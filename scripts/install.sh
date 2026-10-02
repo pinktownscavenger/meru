@@ -354,9 +354,95 @@ setup_searxng() {
   fi
 }
 
-# install_user_service is the Task 5 seam for the systemd user unit.
+# download_merud_unit gets the canonical unit from the same release as the binaries.
+download_merud_unit() {
+  local destination=$1
+  curl -fsSL -o "$destination" "https://raw.githubusercontent.com/$repo/$version/deploy/systemd/merud.service"
+}
+
+# show_merud_failure prints the two commands that explain a user-service failure.
+show_merud_failure() {
+  echo "merud did not start. Check:"
+  echo "  systemctl --user status merud"
+  echo "  journalctl --user -u merud -n 50 --no-pager"
+}
+
+# wait_for_merud waits for the installed client to reach the daemon socket.
+wait_for_merud() {
+  local seconds=$1 waited=0
+  while [ "$waited" -lt "$seconds" ]; do
+    "$bin_dir/meru" ping >/dev/null 2>&1 && return 0
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+# install_merud_service installs one canonical unit and restarts it on every run.
+install_merud_service() {
+  local work_dir source unit_dir unit
+  work_dir=${tmp:-}
+  if [ -z "$work_dir" ]; then
+    work_dir=$(mktemp -d)
+  fi
+  source="$work_dir/merud.service"
+  unit_dir="$HOME/.config/systemd/user"
+  unit="$unit_dir/merud.service"
+  mkdir -p "$work_dir" "$unit_dir"
+  download_merud_unit "$source" || { echo "Could not download the merud user unit."; return 1; }
+  install -m 0644 "$source" "$unit"
+  if ! systemctl --user daemon-reload; then
+    show_merud_failure
+    return 1
+  fi
+  if ! systemctl --user enable merud.service; then
+    show_merud_failure
+    return 1
+  fi
+  if ! systemctl --user restart merud.service; then
+    show_merud_failure
+    return 1
+  fi
+  if ! wait_for_merud 60; then
+    show_merud_failure
+    return 1
+  fi
+  echo "merud is running as a systemd user service."
+}
+
+# offer_user_profile asks for the profile only after the daemon answers ping.
+offer_user_profile() {
+  if has_tty && ask "Tell Meru about you now?"; then
+    run_with_tty "$bin_dir/meru" setup user
+  else
+    echo "Run 'meru setup user' when you're ready."
+  fi
+}
+
+# offer_lingering enables a headless user service only after explicit consent.
+offer_lingering() {
+  local state
+  if ! ask "Keep merud running on this server while you are logged out? This uses sudo loginctl enable-linger."; then
+    echo "Lingering was not enabled. merud runs while your user has a login session."
+    return 0
+  fi
+  if ! sudo loginctl enable-linger "$USER"; then
+    echo "Could not enable lingering for $USER." >&2
+    return 1
+  fi
+  state=$(loginctl show-user "$USER" -p Linger --value) || return 1
+  if [ "$state" != yes ]; then
+    echo "Lingering did not report Linger=yes for $USER." >&2
+    return 1
+  fi
+  echo "Lingering is enabled for $USER."
+}
+
+# install_user_service starts merud before profile and lingering questions.
 install_user_service() {
-  return 0
+  install_merud_service || return 1
+  offer_user_profile
+  offer_lingering
 }
 
 # install_linux installs the verified CLI, then delegates setup to existing commands.

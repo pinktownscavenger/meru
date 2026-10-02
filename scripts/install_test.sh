@@ -450,6 +450,150 @@ test_searxng_handles_home_with_spaces() {
   rm -rf "$dir"
 }
 
+# test_merud_unit_uses_local_bin checks the release install path in the canonical unit.
+test_merud_unit_uses_local_bin() {
+  local unit="$script_dir/../deploy/systemd/merud.service"
+  grep -Fqx 'ExecStart=%h/.local/bin/merud' "$unit"
+  grep -Fqx 'Type=simple' "$unit"
+  grep -Fqx 'Restart=on-failure' "$unit"
+  grep -Fqx 'RestartSec=5' "$unit"
+  grep -Fqx 'WantedBy=default.target' "$unit"
+}
+
+# test_service_install_reloads_enables_and_starts records the user-manager calls.
+test_service_install_reloads_enables_and_starts() {
+  local dir log old_home
+  dir=$(mktemp -d); log="$dir/log"; old_home=$HOME
+  load_installer
+  type install_merud_service >/dev/null 2>&1 || { rm -rf "$dir"; test_fail "install_merud_service is missing"; return; }
+  HOME="$dir/home"; bin_dir="$HOME/.local/bin"; tmp="$dir/tmp"; mkdir -p "$tmp"
+  download_merud_unit() { cp "$script_dir/../deploy/systemd/merud.service" "$1"; }
+  systemctl() { printf 'systemctl %s\n' "$*" >>"$log"; }
+  wait_for_merud() { return 0; }
+  install_merud_service
+  grep -Fqx 'systemctl --user daemon-reload' "$log"
+  grep -Fqx 'systemctl --user enable merud.service' "$log"
+  grep -Fqx 'systemctl --user restart merud.service' "$log"
+  HOME=$old_home
+  rm -rf "$dir"
+}
+
+# test_service_rerun_replaces_one_unit_and_restarts keeps one canonical file.
+test_service_rerun_replaces_one_unit_and_restarts() {
+  local dir log old_home count
+  dir=$(mktemp -d); log="$dir/log"; old_home=$HOME
+  load_installer
+  HOME="$dir/home"; bin_dir="$HOME/.local/bin"; tmp="$dir/tmp"; mkdir -p "$tmp"
+  download_merud_unit() { cp "$script_dir/../deploy/systemd/merud.service" "$1"; }
+  systemctl() { printf 'systemctl %s\n' "$*" >>"$log"; }
+  wait_for_merud() { return 0; }
+  install_merud_service
+  install_merud_service
+  count=$(find "$HOME/.config/systemd/user" -name merud.service -type f | wc -l | tr -d ' ')
+  assert_equal 1 "$count"
+  count=$(grep -Fc 'systemctl --user restart merud.service' "$log")
+  assert_equal 2 "$count"
+  HOME=$old_home
+  rm -rf "$dir"
+}
+
+# test_missing_user_bus_prints_status_and_journal gives exact recovery commands.
+test_missing_user_bus_prints_status_and_journal() {
+  local dir old_home output
+  dir=$(mktemp -d); old_home=$HOME
+  load_installer
+  type show_merud_failure >/dev/null 2>&1 || { rm -rf "$dir"; test_fail "show_merud_failure is missing"; return; }
+  HOME="$dir/home"; bin_dir="$HOME/.local/bin"; tmp="$dir/tmp"; mkdir -p "$tmp"
+  download_merud_unit() { cp "$script_dir/../deploy/systemd/merud.service" "$1"; }
+  systemctl() { return 1; }
+  output=$(install_merud_service 2>&1 || true)
+  assert_contains "$output" 'systemctl --user status merud'
+  assert_contains "$output" 'journalctl --user -u merud -n 50 --no-pager'
+  HOME=$old_home
+  rm -rf "$dir"
+}
+
+# test_service_handles_home_with_spaces quotes the user-unit destination.
+test_service_handles_home_with_spaces() {
+  local dir old_home
+  dir=$(mktemp -d); old_home=$HOME
+  load_installer
+  HOME="$dir/home with spaces"; bin_dir="$HOME/.local/bin"; tmp="$dir/tmp"; mkdir -p "$tmp"
+  download_merud_unit() { cp "$script_dir/../deploy/systemd/merud.service" "$1"; }
+  systemctl() { return 0; }
+  wait_for_merud() { return 0; }
+  install_merud_service
+  [ -f "$HOME/.config/systemd/user/merud.service" ]
+  HOME=$old_home
+  rm -rf "$dir"
+}
+
+# test_profile_runs_only_after_ping never asks for a profile after service failure.
+test_profile_runs_only_after_ping() {
+  local dir log
+  dir=$(mktemp -d); log="$dir/log"
+  load_installer
+  type install_user_service >/dev/null 2>&1 || { rm -rf "$dir"; test_fail "install_user_service is missing"; return; }
+  install_merud_service() { printf 'service\n' >>"$log"; return 1; }
+  offer_user_profile() { printf 'profile\n' >>"$log"; }
+  offer_lingering() { printf 'linger\n' >>"$log"; }
+  install_user_service >/dev/null 2>&1 || true
+  if grep -q '^profile$' "$log"; then test_fail "profile ran after failed ping"; fi
+  : >"$log"
+  install_merud_service() { printf 'service\n' >>"$log"; return 0; }
+  install_user_service
+  assert_equal $'service\nprofile\nlinger' "$(cat "$log")"
+  rm -rf "$dir"
+}
+
+# test_declined_lingering_never_calls_sudo leaves the login policy unchanged.
+test_declined_lingering_never_calls_sudo() {
+  local dir log
+  dir=$(mktemp -d); log="$dir/log"
+  load_installer
+  type offer_lingering >/dev/null 2>&1 || { rm -rf "$dir"; test_fail "offer_lingering is missing"; return; }
+  ask() { return 1; }
+  sudo() { printf 'sudo %s\n' "$*" >>"$log"; }
+  loginctl() { printf 'loginctl %s\n' "$*" >>"$log"; }
+  offer_lingering
+  [ ! -s "$log" ] || { test_fail "declined lingering ran commands"; rm -rf "$dir"; return; }
+  rm -rf "$dir"
+}
+
+# test_accepted_lingering_runs_exact_loginctl_command checks the privileged argv.
+test_accepted_lingering_runs_exact_loginctl_command() {
+  local dir log output old_user
+  dir=$(mktemp -d); log="$dir/log"; old_user=${USER:-}
+  load_installer
+  USER=meru-test
+  ask() { return 0; }
+  sudo() { printf 'sudo %s\n' "$*" >>"$log"; }
+  loginctl() { printf 'loginctl %s\n' "$*" >>"$log"; printf 'yes\n'; }
+  offer_lingering
+  output=$(cat "$log")
+  assert_equal $'sudo loginctl enable-linger meru-test\nloginctl show-user meru-test -p Linger --value' "$output"
+  USER=$old_user
+  rm -rf "$dir"
+}
+
+# test_lingering_must_report_yes rejects a command that did not take effect.
+test_lingering_must_report_yes() {
+  local output old_user
+  old_user=${USER:-}
+  load_installer
+  USER=meru-test
+  ask() { return 0; }
+  sudo() { return 0; }
+  loginctl() { printf 'no\n'; }
+  if output=$(offer_lingering 2>&1); then
+    USER=$old_user
+    test_fail "lingering accepted Linger=no"
+    return
+  fi
+  USER=$old_user
+  assert_contains "$output" 'Linger=yes'
+}
+
 # run_test isolates each test because installer failures call exit.
 run_test() {
   local name=$1 status
@@ -492,7 +636,16 @@ for test_name in \
   test_existing_settings_secret_is_kept \
   test_podman_quadlet_binds_loopback_and_uses_percent_h \
   test_docker_argv_binds_loopback_and_restarts \
-  test_searxng_handles_home_with_spaces
+  test_searxng_handles_home_with_spaces \
+  test_merud_unit_uses_local_bin \
+  test_service_install_reloads_enables_and_starts \
+  test_service_rerun_replaces_one_unit_and_restarts \
+  test_missing_user_bus_prints_status_and_journal \
+  test_service_handles_home_with_spaces \
+  test_profile_runs_only_after_ping \
+  test_declined_lingering_never_calls_sudo \
+  test_accepted_lingering_runs_exact_loginctl_command \
+  test_lingering_must_report_yes
 do
   run_test "$test_name"
 done
