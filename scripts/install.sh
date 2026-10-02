@@ -445,6 +445,15 @@ install_user_service() {
   offer_lingering
 }
 
+# finish_linux_setup starts the daemon only after meru setup has written config.
+finish_linux_setup() {
+  if [ ! -f "$HOME/.meru/config.toml" ]; then
+    echo "Run 'meru setup', then run this installer again to start merud as a service."
+    return 0
+  fi
+  install_user_service
+}
+
 # install_linux installs the verified CLI, then delegates setup to existing commands.
 install_linux() {
   local version=$1 base cli release_dir choice
@@ -485,7 +494,7 @@ install_linux() {
     echo "Run 'meru setup' after Ollama starts."
   fi
   setup_searxng
-  install_user_service
+  finish_linux_setup
 }
 
 # main performs the install when Bash executes this file rather than sourcing it.

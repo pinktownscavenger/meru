@@ -378,7 +378,7 @@ test_no_runtime_skips_with_recovery_text() {
 
 # test_settings_have_json_random_secret_and_modes checks safe defaults on disk.
 test_settings_have_json_random_secret_and_modes() {
-  local dir settings secret dir_mode file_mode
+  local dir settings secret dir_mode file_mode instance_names
   dir=$(mktemp -d); settings="$dir/searxng/settings.yml"
   load_installer
   type write_searxng_settings >/dev/null 2>&1 || { rm -rf "$dir"; test_fail "write_searxng_settings is missing"; return; }
@@ -386,6 +386,8 @@ test_settings_have_json_random_secret_and_modes() {
   grep -q '^    - json$' "$settings"
   secret=$(sed -n 's/^  secret_key: "\([0-9a-f]*\)"$/\1/p' "$settings")
   [ "${#secret}" -eq 64 ] || { test_fail "secret is not 64 hex digits"; rm -rf "$dir"; return; }
+  instance_names=$(grep -Fc '  instance_name: "Meru web search"' "$settings")
+  assert_equal 1 "$instance_names"
   dir_mode=$(stat -f %Lp "$dir/searxng" 2>/dev/null || stat -c %a "$dir/searxng")
   file_mode=$(stat -f %Lp "$settings" 2>/dev/null || stat -c %a "$settings")
   assert_equal 700 "$dir_mode"
@@ -546,6 +548,26 @@ test_profile_runs_only_after_ping() {
   rm -rf "$dir"
 }
 
+# test_service_waits_for_config keeps a non-interactive first run recoverable.
+test_service_waits_for_config() {
+  local dir log old_home output
+  dir=$(mktemp -d); log="$dir/log"; old_home=$HOME
+  load_installer
+  type finish_linux_setup >/dev/null 2>&1 || { rm -rf "$dir"; test_fail "finish_linux_setup is missing"; return; }
+  HOME="$dir/home"
+  install_user_service() { printf 'service\n' >>"$log"; }
+  output=$(finish_linux_setup)
+  [ ! -s "$log" ] || { test_fail "service started without config"; HOME=$old_home; rm -rf "$dir"; return; }
+  assert_contains "$output" 'meru setup'
+  assert_contains "$output" 'run this installer again'
+  mkdir -p "$HOME/.meru"
+  : >"$HOME/.meru/config.toml"
+  finish_linux_setup
+  assert_equal service "$(cat "$log")"
+  HOME=$old_home
+  rm -rf "$dir"
+}
+
 # test_declined_lingering_never_calls_sudo leaves the login policy unchanged.
 test_declined_lingering_never_calls_sudo() {
   local dir log
@@ -643,6 +665,7 @@ for test_name in \
   test_missing_user_bus_prints_status_and_journal \
   test_service_handles_home_with_spaces \
   test_profile_runs_only_after_ping \
+  test_service_waits_for_config \
   test_declined_lingering_never_calls_sudo \
   test_accepted_lingering_runs_exact_loginctl_command \
   test_lingering_must_report_yes

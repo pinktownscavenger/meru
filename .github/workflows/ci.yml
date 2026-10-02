@@ -115,6 +115,38 @@ jobs:
       - name: vet, staticcheck and govulncheck with the desktop tags
         run: make desktop-check
 
+  installer:
+    name: Ubuntu installer
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: test the release installer
+        run: make install-script-test
+      - name: verify the merud user service
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          go build -trimpath -o "$HOME/.local/bin/merud" ./cmd/merud
+          systemd-analyze verify deploy/systemd/merud.service
+      - name: install Podman for the Quadlet check
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes podman
+      - name: verify the SearXNG Quadlet
+        run: |
+          output="$(mktemp)"
+          QUADLET_UNIT_DIRS="$PWD/deploy/systemd" \
+            /usr/lib/systemd/system-generators/podman-system-generator --user --dryrun > "$output"
+          grep -F 'meru-searxng.service' "$output"
+          grep -F '127.0.0.1:8888:8080' "$output"
+          grep -F '/.meru/searxng:/etc/searxng' "$output"
+      - name: test the web address guard
+        run: go test -race ./internal/builtin -run 'TestWebFetch|TestCheckPublic'
+
   e2e:
     name: end-to-end
     needs: test

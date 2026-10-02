@@ -2,18 +2,17 @@
 
 This guide takes you from nothing to asking Meru a question, then covers settings,
 indexing your files, running it as a service, the dashboard, and fixing common
-problems. It describes v0.3: questions, streamed answers, session transcripts,
-routing, answers from your own files with citations, web search through a
-SearXNG you run, and tools from MCP servers and A2A agents you allow. Memory and scheduled jobs arrive in later milestones
-([ROADMAP.md](../ROADMAP.md)). For a short answer to one question, such as how
+problems. It covers questions, streamed answers, your files, memory, web search
+through a SearXNG you run, and tools from MCP servers and A2A agents you allow.
+Scheduled jobs arrive in a later milestone ([ROADMAP.md](../ROADMAP.md)). For a short answer to one question, such as how
 to let Meru run a command, start at the [FAQ](faq/index.md).
 
 ## 1. Install the prerequisites
 
-You need two programs on the machine that will run Meru, and a third for web
-search.
+What you need depends on how you install:
 
-- **Go 1.26 or later**, to build Meru. Download it from <https://go.dev/dl/>, or on
+- **Go 1.26 or later**, only to build Meru from source. A release install needs
+  no Go. Download it from <https://go.dev/dl/>, or on
   macOS run `brew install go`. Check with `go version`. The repo pins Go 1.26.6;
   if yours is older, `go` downloads 1.26.6 by itself the first time you build.
 - **Ollama 0.12.11 or later**, to run the models. Download it from
@@ -21,11 +20,11 @@ search.
   `http://127.0.0.1:11434`. Check with `curl http://127.0.0.1:11434/api/version`.
   `merud` refuses to start with an older Ollama, because the router needs log
   probabilities, which Ollama added in 0.12.11.
-- **Docker**, only for web search. Meru searches the web through SearXNG, which
-  runs in a container (see [Web search](#web-search)). Meru runs without Docker;
-  only the `web_search` tool stops working, and it tells the model why. On macOS,
-  Docker Desktop or Colima provides `docker compose`; check with
-  `docker compose version`.
+- **Podman or Docker**, only for web search. Meru searches the web through
+  SearXNG, which runs in a container (see [Web search](#web-search)). Meru runs
+  without either one. The Ubuntu installer prefers working rootless Podman and
+  falls back to working Docker; it installs neither. On macOS, Docker Desktop or
+  Colima provides `docker compose`; check with `docker compose version`.
 
 ## 2. Download the models
 
@@ -188,6 +187,67 @@ loaded model got.
 ## 3. Install Meru
 
 Install a release, or build Meru from source. A release needs no Go.
+
+### Ubuntu 24.04 command-line install
+
+This stage supports Ubuntu 24.04 on x86-64. It installs the terminal clients
+`meru` and `meru chat`, plus the `merud` daemon. It does not install a Linux
+desktop app. A new setup defaults to the `lite` profile: MiniCPM5-2B and
+`nomic-embed-text`.
+
+You need `curl`, `tar` and `sha256sum`, which Ubuntu 24.04 normally includes.
+Web search also needs an existing, working rootless Podman or Docker install.
+The installer does not install either runtime. Run:
+
+```sh
+curl -fsSL https://github.com/aarora79/meru/releases/latest/download/install.sh | bash
+```
+
+The script names every download and privileged step before it starts. It then:
+
+1. downloads the native release archive and `SHA256SUMS` from GitHub;
+2. checks the archive before it installs `meru` and `merud` in
+   `~/.local/bin`;
+3. offers Ollama's Linux installer, which may use `sudo`, and waits for Ollama;
+4. runs `meru setup` for the `lite` models, folders and tools;
+5. offers SearXNG through working rootless Podman, or working Docker when
+   Podman is unavailable;
+6. installs and starts `merud` as a systemd user service;
+7. after `meru ping` works, offers `meru setup user`; and
+8. offers `sudo loginctl enable-linger "$USER"` for a server that should keep
+   running after logout.
+
+Each optional or privileged step asks first. Choose `s` at the first prompt to
+accept one step at a time. `MERU_YES=1` accepts every step, including Ollama's
+installer and lingering, so use it only when that is what you want:
+
+```sh
+curl -fsSL https://github.com/aarora79/meru/releases/latest/download/install.sh \
+  | MERU_YES=1 bash
+```
+
+With no terminal, the script installs and checks the binaries but cannot answer
+`meru setup`. It prints the commands that remain and does not start `merud`
+without a config. Run `meru setup`, then run the installer again from a terminal.
+
+Check the install:
+
+```sh
+meru ping
+systemctl --user status merud
+meru tools
+```
+
+If you chose a folder during setup, put a short text file in it, wait for the
+indexer, and ask a question whose answer appears only in that file. The answer
+should cite the file. This checks the whole path from the client, through
+`merud`, Ollama and the index.
+
+On a remote server, a systemd user manager may stop when the SSH session ends.
+Accept lingering only when Meru should stay up after logout. Check the result
+with `loginctl show-user "$USER" -p Linger --value`; it should print `yes`.
+The installer prints `systemctl` and `journalctl` commands when a service fails.
+The [deployment guide](../deploy/README.md#linux-systemd) lists them too.
 
 ### The Mac installer
 
@@ -1359,6 +1419,24 @@ installer's Web search step does all of this for you (see
 `meru-searxng`, with its settings in `~/.meru/searxng/settings.yml`. The steps
 below do it by hand, on a Mac or on Linux.
 
+On Ubuntu, the release installer uses the same container name and settings
+folder. It prefers a working rootless Podman and installs a Quadlet as the
+systemd user service `meru-searxng.service`. If Podman is not working, it uses a
+working Docker daemon and the restart policy `unless-stopped`. It does not switch
+an existing named container from one runtime to the other. Check the owner with:
+
+```sh
+podman ps -a --filter name=meru-searxng
+systemctl --user status meru-searxng
+journalctl --user -u meru-searxng -n 50 --no-pager
+
+docker ps -a --filter name=meru-searxng
+docker logs meru-searxng
+```
+
+If neither runtime works, start or install one and rerun the Meru installer. The
+rest of Meru works without SearXNG.
+
 ```sh
 mkdir -p ~/srv/searxng/core-config && cd ~/srv/searxng
 curl -fsSL -O https://raw.githubusercontent.com/searxng/searxng/master/container/docker-compose.yml \
@@ -1894,12 +1972,27 @@ The rules:
 it: a duplicate name, a placeholder with no parameter, a parameter no placeholder
 uses, a `path` with no `under`, an `under` folder that doesn't exist, a timeout
 over `"300s"`, and so on. A program missing from `PATH` only gets a warning in
-`merud.log`. The config template (`meru config template`) has 25 starters,
-commented out: `git-log`, `git-status`, `search-notes` and `disk-free`, 15
-for macOS machine facts, snapshots, `sed` and `awk` (see below), and six for
-GitHub.
+`merud.log`. The config template (`meru config template`) has 29 starters,
+commented out: seven general repository and machine commands, four Linux machine
+commands, 12 macOS commands, and six for GitHub.
 
-### Machine facts, snapshots, sed and awk
+### Linux machine facts
+
+Ubuntu's four samples use ordinary command arguments and print once, so they fit
+the same no-shell command path as every other local tool:
+
+| Tool | Program and result |
+| --- | --- |
+| `cmd.linux-system-load` | `top -b -n 1` from `procps`: one CPU, memory and process snapshot |
+| `cmd.linux-memory` | `free -h` from `procps`: RAM and swap use |
+| `cmd.linux-cpu` | `lscpu` from `util-linux`: CPU architecture and features |
+| `cmd.linux-disks` | `lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS` from `util-linux`: block devices and mounts |
+
+Ubuntu 24.04 normally includes `procps` and `util-linux`. `meru setup` shows a
+sample as unavailable when its program is missing; it does not install the
+package.
+
+### macOS machine facts, snapshots, sed and awk
 
 These 15 commands only read, and all work on macOS as shipped:
 
@@ -2081,6 +2174,21 @@ your system. [deploy/README.md](../deploy/README.md) has the exact commands:
 - **Linux:** a `systemd` user unit, including how to start it at boot on a server.
 - **Windows:** no service wrapper yet; start `merud.exe` from Task Scheduler.
 
+The Ubuntu installer enables and starts `merud.service`. Check or restart it
+without `sudo`:
+
+```sh
+systemctl --user status merud
+journalctl --user -u merud -n 50 --no-pager
+systemctl --user restart merud
+meru ping
+```
+
+If `systemctl --user` cannot connect after an SSH login, log out and back in so
+PAM creates the user manager. On a headless server, enable lingering only if the
+service should run with no login session; the installer offers the exact command
+and asks first.
+
 ## 10. Watch it on a dashboard (optional)
 
 `merud` can send its metrics and traces to a local Grafana stack, which runs in
@@ -2102,6 +2210,16 @@ dashboard to open for what, explains empty panels, shows how to query the metric
 from the command line, and how to find one question's trace.
 
 ## 11. Update to a newer version
+
+For an Ubuntu release install, rerun the same installer. It checks and replaces
+the two binaries, keeps your config, transcripts, index and SearXNG settings,
+then restarts the user service:
+
+```sh
+curl -fsSL https://github.com/aarora79/meru/releases/latest/download/install.sh | bash
+```
+
+Meru does not check for updates or run this command on its own.
 
 From your clone of the repo, pull the latest code, rebuild both programs and
 restart `merud`:
@@ -2235,7 +2353,7 @@ later.
 | A file never shows up in answers | Check that its folder is in `[index] folders`, then run `merud -v` and search `~/.meru/merud.log` for the file's name; the skip line gives the reason. |
 | `merud` warns that the OS watch limit was reached | Linux only: raise `fs.inotify.max_user_watches` (see step 7). Changes still get in at the next startup. |
 | `web_search` answers that JSON is off, or `curl` on SearXNG prints HTML | SearXNG answers web pages only. Add `json` under `search: formats:` in `~/srv/searxng/core-config/settings.yml`, then `docker compose restart` (see [Web search](#web-search)). |
-| `web_search` says `SearXNG isn't answering on http://127.0.0.1:8888` | The container isn't running. Run `cd ~/srv/searxng && docker compose up -d`, and check that Docker itself runs. `docker compose ps` should show `127.0.0.1:8888->8888/tcp`. |
+| `web_search` says `SearXNG isn't answering on http://127.0.0.1:8888` | On an Ubuntu installer setup, check `podman ps -a --filter name=meru-searxng` and `systemctl --user status meru-searxng`, or `docker ps -a --filter name=meru-searxng` and `docker logs meru-searxng`. For the manual Compose setup, run `cd ~/srv/searxng && docker compose up -d`; `docker compose ps` should show `127.0.0.1:8888->8888/tcp`. |
 | `merud` refuses a config value | The message names the key. Fix it in `~/.meru/config.toml`; `meru config template` shows every key, its default and the allowed values. |
 | The first answer is slow | Ollama was loading the answer model; `merud` loads it in the background at startup, and a question asked before `answer model warm` shows in `~/.meru/merud.log` waits for it. Later answers are fast while `merud` runs, because it keeps the models loaded. |
 | `couldn't load the answer model` in the log | Ollama couldn't load `[models] main`. Pull it with the `ollama pull` command on the same line, or pick another answer model. |
@@ -2247,9 +2365,37 @@ later.
 
 ## 13. Uninstall
 
+On Ubuntu, stop the user services first. Remove only the files the release
+installer owns:
+
+```sh
+systemctl --user disable --now merud.service
+rm "$HOME/.config/systemd/user/merud.service"
+
+# Run this block only when the Podman Quadlet exists.
+systemctl --user disable --now meru-searxng.service
+rm "$HOME/.config/containers/systemd/meru-searxng.container"
+systemctl --user daemon-reload
+
+rm "$HOME/.local/bin/meru" "$HOME/.local/bin/merud"
+```
+
+If Docker owns `meru-searxng`, run `docker rm -f meru-searxng` instead of the
+Quadlet block. If Podman has a container left after the service stops, inspect it
+with `podman ps -a --filter name=meru-searxng`, then remove that one container
+with `podman rm -f meru-searxng`.
+
+Meru's data remains in `~/.meru`: config, memories, transcripts, the search
+index, secrets and SearXNG settings. Inspect that folder and remove only the data
+you mean to discard. This guide does not give a recursive command that can erase
+it all by mistake. Disabling lingering is a machine-wide login choice, not an
+installer file; if you enabled it only for Meru, undo it with `sudo loginctl
+disable-linger "$USER"`.
+
+For a source build on macOS or another system:
+
 ```sh
 rm ~/go/bin/merud ~/go/bin/meru
-rm -rf ~/.meru          # deletes your settings, every transcript and the index
 ```
 
 For a release install, remove `~/.local/bin/meru`, `~/.local/bin/merud` and
