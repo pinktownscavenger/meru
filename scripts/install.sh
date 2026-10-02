@@ -186,9 +186,172 @@ linux_banner() {
   echo
 }
 
-# setup_searxng is the Task 4 seam for optional local web search.
+# searxng_ready accepts the JSON search response Meru's web tool needs.
+searxng_ready() {
+  local response
+  response=$(curl --noproxy '*' -fsS --max-time 3 'http://127.0.0.1:8888/search?q=test&format=json' 2>/dev/null) || return 1
+  case "$response" in *'"results"'*) return 0 ;; *) return 1 ;; esac
+}
+
+# searxng_owner reports which runtime already owns the named container.
+searxng_owner() {
+  if command -v podman >/dev/null 2>&1 && podman container exists meru-searxng >/dev/null 2>&1; then
+    printf 'podman\n'
+    return 0
+  fi
+  if command -v docker >/dev/null 2>&1 && docker inspect meru-searxng >/dev/null 2>&1; then
+    printf 'docker\n'
+    return 0
+  fi
+}
+
+# container_runtime_ready checks that a named runtime can reach its engine.
+container_runtime_ready() {
+  local runtime=$1
+  command -v "$runtime" >/dev/null 2>&1 && "$runtime" info >/dev/null 2>&1
+}
+
+# choose_container_runtime prefers working rootless Podman, then working Docker.
+choose_container_runtime() {
+  if container_runtime_ready podman; then
+    printf 'podman\n'
+  elif container_runtime_ready docker; then
+    printf 'docker\n'
+  fi
+}
+
+# write_searxng_settings creates the bounded JSON-enabled settings once.
+write_searxng_settings() {
+  local directory=$1 settings="$1/settings.yml" secret
+  mkdir -p "$directory"
+  chmod 0700 "$directory"
+  if [ -f "$settings" ]; then
+    chmod 0600 "$settings"
+    return 0
+  fi
+  secret=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+  [ "${#secret}" -eq 64 ] || fail "couldn't make SearXNG's secret key"
+  printf '%s\n' \
+    '# SearXNG settings, written by the Meru installer.' \
+    '# SearXNG reads this file as /etc/searxng/settings.yml in its container.' \
+    'use_default_settings: true' \
+    '' \
+    'general:' \
+    '  instance_name: "Meru web search"' \
+    '' \
+    'search:' \
+    '  safe_search: 1' \
+    '  autocomplete: ""' \
+    '  formats:' \
+    '    - html' \
+    '    - json' \
+    '' \
+    'server:' \
+    '  base_url: "http://127.0.0.1:8888/"' \
+    "  secret_key: \"$secret\"" \
+    '  limiter: false' \
+    '  public_instance: false' \
+    '  image_proxy: false' >"$settings"
+  chmod 0600 "$settings"
+}
+
+# setup_searxng_podman installs the Quadlet and starts its user service.
+setup_searxng_podman() {
+  local settings_dir=$1 unit_dir unit raw_url
+  if podman container exists meru-searxng >/dev/null 2>&1; then
+    podman start meru-searxng >/dev/null
+    return 0
+  fi
+  unit_dir="$HOME/.config/containers/systemd"
+  unit="$unit_dir/meru-searxng.container"
+  raw_url="https://raw.githubusercontent.com/$repo/$version/deploy/systemd/meru-searxng.container"
+  mkdir -p "$unit_dir"
+  curl -fsSL -o "$unit" "$raw_url" || return 1
+  systemctl --user daemon-reload
+  systemctl --user enable --now meru-searxng.service
+  : "$settings_dir"
+}
+
+# setup_searxng_docker pulls and runs one loopback-only Docker container.
+setup_searxng_docker() {
+  local settings_dir=$1
+  local -a args=(
+    run --detach
+    --name meru-searxng
+    --restart unless-stopped
+    --publish 127.0.0.1:8888:8080
+    --volume "$settings_dir:/etc/searxng"
+    --env SEARXNG_BASE_URL=http://127.0.0.1:8888/
+    docker.io/searxng/searxng:latest
+  )
+  docker pull docker.io/searxng/searxng:latest
+  docker "${args[@]}"
+}
+
+# wait_for_searxng waits for one JSON response from the local search service.
+wait_for_searxng() {
+  local seconds=$1 waited=0
+  while [ "$waited" -lt "$seconds" ]; do
+    searxng_ready && return 0
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+# print_searxng_recovery names commands for the runtime that owns the service.
+print_searxng_recovery() {
+  case "$1" in
+    podman)
+      echo "Try: podman start meru-searxng"
+      echo "Then check: systemctl --user status meru-searxng and journalctl --user -u meru-searxng -n 50"
+      ;;
+    docker)
+      echo "Try: docker start meru-searxng"
+      echo "Then check: docker ps -a --filter name=meru-searxng and docker logs meru-searxng"
+      ;;
+  esac
+}
+
+# setup_searxng keeps an existing owner or starts the optional local service.
 setup_searxng() {
-  return 0
+  local owner runtime settings_dir
+  if searxng_ready; then
+    echo "SearXNG already answers JSON on 127.0.0.1:8888; keeping it."
+    return 0
+  fi
+  owner=$(searxng_owner)
+  if [ -n "$owner" ]; then
+    if ! container_runtime_ready "$owner"; then
+      echo "The existing meru-searxng container belongs to $owner, but $owner is not working."
+      print_searxng_recovery "$owner"
+      return 0
+    fi
+    runtime=$owner
+  else
+    runtime=$(choose_container_runtime)
+    if [ -z "$runtime" ]; then
+      echo "Install Podman or Docker, start it, and run this installer again to add web search."
+      return 0
+    fi
+  fi
+  if ! ask "Set up optional SearXNG web search with $runtime?"; then
+    echo "Skipped web search. Run this installer again when you want it."
+    return 0
+  fi
+  settings_dir="$HOME/.meru/searxng"
+  write_searxng_settings "$settings_dir"
+  if [ -n "$owner" ]; then
+    "$runtime" start meru-searxng >/dev/null || { print_searxng_recovery "$runtime"; return 0; }
+  elif [ "$runtime" = podman ]; then
+    setup_searxng_podman "$settings_dir" || { print_searxng_recovery podman; return 0; }
+  else
+    setup_searxng_docker "$settings_dir" || { print_searxng_recovery docker; return 0; }
+  fi
+  if ! wait_for_searxng 90; then
+    echo "SearXNG did not answer JSON within 90 seconds."
+    print_searxng_recovery "$runtime"
+  fi
 }
 
 # install_user_service is the Task 5 seam for the systemd user unit.
