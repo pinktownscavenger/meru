@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh installs Meru on a Mac from a GitHub release. Run it with:
+# install.sh installs Meru from a GitHub release. Run it with:
 #
 #   curl -fsSL https://github.com/aarora79/meru/releases/latest/download/install.sh | bash
 #
@@ -42,12 +42,86 @@ ask() {
   case "$reply" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
 }
 
-[ "$(uname -s)" = "Darwin" ] || fail "this installer is for macOS; see docs/running.md for Linux and Windows"
-case "$(uname -m)" in
-  arm64) arch="arm64" ;;
-  x86_64) arch="amd64" ;;
-  *) fail "unsupported processor $(uname -m)" ;;
-esac
+# os_release_value reads one key from os-release as text. It never executes the file.
+os_release_value() {
+  local path=$1 key=$2 line value
+  while IFS= read -r line; do
+    case "$line" in
+      "$key="*)
+        value=${line#*=}
+        case "$value" in
+          \"*\") value=${value#\"}; value=${value%\"} ;;
+          \'*\') value=${value#\'}; value=${value%\'} ;;
+        esac
+        printf '%s\n' "$value"
+        return 0
+        ;;
+    esac
+  done <"$path"
+  return 1
+}
+
+# platform_for maps one supported machine to the matching release archive name.
+platform_for() {
+  local kernel=$1 machine=$2 os_release_path=$3 id version_id
+  case "$kernel:$machine" in
+    Darwin:arm64) printf 'darwin-arm64\n' ;;
+    Darwin:x86_64) printf 'darwin-amd64\n' ;;
+    Linux:x86_64)
+      id=$(os_release_value "$os_release_path" ID 2>/dev/null || true)
+      version_id=$(os_release_value "$os_release_path" VERSION_ID 2>/dev/null || true)
+      if [ "$id" = ubuntu ] && [ "$version_id" = 24.04 ]; then
+        printf 'linux-amd64\n'
+      else
+        printf 'install.sh: this stage supports Ubuntu 24.04 on x86-64; use the release archive for %s %s\n' "$kernel" "$machine" >&2
+        return 1
+      fi
+      ;;
+    *)
+      printf 'install.sh: unsupported system %s %s; use the matching release archive\n' "$kernel" "$machine" >&2
+      return 1
+      ;;
+  esac
+}
+
+# verify_downloads checks files in a download directory with the platform tool.
+verify_downloads() {
+  local os=$1 directory=$2
+  case "$os" in
+    Linux) (cd "$directory" && sha256sum -c --ignore-missing SHA256SUMS) ;;
+    Darwin) (cd "$directory" && shasum -a 256 -c --ignore-missing SHA256SUMS) ;;
+    *) printf 'install.sh: no checksum tool for %s\n' "$os" >&2; return 1 ;;
+  esac
+}
+
+# install_cli extracts a verified archive and installs both command-line programs.
+install_cli() {
+  local archive=$1 release_dir=$2 destination=$3 extract_dir
+  extract_dir=$(dirname "$archive")
+  tar -xzf "$archive" -C "$extract_dir"
+  mkdir -p "$destination"
+  install -m 0755 "$extract_dir/$release_dir/meru" "$extract_dir/$release_dir/merud" "$destination/"
+}
+
+# ensure_path_line adds the local binary directory to one shell profile once.
+ensure_path_line() {
+  local profile_file=$1 directory=$2 line
+  line="export PATH=\"$directory:\$PATH\""
+  if [ -f "$profile_file" ] && grep -Fqx "$line" "$profile_file"; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$profile_file")"
+  printf '%s\n' "$line" >>"$profile_file"
+}
+
+# main performs the install when Bash executes this file rather than sourcing it.
+main() {
+local kernel machine platform os arch
+kernel=$(uname -s)
+machine=$(uname -m)
+platform=$(platform_for "$kernel" "$machine" /etc/os-release) || exit 1
+os=$kernel
+arch=${platform#*-}
 
 # The latest release's tag: github.com/<repo>/releases/latest redirects to
 # .../releases/tag/<tag>, and curl's url_effective is where it landed.
@@ -57,6 +131,9 @@ if [ -z "$version" ]; then
   version="${url##*/}"
 fi
 case "$version" in v[0-9]*.[0-9]*.[0-9]*) ;; *) fail "couldn't find the release to install (got '$version')" ;; esac
+if [ "$platform" = linux-amd64 ]; then
+  fail "Ubuntu support is not complete in this installer yet"
+fi
 # What this Mac will get, so the banner can list it before anything starts.
 mem_gb=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 # The answer model to offer for this much memory, from docs/running.md,
@@ -127,18 +204,16 @@ for f in "${files[@]}"; do
 done
 
 say "Checking the downloads against SHA256SUMS"
-(cd "$tmp" && shasum -a 256 -c SHA256SUMS --ignore-missing) || fail "a download doesn't match SHA256SUMS; nothing was installed"
+verify_downloads "$os" "$tmp" || fail "a download doesn't match SHA256SUMS; nothing was installed"
 
 say "Installing meru and merud in $bin_dir"
-mkdir -p "$bin_dir"
-tar -xzf "$tmp/$cli" -C "$tmp"
-install -m 0755 "$tmp/meru-$version-darwin-$arch/meru" "$tmp/meru-$version-darwin-$arch/merud" "$bin_dir/"
+install_cli "$tmp/$cli" "meru-$version-darwin-$arch" "$bin_dir"
 case ":$PATH:" in
   *":$bin_dir:"*) ;;
   *)
     echo "$bin_dir isn't on your PATH."
     if ask "Add it to ~/.zshrc?"; then
-      echo 'export PATH="$HOME/.local/bin:$PATH"' >>"$HOME/.zshrc"
+      ensure_path_line "$HOME/.zshrc" '$HOME/.local/bin'
       echo "Added. Open a new Terminal window for it to take effect."
     fi
     export PATH="$bin_dir:$PATH"
@@ -232,3 +307,10 @@ echo "Chat:             meru chat"
 [ "$arch" = "arm64" ] && echo "Desktop app:      open Meru.app"
 echo "Gmail, Calendar and Drive: https://github.com/$repo/blob/main/docs/google-setup.md"
 if [ "$pulled_answer" = 1 ] && [ "$had_config" = 1 ]; then how_to_use; fi
+}
+
+# BASH_SOURCE differs from $0 when another script sources this file. With
+# `curl ... | bash`, BASH_SOURCE is empty, so that published form also runs main.
+if [ -z "${BASH_SOURCE[0]:-}" ] || [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
