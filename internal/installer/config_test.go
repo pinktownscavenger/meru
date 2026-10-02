@@ -125,6 +125,31 @@ func TestSampleCommands(t *testing.T) {
 	if o := byName["git-log"]; o.Missing == "" || o.Chosen {
 		t.Errorf("git-log without ~/repos: %+v", o)
 	}
+	linux := map[string][]string{
+		"linux-system-load": {"top", "-b", "-n", "1"},
+		"linux-memory":      {"free", "-h"},
+		"linux-cpu":         {"lscpu"},
+		"linux-disks":       {"lsblk", "-o", "NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS"},
+	}
+	macOnly := []string{"sw_vers", "memory_pressure", "system_profiler", "pmset", "diskutil"}
+	for name, argv := range linux {
+		o, ok := byName[name]
+		if !ok {
+			t.Errorf("Linux sample %q is missing", name)
+			continue
+		}
+		if !slices.Equal(o.Argv, argv) {
+			t.Errorf("%s argv = %v, want %v", name, o.Argv, argv)
+		}
+		if o.Chosen {
+			t.Errorf("Linux sample %q starts ticked in the Mac installer", name)
+		}
+		for _, arg := range o.Argv {
+			if slices.Contains(macOnly, arg) {
+				t.Errorf("Linux sample %q uses Mac-only program %q", name, arg)
+			}
+		}
+	}
 }
 
 // TestSaveSkillsAndCommands turns two samples on, twice, and checks that
