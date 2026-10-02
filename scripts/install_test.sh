@@ -198,11 +198,119 @@ test_install_handles_home_with_spaces() {
   rm -rf "$dir"
 }
 
+# test_existing_ollama_is_kept avoids downloads when the loopback API answers.
+test_existing_ollama_is_kept() {
+  local dir log
+  dir=$(mktemp -d); log="$dir/log"
+  load_installer
+  type install_ollama_linux >/dev/null 2>&1 || { rm -rf "$dir"; test_fail "install_ollama_linux is missing"; return; }
+  ollama_ready() { return 0; }
+  ask() { printf 'asked\n' >>"$log"; return 0; }
+  curl() { printf 'curl %s\n' "$*" >>"$log"; }
+  sh() { printf 'sh %s\n' "$*" >>"$log"; }
+  install_ollama_linux "$dir"
+  [ ! -s "$log" ] || { test_fail "existing Ollama caused work: $(cat "$log")"; rm -rf "$dir"; return; }
+  rm -rf "$dir"
+}
+
+# test_ollama_installer_is_saved_then_run_after_yes checks URL and command order.
+test_ollama_installer_is_saved_then_run_after_yes() {
+  local dir log output
+  dir=$(mktemp -d); log="$dir/log"
+  load_installer
+  type install_ollama_linux >/dev/null 2>&1 || { rm -rf "$dir"; test_fail "install_ollama_linux is missing"; return; }
+  ollama_ready() { return 1; }
+  ask() { return 0; }
+  curl() {
+    printf 'curl %s\n' "$*" >>"$log"
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = -o ]; then shift; printf '#!/bin/sh\n' >"$1"; break; fi
+      shift
+    done
+  }
+  sh() { printf 'sh %s\n' "$*" >>"$log"; }
+  install_ollama_linux "$dir"
+  output=$(cat "$log")
+  rm -rf "$dir"
+  assert_contains "$output" "https://ollama.com/install.sh"
+  assert_contains "$output" "sh $dir/ollama-install.sh"
+  case "$output" in curl*"https://ollama.com/install.sh"*"sh $dir/ollama-install.sh") ;;
+    *) test_fail "Ollama installer did not download before sh: $output" ;;
+  esac
+}
+
+# test_declined_ollama_runs_nothing leaves privileged installation to the user.
+test_declined_ollama_runs_nothing() {
+  local dir log
+  dir=$(mktemp -d); log="$dir/log"
+  load_installer
+  type install_ollama_linux >/dev/null 2>&1 || { rm -rf "$dir"; test_fail "install_ollama_linux is missing"; return; }
+  ollama_ready() { return 1; }
+  ask() { return 1; }
+  curl() { printf 'curl %s\n' "$*" >>"$log"; }
+  sh() { printf 'sh %s\n' "$*" >>"$log"; }
+  install_ollama_linux "$dir"
+  [ ! -s "$log" ] || { test_fail "declined Ollama ran a command: $(cat "$log")"; rm -rf "$dir"; return; }
+  rm -rf "$dir"
+}
+
+# test_no_tty_runs_no_privileged_or_optional_command prints later commands only.
+test_no_tty_runs_no_privileged_or_optional_command() {
+  local dir log output
+  dir=$(mktemp -d); log="$dir/log"
+  load_installer
+  type install_ollama_linux >/dev/null 2>&1 || { rm -rf "$dir"; test_fail "install_ollama_linux is missing"; return; }
+  type run_meru_setup >/dev/null 2>&1 || { rm -rf "$dir"; test_fail "run_meru_setup is missing"; return; }
+  all=0
+  has_tty() { return 1; }
+  ollama_ready() { return 1; }
+  curl() { printf 'curl %s\n' "$*" >>"$log"; }
+  sh() { printf 'sh %s\n' "$*" >>"$log"; }
+  run_with_tty() { printf 'tty %s\n' "$*" >>"$log"; }
+  output=$(install_ollama_linux "$dir"; run_meru_setup)
+  [ ! -s "$log" ] || { test_fail "no-terminal path ran a command: $(cat "$log")"; rm -rf "$dir"; return; }
+  rm -rf "$dir"
+  assert_contains "$output" "meru setup"
+}
+
+# test_meru_yes_banner_names_sudo_steps makes non-interactive consent explicit.
+test_meru_yes_banner_names_sudo_steps() {
+  local output
+  load_installer
+  type linux_banner >/dev/null 2>&1 || { test_fail "linux_banner is missing"; return; }
+  all=1
+  output=$(linux_banner v0.0.0)
+  assert_contains "$output" "Ollama"
+  assert_contains "$output" "SearXNG"
+  assert_contains "$output" "sudo"
+  assert_contains "$output" "loginctl enable-linger"
+  assert_contains "$output" "accepts every step"
+}
+
+# test_linux_setup_uses_no_main_override keeps the setup command on lite by default.
+test_linux_setup_uses_no_main_override() {
+  local dir log output
+  dir=$(mktemp -d); log="$dir/log"
+  load_installer
+  type run_meru_setup >/dev/null 2>&1 || { rm -rf "$dir"; test_fail "run_meru_setup is missing"; return; }
+  bin_dir="$dir/home with spaces/.local/bin"
+  has_tty() { return 0; }
+  ask() { return 0; }
+  run_with_tty() { printf '%s\n' "$*" >"$log"; }
+  run_meru_setup
+  output=$(cat "$log")
+  rm -rf "$dir"
+  assert_equal "$bin_dir/meru setup" "$output"
+  case "$output" in *--main*) test_fail "Ubuntu setup overrode the lite default" ;; esac
+}
+
 # run_test isolates each test because installer failures call exit.
 run_test() {
-  local name=$1
+  local name=$1 status
   tests_run=$((tests_run + 1))
-  if ("$name"); then
+  (set -e; "$name")
+  status=$?
+  if [ "$status" -eq 0 ]; then
     printf 'PASS: %s\n' "$name"
   else
     tests_failed=$((tests_failed + 1))
@@ -221,7 +329,13 @@ for test_name in \
   test_macos_uses_shasum \
   test_install_cli_sets_mode_0755 \
   test_path_line_is_added_once \
-  test_install_handles_home_with_spaces
+  test_install_handles_home_with_spaces \
+  test_existing_ollama_is_kept \
+  test_ollama_installer_is_saved_then_run_after_yes \
+  test_declined_ollama_runs_nothing \
+  test_no_tty_runs_no_privileged_or_optional_command \
+  test_meru_yes_banner_names_sudo_steps \
+  test_linux_setup_uses_no_main_override
 do
   run_test "$test_name"
 done

@@ -27,6 +27,11 @@ all="${MERU_YES:-0}"
 say() { printf '\n==> %s\n' "$*"; }
 fail() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 
+# has_tty reports whether this process can ask questions on its controlling terminal.
+has_tty() {
+  { : </dev/tty; } 2>/dev/null
+}
+
 # ask prints a yes/no question and returns 0 for yes. The script's own input
 # is the curl pipe, so answers come from the terminal, /dev/tty. With no
 # terminal, such as in CI, every answer is no.
@@ -36,7 +41,7 @@ ask() {
   if [ "$all" = 1 ]; then printf '%s yes\n' "$1"; return 0; fi
   # Opening /dev/tty fails when there is no terminal, even if the file
   # exists, so try it quietly first.
-  if ! { : </dev/tty; } 2>/dev/null; then return 1; fi
+  if ! has_tty; then return 1; fi
   printf '%s [y/N] ' "$1" >/dev/tty
   read -r reply </dev/tty || return 1
   case "$reply" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
@@ -114,6 +119,126 @@ ensure_path_line() {
   printf '%s\n' "$line" >>"$profile_file"
 }
 
+# ollama_ready checks Ollama's loopback API without using a configured proxy.
+ollama_ready() {
+  curl --noproxy '*' -fsS --max-time 2 http://127.0.0.1:11434/api/version >/dev/null 2>&1
+}
+
+# install_ollama_linux keeps a working Ollama or runs its saved installer after consent.
+install_ollama_linux() {
+  local temp_dir=$1 installer_file="$1/ollama-install.sh"
+  ollama_install_ran=0
+  if ollama_ready; then
+    echo "Ollama is already answering on 127.0.0.1:11434."
+    return 0
+  fi
+  if ! ask "Download and run Ollama's Linux installer? It may use sudo."; then
+    echo "Install Ollama later from https://ollama.com/download/linux."
+    return 0
+  fi
+  curl -fsSL -o "$installer_file" https://ollama.com/install.sh || fail "couldn't download Ollama's installer"
+  ollama_install_ran=1
+  sh "$installer_file"
+}
+
+# wait_for_ollama waits for the local API and prints service checks on failure.
+wait_for_ollama() {
+  local seconds=$1 waited=0
+  while [ "$waited" -lt "$seconds" ]; do
+    ollama_ready && return 0
+    sleep 1
+    waited=$((waited + 1))
+  done
+  printf 'Ollama did not answer on http://127.0.0.1:11434. Check:\n' >&2
+  printf '  systemctl status ollama --no-pager\n' >&2
+  printf '  journalctl -u ollama -n 50 --no-pager\n' >&2
+  return 1
+}
+
+# run_with_tty gives an interactive child the terminal instead of the curl pipe.
+run_with_tty() {
+  "$@" </dev/tty
+}
+
+# run_meru_setup hands config and model setup to the existing command-line client.
+run_meru_setup() {
+  if has_tty && ask "Run meru setup now (models, config, folders, and tools)?"; then
+    run_with_tty "$bin_dir/meru" setup
+  else
+    echo "Run 'meru setup' when you're ready. A new setup uses the lite profile by default."
+  fi
+}
+
+# linux_banner names every download and privileged step before work begins.
+linux_banner() {
+  local version=$1
+  echo
+  echo "  Meru $version for Ubuntu 24.04 on x86-64"
+  echo "  -----------------------------------------"
+  echo "  This installer downloads Meru from GitHub."
+  echo "  It can download Ollama's installer, which may use sudo."
+  echo "  It can pull the SearXNG image, docker.io/searxng/searxng:latest, with Podman or Docker."
+  echo "  For a headless server, it can run: sudo loginctl enable-linger \"$USER\""
+  echo "  It installs neither Podman nor Docker."
+  if [ "$all" = 1 ]; then
+    echo "  MERU_YES=1 accepts every step, including Ollama's installer and lingering."
+  fi
+  echo
+}
+
+# setup_searxng is the Task 4 seam for optional local web search.
+setup_searxng() {
+  return 0
+}
+
+# install_user_service is the Task 5 seam for the systemd user unit.
+install_user_service() {
+  return 0
+}
+
+# install_linux installs the verified CLI, then delegates setup to existing commands.
+install_linux() {
+  local version=$1 base cli release_dir choice
+  linux_banner "$version"
+  if [ "$all" != 1 ] && has_tty; then
+    printf 'Install everything [a], choose each step [s], or quit [q]? ' >/dev/tty
+    read -r choice </dev/tty || choice=q
+    case "$choice" in
+      [aA]*) all=1 ;;
+      [sS]*) all=0 ;;
+      *) echo "Nothing installed."; return 0 ;;
+    esac
+  fi
+
+  tmp=$(mktemp -d)
+  # EXIT removes the download folder whether this path succeeds or fails.
+  trap 'rm -rf "$tmp"' EXIT
+  base="https://github.com/$repo/releases/download/$version"
+  cli="meru-$version-linux-amd64.tar.gz"
+  release_dir="meru-$version-linux-amd64"
+  curl -fsSL -o "$tmp/$cli" "$base/$cli" || fail "couldn't download $cli from $base"
+  curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS" || fail "couldn't download SHA256SUMS from $base"
+
+  say "Checking the downloads against SHA256SUMS"
+  verify_downloads Linux "$tmp" || fail "a download doesn't match SHA256SUMS; nothing was installed"
+  say "Installing meru and merud in $bin_dir"
+  install_cli "$tmp/$cli" "$release_dir" "$bin_dir"
+  ensure_path_line "$HOME/.profile" '$HOME/.local/bin'
+  export PATH="$bin_dir:$PATH"
+
+  say "Ollama runs the models"
+  install_ollama_linux "$tmp"
+  if ollama_ready; then
+    run_meru_setup
+  elif [ "${ollama_install_ran:-0}" = 1 ] && wait_for_ollama 60; then
+    run_meru_setup
+  else
+    echo "Run 'meru setup' after Ollama starts."
+  fi
+  setup_searxng
+  install_user_service
+}
+
 # main performs the install when Bash executes this file rather than sourcing it.
 main() {
 local kernel machine platform os arch
@@ -132,7 +257,8 @@ if [ -z "$version" ]; then
 fi
 case "$version" in v[0-9]*.[0-9]*.[0-9]*) ;; *) fail "couldn't find the release to install (got '$version')" ;; esac
 if [ "$platform" = linux-amd64 ]; then
-  fail "Ubuntu support is not complete in this installer yet"
+  install_linux "$version"
+  return
 fi
 # What this Mac will get, so the banner can list it before anything starts.
 mem_gb=$(( $(sysctl -n hw.memsize) / 1073741824 ))
