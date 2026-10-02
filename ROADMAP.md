@@ -199,11 +199,21 @@ Chained tool calls split them most (78%, 67% and 61%), and `qwen-moe` answered
 fastest, with a median of 6.5 s to the last token.
 
 ## v0.5 — It acts unprompted
+- Ubuntu 24.04 x86-64 command-line installation through `scripts/install.sh`, with
+  the `lite` profile by default
+- Optional SearXNG through working rootless Podman or Docker, with neither runtime
+  installed by Meru
+- `merud` as a systemd user service, with lingering only after the user accepts it
+- Ubuntu desktop packaging follows in a later stage of issue #84
 - Job definitions (prompt + cron) as `[[jobs]]` in `config.toml`
 - In-daemon scheduler sharing the warm model
 - Digests, notifications, `meru brief`
 
-**Done when:** a morning brief lands without you asking.
+**Ubuntu done when:** on a fresh Ubuntu 24.04 x86-64 machine, one documented
+command installs command-line Meru with the `lite` profile, starts `merud`, and a
+normal question plus a question about an indexed file both use the right model.
+
+**Scheduler done when:** a morning brief lands without you asking.
 
 ## Later, maybe
 - Voice: local speech-to-text, text-to-speech and a wake word

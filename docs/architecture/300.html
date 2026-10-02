@@ -278,7 +278,7 @@
     <li><a href="#mcp">Tools over MCP</a></li>
     <li><a href="#local-commands">Local commands</a></li>
     <li><a href="#setup">First run and setup</a></li>
-    <li><a href="#installer">The Mac installer</a></li>
+    <li><a href="#installer">Installers</a></li>
     <li><a href="#web-search">Web search</a></li>
     <li><a href="#a2a">Other agents over A2A</a></li>
     <li><a href="#scheduler">Scheduled jobs</a></li>
@@ -748,10 +748,13 @@
   <thead><tr><th>Platform</th><th>Status</th><th>Restarts <code>merud</code> after a reboot</th></tr></thead>
   <tbody>
     <tr><td>macOS, Apple silicon</td><td>Supported and tested. The development machine is a Mac Studio (M4 Max, 64 GB).</td><td><code>launchd</code></td></tr>
-    <tr><td>Linux, x86-64 or arm64</td><td>Supported, including home servers and cloud virtual machines.</td><td><code>systemd</code></td></tr>
+    <tr><td>Ubuntu 24.04, x86-64</td><td>Command-line clients and daemon supported and tested, including home servers and cloud virtual machines.</td><td><code>systemd --user</code></td></tr>
+    <tr><td>Other Linux systems and Linux arm64</td><td>Should work; not tested at first.</td><td><code>systemd</code></td></tr>
     <tr><td>Windows 10 and later</td><td>Should work; not tested at first.</td><td>a Windows service</td></tr>
   </tbody>
 </table></div>
+
+<p>On Ubuntu 24.04 x86-64, <code>scripts/install.sh</code> is the install path. It installs the command-line clients and daemon, uses the <code>lite</code> profile by default, and makes no GPU-based model recommendation. The desktop app and its Wails installer remain Mac-only in this stage.</p>
 
 <p>On a cloud server, Meru still sends no prompt to a model provider, but your notes, email and transcripts live on that server. Meru's promise is "a machine you control"; where that machine sits is your call. You'd run <code>meru</code> over SSH, because it reaches <code>merud</code> through a local socket.</p>
 
@@ -2285,7 +2288,19 @@ meru mcp add http &lt;name&gt; &lt;url&gt; [--remote]          # a Streamable HT
 <p>On a Mac, the installer in each release's disk image does all of this in a window, before <code>merud</code> exists, and more: it installs Ollama, starts SearXNG in Docker, sets up the Google server and starts <code>merud</code> at login (see <a href="#installer">The Mac installer</a>).</p>
 
 <!-- ============================================================ -->
-<h2 id="installer">The Mac installer</h2>
+<h2 id="installer">Installer</h2>
+
+<p>Meru has one release installer for each verified path. <code>scripts/install.sh</code> installs the command-line clients and daemon on Ubuntu 24.04 x86-64. The Wails installer, "Install Meru.app", remains the Mac path.</p>
+
+<h3>The Ubuntu terminal installer</h3>
+
+<p>The same one-line <code>scripts/install.sh</code> entry point that installs release archives on macOS also installs Ubuntu. It verifies the release checksum before it writes <code>meru</code> or <code>merud</code>, then runs <code>meru setup</code> with the existing <code>lite</code> default. This stage does not inspect a GPU or suggest a larger model.</p>
+
+<p>The installer keeps a SearXNG that already answers on <code>127.0.0.1:8888</code>. Otherwise it uses working rootless Podman when present, then working Docker. It installs neither container runtime. Both paths bind SearXNG to loopback only and keep its settings and secret when the installer runs again.</p>
+
+<p><code>merud</code> runs through the user's systemd instance from <code>%h/.local/bin/merud</code>. The installer enables and starts that user service. On a headless server it offers to enable lingering, explains that this runs the user service without a login session, and calls <code>sudo loginctl enable-linger</code> only after the user accepts that step.</p>
+
+<h3>The Mac installer</h3>
 
 <p>The Mac installer, "Install Meru.app", takes a Mac with Apple silicon from nothing to a running Meru in nine steps: Ollama and the models, web search, folders in the index, skills and commands, Google if you want it, your profile, and <code>merud</code> started at login. Each release carries it in a disk image, <code>Meru-vX.Y.Z-macos-arm64.dmg</code>, beside the zip files. <code>scripts/install.sh</code> and the <code>meru-install</code> skill stay for people who prefer a terminal.</p>
 
@@ -2772,7 +2787,7 @@ capture_content  = false                     # prompt/response text in spans</co
   <thead><tr><th>Question</th><th>Decision</th></tr></thead>
   <tbody>
     <tr><td>Language</td><td>Go, for a small footprint, easy distribution, room to scale, built-in concurrency and fewer dependencies (see <a href="#why-go">Why Go</a>).</td></tr>
-    <tr><td>Platforms</td><td>macOS on Apple silicon first, Linux supported, Windows untested at first. Cloud servers count as "a machine you control".</td></tr>
+    <tr><td>Platforms</td><td>macOS on Apple silicon first; Ubuntu 24.04 x86-64 verified for the command-line clients and daemon; other Linux systems should work; Windows remains untested. Cloud servers count as "a machine you control".</td></tr>
     <tr><td>Agent harness</td><td>Our own loop plus the official MCP and A2A Go SDKs. We looked at Eino and ADK Go. ADK Go pulls a cloud-model client into the dependency tree, and neither saves much once the allowlist, audit and budget logic are ours.</td></tr>
     <tr><td>Model runtime</td><td>Ollama on loopback for now (see open question 4).</td></tr>
     <tr><td>Models</td><td>The <code>lite</code> profile by default (MiniCPM5-2B + <code>nomic-embed-text</code>), and <code>full</code> for Apple silicon with 64 GB or more (<code>qwen3.6:35b-a3b-mxfp8</code> + <code>qwen3-embedding:0.6b</code>).</td></tr>

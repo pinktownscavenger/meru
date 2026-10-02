@@ -271,7 +271,7 @@
 <!-- ============================================================ -->
 <h2 id="what-meru-is">What Meru is</h2>
 
-<p>Meru answers questions, searches your notes and calls tools you already use, such as your calendar or email. Every model it runs sits on the same machine as your files: a Mac first, a Linux box or a cloud server you rent. Windows 10 and later should work but is untested at first.</p>
+<p>Meru answers questions, searches your notes and calls tools you already use, such as your calendar or email. Every model it runs sits on the same machine as your files: a Mac first, or Ubuntu 24.04 on an x86-64 Linux box or cloud server you rent. Other Linux systems and Windows 10 or later should work but are untested at first.</p>
 
 <p>An assistant that reads your notes, mail and calendar could leak all three. A <b>cloud model</b>, one that runs on another company's servers, would see every prompt. Meru has no code that talks to one. It runs open-weight models through <b>Ollama</b>, a free program that serves models on your own computer, and reaches Ollama over <b>loopback</b>, the 127.0.0.1 address that never leaves the machine. Tools you add run as separate programs, and one such as Gmail can reach the network on its own (see <a href="#tools">Tools over MCP</a>). So can SearXNG, the search engine you run for web search (see <a href="#web-search">Web search</a>).</p>
 
@@ -288,6 +288,14 @@
 <p><b>Why Go.</b> Both programs are written in Go rather than Python, the usual language for AI tools. Each builds into one file of tens of megabytes that runs on macOS, Linux or Windows with nothing else installed; a Python app would also need an interpreter and its packages. <code>merud</code> runs all day, so its small memory use matters, and it matters more when one server runs a Meru for each of many people, sharing one Ollama. Go also runs streaming, parallel tool calls and background jobs side by side without extra machinery, and its standard library covers most of what Meru needs, so Meru depends on fewer outside packages. <a href="300.html#why-go">Level 300</a> lists all the reasons and the trade-off.</p>
 
 <p><code>meru "..."</code> asks one question and prints plain text, so it works in scripts. <code>meru chat</code> keeps a conversation open in the terminal until you quit. On a cloud server you run <code>meru</code> over SSH. The desktop app, <code>meru-desktop</code>, is a third client in a window of its own (see <a href="#desktop-app">The desktop app</a>). After a reboot the operating system restarts <code>merud</code>: <code>launchd</code> on macOS, <code>systemd</code> on Linux, a Windows service on Windows.</p>
+
+<h3>The Ubuntu installer</h3>
+
+<p>On Ubuntu 24.04 x86-64, <code>scripts/install.sh</code> installs the command-line clients and daemon from the release archive. It checks the archive before it writes either binary, then hands model and config setup to <code>meru setup</code>. A new setup keeps the existing <code>lite</code> default; this stage does not inspect a GPU or suggest a larger model. The desktop app and its Wails installer remain Mac-only.</p>
+
+<p>Web search is optional. The installer first keeps a SearXNG that works. If it needs to start one, it prefers a working rootless Podman and falls back to a working Docker engine. It installs neither runtime, and both paths expose SearXNG only on <code>127.0.0.1:8888</code>.</p>
+
+<p>The installer writes the canonical <code>merud</code> systemd user service, then enables and starts it. A user service normally stops when its last login session ends. For a headless server, the installer offers systemd lingering and explains the change; it runs <code>sudo loginctl enable-linger</code> only after the user accepts that step.</p>
 
 <figure id="fig-overview">
 <div class="figbox">
