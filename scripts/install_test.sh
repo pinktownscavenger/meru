@@ -304,6 +304,36 @@ test_linux_setup_uses_no_main_override() {
   case "$output" in *--main*) test_fail "Ubuntu setup overrode the lite default" ;; esac
 }
 
+# test_linux_configures_web_before_setup keeps setup's web check useful.
+test_linux_configures_web_before_setup() {
+  local dir log output
+  dir=$(mktemp -d); log="$dir/log"
+  load_installer
+  type configure_linux >/dev/null 2>&1 || { rm -rf "$dir"; test_fail "configure_linux is missing"; return; }
+  setup_searxng() { printf 'web\n' >>"$log"; }
+  ollama_ready() { return 0; }
+  run_meru_setup() { printf 'setup\n' >>"$log"; }
+  finish_linux_setup() { printf 'service\n' >>"$log"; }
+  print_linux_checks() { printf 'checks\n' >>"$log"; }
+  configure_linux
+  output=$(cat "$log")
+  rm -rf "$dir"
+  assert_equal $'web\nsetup\nservice\nchecks' "$output"
+}
+
+# test_linux_checks_name_acceptance_commands prints the handoff commands.
+test_linux_checks_name_acceptance_commands() {
+  local output
+  load_installer
+  type print_linux_checks >/dev/null 2>&1 || { test_fail "print_linux_checks is missing"; return; }
+  output=$(print_linux_checks)
+  assert_contains "$output" 'meru ping'
+  assert_contains "$output" 'meru index -status'
+  assert_contains "$output" 'systemctl --user status merud'
+  assert_contains "$output" 'journalctl --user -u merud'
+  assert_contains "$output" 'indexed file'
+}
+
 # test_ready_searxng_is_kept performs no container work when JSON already answers.
 test_ready_searxng_is_kept() {
   local dir log
@@ -423,6 +453,57 @@ test_podman_quadlet_binds_loopback_and_uses_percent_h() {
   grep -Fqx 'WantedBy=default.target' "$unit"
 }
 
+# test_podman_starts_generated_service_without_enable follows Quadlet's boot model.
+test_podman_starts_generated_service_without_enable() {
+  local dir log old_home
+  dir=$(mktemp -d); log="$dir/log"; old_home=$HOME
+  load_installer
+  HOME="$dir/home"; version=v0.0.0
+  podman() { return 1; }
+  curl() {
+    local destination
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = -o ]; then destination=$2; break; fi
+      shift
+    done
+    cp "$script_dir/../deploy/systemd/meru-searxng.container" "$destination"
+  }
+  systemctl() { printf 'systemctl %s\n' "$*" >>"$log"; }
+  setup_searxng_podman "$HOME/.meru/searxng"
+  grep -Fqx 'systemctl --user daemon-reload' "$log"
+  grep -Fqx 'systemctl --user start meru-searxng.service' "$log"
+  if grep -Fq ' enable ' "$log"; then test_fail "Quadlet service was passed to systemctl enable"; fi
+  HOME=$old_home
+  rm -rf "$dir"
+}
+
+# test_podman_systemd_failure_returns avoids a 90-second wait after setup failed.
+test_podman_systemd_failure_returns() {
+  local dir old_home
+  dir=$(mktemp -d); old_home=$HOME
+  load_installer
+  HOME="$dir/home"; version=v0.0.0
+  podman() { return 1; }
+  curl() {
+    local destination
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = -o ]; then destination=$2; break; fi
+      shift
+    done
+    mkdir -p "$(dirname "$destination")"
+    : >"$destination"
+  }
+  systemctl() { return 1; }
+  if setup_searxng_podman "$HOME/.meru/searxng"; then
+    HOME=$old_home
+    rm -rf "$dir"
+    test_fail "Podman setup hid a systemctl failure"
+    return
+  fi
+  HOME=$old_home
+  rm -rf "$dir"
+}
+
 # test_docker_argv_binds_loopback_and_restarts checks distinct Docker arguments.
 test_docker_argv_binds_loopback_and_restarts() {
   local dir log output
@@ -435,6 +516,24 @@ test_docker_argv_binds_loopback_and_restarts() {
   assert_contains "$output" '<--restart><unless-stopped>'
   assert_contains "$output" '<--publish><127.0.0.1:8888:8080>'
   assert_contains "$output" "<$dir/home with spaces/.meru/searxng:/etc/searxng>"
+  rm -rf "$dir"
+}
+
+# test_docker_pull_failure_stops_before_run returns to the recovery path.
+test_docker_pull_failure_stops_before_run() {
+  local dir log
+  dir=$(mktemp -d); log="$dir/log"
+  load_installer
+  docker() {
+    printf 'docker %s\n' "$*" >>"$log"
+    [ "$1" != pull ]
+  }
+  if setup_searxng_docker "$dir/settings"; then
+    rm -rf "$dir"
+    test_fail "Docker setup hid a pull failure"
+    return
+  fi
+  if grep -q '^docker run ' "$log"; then test_fail "Docker ran after its pull failed"; fi
   rm -rf "$dir"
 }
 
@@ -648,6 +747,8 @@ for test_name in \
   test_no_tty_runs_no_privileged_or_optional_command \
   test_meru_yes_banner_names_sudo_steps \
   test_linux_setup_uses_no_main_override \
+  test_linux_configures_web_before_setup \
+  test_linux_checks_name_acceptance_commands \
   test_ready_searxng_is_kept \
   test_existing_podman_container_keeps_podman \
   test_existing_docker_container_keeps_docker \
@@ -657,7 +758,10 @@ for test_name in \
   test_settings_have_json_random_secret_and_modes \
   test_existing_settings_secret_is_kept \
   test_podman_quadlet_binds_loopback_and_uses_percent_h \
+  test_podman_starts_generated_service_without_enable \
+  test_podman_systemd_failure_returns \
   test_docker_argv_binds_loopback_and_restarts \
+  test_docker_pull_failure_stops_before_run \
   test_searxng_handles_home_with_spaces \
   test_merud_unit_uses_local_bin \
   test_service_install_reloads_enables_and_starts \

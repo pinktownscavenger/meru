@@ -209,9 +209,10 @@ The script names every download and privileged step before it starts. It then:
 2. checks the archive before it installs `meru` and `merud` in
    `~/.local/bin`;
 3. offers Ollama's Linux installer, which may use `sudo`, and waits for Ollama;
-4. runs `meru setup` for the `lite` models, folders and tools;
-5. offers SearXNG through working rootless Podman, or working Docker when
+4. offers SearXNG through working rootless Podman, or working Docker when
    Podman is unavailable;
+5. runs `meru setup` for the `lite` models, folders and tools, including its
+   check of the SearXNG service;
 6. installs and starts `merud` as a systemd user service;
 7. after `meru ping` works, offers `meru setup user`; and
 8. offers `sudo loginctl enable-linger "$USER"` for a server that should keep
@@ -2373,7 +2374,7 @@ systemctl --user disable --now merud.service
 rm "$HOME/.config/systemd/user/merud.service"
 
 # Run this block only when the Podman Quadlet exists.
-systemctl --user disable --now meru-searxng.service
+systemctl --user stop meru-searxng.service
 rm "$HOME/.config/containers/systemd/meru-searxng.container"
 systemctl --user daemon-reload
 

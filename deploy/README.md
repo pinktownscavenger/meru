@@ -99,8 +99,9 @@ choice is not needed on a workstation where your login session stays open.
 The release installer prefers a working rootless Podman, then falls back to a
 working Docker daemon. It installs neither. With Podman, it copies the Quadlet
 to `~/.config/containers/systemd/meru-searxng.container`, reloads the user
-manager and enables `meru-searxng.service`. The generated service mounts
-`~/.meru/searxng` and publishes only `127.0.0.1:8888`.
+manager and starts `meru-searxng.service`. The Quadlet's `[Install]` section
+wires it to `default.target` each time the generator runs. The generated service
+mounts `~/.meru/searxng` and publishes only `127.0.0.1:8888`.
 
 Check or restart it with:
 

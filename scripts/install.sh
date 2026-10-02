@@ -267,8 +267,10 @@ setup_searxng_podman() {
   raw_url="https://raw.githubusercontent.com/$repo/$version/deploy/systemd/meru-searxng.container"
   mkdir -p "$unit_dir"
   curl -fsSL -o "$unit" "$raw_url" || return 1
-  systemctl --user daemon-reload
-  systemctl --user enable --now meru-searxng.service
+  systemctl --user daemon-reload || return 1
+  # Quadlet's [Install] section wires boot start during generation. Its generated
+  # service is transient, so systemctl cannot enable it as a regular unit.
+  systemctl --user start meru-searxng.service || return 1
   : "$settings_dir"
 }
 
@@ -284,7 +286,7 @@ setup_searxng_docker() {
     --env SEARXNG_BASE_URL=http://127.0.0.1:8888/
     docker.io/searxng/searxng:latest
   )
-  docker pull docker.io/searxng/searxng:latest
+  docker pull docker.io/searxng/searxng:latest || return 1
   docker "${args[@]}"
 }
 
@@ -454,6 +456,32 @@ finish_linux_setup() {
   install_user_service
 }
 
+# print_linux_checks gives the user a short end-to-end acceptance list.
+print_linux_checks() {
+  echo
+  echo "Check Meru:"
+  echo "  meru ping"
+  echo "  meru index -status"
+  echo "  systemctl --user status merud"
+  echo "  journalctl --user -u merud -n 50 --no-pager"
+  echo "  meru \"In one sentence, what can you help me with?\""
+  echo "  Add a unique sentence to an indexed file, then ask Meru about it and check the citation."
+}
+
+# configure_linux starts web search before setup checks it, then starts merud when configured.
+configure_linux() {
+  setup_searxng
+  if ollama_ready; then
+    run_meru_setup
+  elif [ "${ollama_install_ran:-0}" = 1 ] && wait_for_ollama 60; then
+    run_meru_setup
+  else
+    echo "Run 'meru setup' after Ollama starts."
+  fi
+  finish_linux_setup
+  print_linux_checks
+}
+
 # install_linux installs the verified CLI, then delegates setup to existing commands.
 install_linux() {
   local version=$1 base cli release_dir choice
@@ -486,15 +514,7 @@ install_linux() {
 
   say "Ollama runs the models"
   install_ollama_linux "$tmp"
-  if ollama_ready; then
-    run_meru_setup
-  elif [ "${ollama_install_ran:-0}" = 1 ] && wait_for_ollama 60; then
-    run_meru_setup
-  else
-    echo "Run 'meru setup' after Ollama starts."
-  fi
-  setup_searxng
-  finish_linux_setup
+  configure_linux
 }
 
 # main performs the install when Bash executes this file rather than sourcing it.

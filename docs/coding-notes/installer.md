@@ -23,12 +23,15 @@ setup uses the `lite` profile because the script leaves model choice with `meru
 setup` instead of putting model names in the installer.
 
 After the binaries land, the script offers Ollama and waits for its loopback API.
-It gives the terminal to `meru setup`, which owns model downloads, folders and
-tools. Web search is optional. The script keeps an existing `meru-searxng`
-container with its current runtime; for a new one it prefers working rootless
-Podman and falls back to working Docker. Podman uses the checked-in Quadlet and a
-systemd user service. Docker uses one named container. Both publish only
-`127.0.0.1:8888`, and the script never installs a container runtime.
+It offers optional web search before it gives the terminal to `meru setup`, so
+setup can check the service. Setup owns model downloads, folders and tools. The
+script keeps an existing `meru-searxng` container with its current runtime; for a
+new one it prefers working rootless Podman and falls back to working Docker.
+Podman uses the checked-in Quadlet and a systemd user service. Docker uses one
+named container. Both publish only `127.0.0.1:8888`, and the script never
+installs a container runtime. Quadlet's generator applies the file's `[Install]`
+section during `daemon-reload`, so the script starts the generated transient
+service but does not try to enable it as a regular unit.
 
 The last step installs `deploy/systemd/merud.service`, waits for `meru ping`, and
 then offers the user profile. A headless server can keep the user services alive
