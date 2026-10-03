@@ -29,6 +29,14 @@ assert_contains() {
   esac
 }
 
+# mode_of prints one file's numeric mode on macOS or Linux.
+mode_of() {
+  case "$(uname -s)" in
+    Darwin) stat -f %Lp "$1" ;;
+    *) stat -c %a "$1" ;;
+  esac
+}
+
 # load_installer sources the functions under test. The installer must not run main.
 load_installer() {
   # shellcheck source=install.sh
@@ -165,9 +173,9 @@ test_install_cli_sets_mode_0755() {
   make_cli_archive "$dir" meru-test-linux-amd64
   load_installer
   install_cli "$dir/release.tar.gz" meru-test-linux-amd64 "$destination"
-  mode=$(stat -f %Lp "$destination/meru" 2>/dev/null || stat -c %a "$destination/meru")
+  mode=$(mode_of "$destination/meru")
   assert_equal 755 "$mode"
-  mode=$(stat -f %Lp "$destination/merud" 2>/dev/null || stat -c %a "$destination/merud")
+  mode=$(mode_of "$destination/merud")
   rm -rf "$dir"
   assert_equal 755 "$mode"
 }
@@ -285,6 +293,15 @@ test_meru_yes_banner_names_sudo_steps() {
   assert_contains "$output" "sudo"
   assert_contains "$output" "loginctl enable-linger"
   assert_contains "$output" "accepts every step"
+}
+
+# test_linux_banner_does_not_require_user_env supports sparse service environments.
+test_linux_banner_does_not_require_user_env() {
+  local output
+  load_installer
+  output=$(unset USER; linux_banner v0.0.0)
+  assert_contains "$output" 'loginctl enable-linger'
+  assert_contains "$output" "$(id -un)"
 }
 
 # test_linux_setup_uses_no_main_override keeps the setup command on lite by default.
@@ -418,8 +435,8 @@ test_settings_have_json_random_secret_and_modes() {
   [ "${#secret}" -eq 64 ] || { test_fail "secret is not 64 hex digits"; rm -rf "$dir"; return; }
   instance_names=$(grep -Fc '  instance_name: "Meru web search"' "$settings")
   assert_equal 1 "$instance_names"
-  dir_mode=$(stat -f %Lp "$dir/searxng" 2>/dev/null || stat -c %a "$dir/searxng")
-  file_mode=$(stat -f %Lp "$settings" 2>/dev/null || stat -c %a "$settings")
+  dir_mode=$(mode_of "$dir/searxng")
+  file_mode=$(mode_of "$settings")
   assert_equal 700 "$dir_mode"
   assert_equal 600 "$file_mode"
   rm -rf "$dir"
@@ -683,35 +700,31 @@ test_declined_lingering_never_calls_sudo() {
 
 # test_accepted_lingering_runs_exact_loginctl_command checks the privileged argv.
 test_accepted_lingering_runs_exact_loginctl_command() {
-  local dir log output old_user
-  dir=$(mktemp -d); log="$dir/log"; old_user=${USER:-}
+  local dir log output
+  dir=$(mktemp -d); log="$dir/log"
   load_installer
-  USER=meru-test
+  current_user() { printf 'meru-test\n'; }
   ask() { return 0; }
   sudo() { printf 'sudo %s\n' "$*" >>"$log"; }
   loginctl() { printf 'loginctl %s\n' "$*" >>"$log"; printf 'yes\n'; }
   offer_lingering
   output=$(cat "$log")
   assert_equal $'sudo loginctl enable-linger meru-test\nloginctl show-user meru-test -p Linger --value' "$output"
-  USER=$old_user
   rm -rf "$dir"
 }
 
 # test_lingering_must_report_yes rejects a command that did not take effect.
 test_lingering_must_report_yes() {
-  local output old_user
-  old_user=${USER:-}
+  local output
   load_installer
-  USER=meru-test
+  current_user() { printf 'meru-test\n'; }
   ask() { return 0; }
   sudo() { return 0; }
   loginctl() { printf 'no\n'; }
   if output=$(offer_lingering 2>&1); then
-    USER=$old_user
     test_fail "lingering accepted Linger=no"
     return
   fi
-  USER=$old_user
   assert_contains "$output" 'Linger=yes'
 }
 
@@ -746,6 +759,7 @@ for test_name in \
   test_declined_ollama_runs_nothing \
   test_no_tty_runs_no_privileged_or_optional_command \
   test_meru_yes_banner_names_sudo_steps \
+  test_linux_banner_does_not_require_user_env \
   test_linux_setup_uses_no_main_override \
   test_linux_configures_web_before_setup \
   test_linux_checks_name_acceptance_commands \

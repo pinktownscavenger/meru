@@ -169,16 +169,22 @@ run_meru_setup() {
   fi
 }
 
+# current_user returns the account name from the operating system, not the environment.
+current_user() {
+  id -un
+}
+
 # linux_banner names every download and privileged step before work begins.
 linux_banner() {
-  local version=$1
+  local version=$1 username
+  username=$(current_user) || username='<your-user>'
   echo
   echo "  Meru $version for Ubuntu 24.04 on x86-64"
   echo "  -----------------------------------------"
   echo "  This installer downloads Meru from GitHub."
   echo "  It can download Ollama's installer, which may use sudo."
   echo "  It can pull the SearXNG image, docker.io/searxng/searxng:latest, with Podman or Docker."
-  echo "  For a headless server, it can run: sudo loginctl enable-linger \"$USER\""
+  echo "  For a headless server, it can run: sudo loginctl enable-linger \"$username\""
   echo "  It installs neither Podman nor Docker."
   if [ "$all" = 1 ]; then
     echo "  MERU_YES=1 accepts every step, including Ollama's installer and lingering."
@@ -423,21 +429,22 @@ offer_user_profile() {
 
 # offer_lingering enables a headless user service only after explicit consent.
 offer_lingering() {
-  local state
+  local state username
+  username=$(current_user) || { echo "Could not find the current user." >&2; return 1; }
   if ! ask "Keep merud running on this server while you are logged out? This uses sudo loginctl enable-linger."; then
     echo "Lingering was not enabled. merud runs while your user has a login session."
     return 0
   fi
-  if ! sudo loginctl enable-linger "$USER"; then
-    echo "Could not enable lingering for $USER." >&2
+  if ! sudo loginctl enable-linger "$username"; then
+    echo "Could not enable lingering for $username." >&2
     return 1
   fi
-  state=$(loginctl show-user "$USER" -p Linger --value) || return 1
+  state=$(loginctl show-user "$username" -p Linger --value) || return 1
   if [ "$state" != yes ]; then
-    echo "Lingering did not report Linger=yes for $USER." >&2
+    echo "Lingering did not report Linger=yes for $username." >&2
     return 1
   fi
-  echo "Lingering is enabled for $USER."
+  echo "Lingering is enabled for $username."
 }
 
 # install_user_service starts merud before profile and lingering questions.
