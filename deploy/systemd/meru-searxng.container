@@ -1,0 +1,16 @@
+[Unit]
+Description=Meru web search
+
+[Container]
+Image=docker.io/searxng/searxng:2026.9.29-4e2c1ea7f@sha256:3284e8900e9b3e5df284ae8c48a26851ae2eff6f99b4b0b18ec3da5a4d9095c3
+ContainerName=meru-searxng
+PublishPort=127.0.0.1:8888:8080
+Volume=%h/.meru/searxng:/etc/searxng
+Environment=SEARXNG_BASE_URL=http://127.0.0.1:8888/
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=900
+
+[Install]
+WantedBy=default.target

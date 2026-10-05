@@ -297,8 +297,13 @@ same `Config` as no file at all; `TestTemplateMatchesDefaults` checks that.
 The `[models]` lines stay empty, with the `lite` names in comments, because a
 name there would override the profile: a user who then picked `full` would
 still run the `lite` model. The MCP servers, local commands, A2A agent and a
-`[connectors.obsidian]` table sit in comments, ready to uncomment. So do six
-read-only GitHub commands for the `gh` CLI: nothing runs until the user takes
+`[connectors.obsidian]` table sit in comments, ready to uncomment. The command
+examples label what works on macOS and Linux, what needs Linux, and what needs
+macOS. Shared snapshots such as `df`, `pgrep`, `uname` and `uptime` stay in the
+first group. Linux and macOS use different flags and programs for the other
+snapshots, so separate groups stop a copied command from failing or reporting
+the wrong thing. Six read-only GitHub commands for the `gh` CLI follow them.
+Nothing runs until the user takes
 the `# ` off an entry, which keeps tools deny-by-default.
 
 `template.go` compiles the file into the binary:
@@ -324,7 +329,7 @@ someone ran it; the test is the simpler guard.
 
 Two more tests keep the comments honest. `TestTemplateCommentedBlocks`
 uncomments every `# [[` block and loads the result, and checks it holds three
-servers, one agent and ten commands, the GitHub ones included. The catalog's two server
+servers, one agent and 29 commands, the GitHub ones included. The catalog's two server
 blocks can't come from `catalog.Block` here, because `catalog` imports
 `config`, so the template holds a hand copy, and `TestTemplateHoldsCatalog` in
 the catalog package checks it against `Block`'s output.

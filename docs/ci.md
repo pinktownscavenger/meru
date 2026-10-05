@@ -28,6 +28,7 @@ CI builds no releases. The owner builds each one on a Mac with
 | Coverage | ci / test | Nothing fails on it; the job summary shows the total and the profile is kept as an artifact for 14 days | `make cover` |
 | Cross-compile | ci / build | Code that builds on your OS but not on another; accidental cgo | `make build` |
 | Desktop app and installer | ci / desktop (macOS) | The desktop app or the Mac installer failing to build with cgo and the WebView, or failing vet, staticcheck or govulncheck with their build tags | `make desktop installer desktop-check` (needs cgo) |
+| Ubuntu installer | ci / installer | A broken shell flow, systemd user unit or rootless Podman Quadlet; a web fetch that can reach a private address | `make install-script-test`; the service checks need systemd and Podman from Ubuntu 24.04 |
 | End-to-end | ci / e2e | A real `merud` and `meru` failing together against the fake Ollama | `make e2e` |
 | actionlint | ci / actionlint | Mistakes in the workflow files themselves | `make actionlint` |
 | govulncheck | security / govulncheck | Known vulnerabilities in the Go toolchain or a module, reported only when Meru's code can reach them | `make vuln` |
@@ -54,6 +55,14 @@ same job with `make installer`, and `internal/installer` runs in the test job.
 The end-to-end tests live in `test/e2e/` behind the `e2e` build tag. They build
 the real `merud`, `meru` and `fakeollama` binaries and drive them as separate
 processes; [docs/coding-notes/e2e.md](coding-notes/e2e.md) explains how.
+
+The Ubuntu installer job runs on Ubuntu 24.04. It tests the shell functions,
+builds `merud` at the release install path, asks systemd to verify its user
+unit, and asks Podman's systemd generator to turn the SearXNG Quadlet into a
+service. It checks the generated service for the loopback port and settings
+mount. The job does not start Ollama, download a model or start SearXNG. Those
+downloads do not belong in CI. A release check on an Ubuntu machine still covers
+the real model download, service start and reboot or logout behavior.
 
 gosec and CodeQL send their findings to the repository's Security tab, where
 GitHub keeps them next to the lines they point at. A pull request from a fork

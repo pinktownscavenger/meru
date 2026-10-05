@@ -10,8 +10,8 @@ data center.
 
 Meru reads it on your machine. Its code has no path to a cloud AI model, not even
 a disabled one. It keeps open-weight models loaded in your computer's memory, so a
-question needs no API key and costs only electricity, and the installer picks the
-model that fits your Mac's memory.
+question needs no API key and costs only electricity. The Mac installer picks a
+model for the Mac's memory; a new Ubuntu install starts with the `lite` profile.
 
 [![Download the Mac installer](https://img.shields.io/badge/Download-Mac%20installer-2F6B4F?logo=apple&style=for-the-badge)](https://github.com/aarora79/meru/releases/latest/download/Meru-macos-arm64.dmg)
 [![Latest release](https://img.shields.io/github/v/release/aarora79/meru?label=latest%20release)](https://github.com/aarora79/meru/releases/latest)
@@ -69,12 +69,29 @@ curl -fsSL https://github.com/aarora79/meru/releases/latest/download/install.sh 
 The script downloads the latest release and checks it against `SHA256SUMS`. It
 puts `meru` and `merud` in `~/.local/bin` and Meru.app in `/Applications`, then
 offers Ollama, the models, `meru setup` and starting `merud` at login, asking
-before each step. [docs/running.md](docs/running.md) covers Linux, Windows and
+before each step. [docs/running.md](docs/running.md) covers Ubuntu, Windows and
 [building from source](docs/running.md#build-from-source).
 
 Meru.app talks to `merud`, and `merud` to Ollama, so all three run together.
 Either installer sets up all three; copying Meru.app by hand gives you a window
 with nothing behind it.
+
+## Install on Ubuntu
+
+Meru's Ubuntu 24.04 x86-64 terminal installer is awaiting its fresh-host
+acceptance run. It installs the native `meru` and `merud` binaries and uses the
+`lite` model profile by default; the desktop app remains macOS-only in this stage.
+
+```sh
+curl -fsSL https://github.com/aarora79/meru/releases/latest/download/install.sh | bash
+```
+
+The script checks the release files, offers to install Ollama, runs `meru setup`,
+and can start `merud` as a systemd user service. It can also run SearXNG with an
+existing rootless Podman or Docker installation. It installs neither container
+runtime. Each optional or privileged step asks first. See the
+[Ubuntu install guide](docs/running.md#ubuntu-2404-command-line-install) for
+prerequisites, headless servers, updates, recovery and removal.
 
 ## What it does
 
@@ -82,7 +99,7 @@ with nothing behind it.
 | --- | --- |
 | **Local models** | Ollama runs the models on your machine, and `merud` keeps them loaded. |
 | **Search over your files** | Meru searches your notes, docs, PDFs and repos by keyword (BM25) and by meaning, and names the file behind each answer. |
-| **Web search** | The built-in `web_search` tool searches through SearXNG, which you run in Docker; no account or API key. The built-in `web_fetch` tool reads a whole public page, answers a question from it with the fast model, or downloads a file; it asks you before it opens an address no search or question of yours gave. Taking it out of `[builtin] tools` turns it off. [docs/running.md](docs/running.md#web-search) shows the setup. |
+| **Web search** | The built-in `web_search` tool searches through SearXNG, which you run in Podman or Docker; no account or API key. The built-in `web_fetch` tool reads a whole public page, answers a question from it with the fast model, or downloads a file; it asks you before it opens an address no search or question of yours gave. Taking it out of `[builtin] tools` turns it off. [docs/running.md](docs/running.md#web-search) shows the setup. |
 | **MCP tools** | `meru setup` offers two servers: `google` for Gmail, Calendar and Drive, and `obsidian` for notes. It adds each one for you or shows you what to paste, and `meru mcp` shows which ones are connected. |
 | **Other agents** | Meru hands tasks to agents you have allowed, over A2A. |
 | **Memory** | Meru saves what it learns about you as small Markdown files you can edit or delete. |
@@ -170,7 +187,11 @@ Meru runs wherever Ollama and Go do:
 
 - **macOS on Apple silicon:** supported and tested. Developed on a Mac Studio, M4 Max,
   64 GB.
-- **Linux:** supported, including home servers and cloud virtual machines.
+- **Ubuntu 24.04 on x86-64:** command-line support is implemented for `meru`,
+  `meru chat` and `merud`; fresh-host acceptance is pending, and the desktop app
+  is not part of this stage.
+- **Other Linux systems:** the native binaries should work, but the release
+  installer does not support them yet.
 - **Windows 10 and later:** should work; not tested at first.
 
 Two model profiles ship with it (see [ARCHITECTURE.md](ARCHITECTURE.md#model-tiers)):

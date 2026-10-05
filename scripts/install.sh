@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# install.sh installs Meru on a Mac from a GitHub release. Run it with:
+# install.sh installs Meru from a GitHub release. Run it with:
 #
 #   curl -fsSL https://github.com/aarora79/meru/releases/latest/download/install.sh | bash
 #
-# It downloads the release, checks every file against SHA256SUMS, puts meru
+# It downloads the release, checks each archive against SHA256SUMS, puts meru
 # and merud in ~/.local/bin and Meru.app in /Applications, and then offers
 # the next steps: Ollama, the models, `meru setup`, and starting merud at
 # login. It first lists what it will install and asks once: everything, each
@@ -27,6 +27,11 @@ all="${MERU_YES:-0}"
 say() { printf '\n==> %s\n' "$*"; }
 fail() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 
+# has_tty reports whether this process can ask questions on its controlling terminal.
+has_tty() {
+  { : </dev/tty; } 2>/dev/null
+}
+
 # ask prints a yes/no question and returns 0 for yes. The script's own input
 # is the curl pipe, so answers come from the terminal, /dev/tty. With no
 # terminal, such as in CI, every answer is no.
@@ -36,18 +41,531 @@ ask() {
   if [ "$all" = 1 ]; then printf '%s yes\n' "$1"; return 0; fi
   # Opening /dev/tty fails when there is no terminal, even if the file
   # exists, so try it quietly first.
-  if ! { : </dev/tty; } 2>/dev/null; then return 1; fi
+  if ! has_tty; then return 1; fi
   printf '%s [y/N] ' "$1" >/dev/tty
   read -r reply </dev/tty || return 1
   case "$reply" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
 }
 
-[ "$(uname -s)" = "Darwin" ] || fail "this installer is for macOS; see docs/running.md for Linux and Windows"
-case "$(uname -m)" in
-  arm64) arch="arm64" ;;
-  x86_64) arch="amd64" ;;
-  *) fail "unsupported processor $(uname -m)" ;;
-esac
+# os_release_value reads one key from os-release as text. It never executes the file.
+os_release_value() {
+  local path=$1 key=$2 line value
+  while IFS= read -r line; do
+    case "$line" in
+      "$key="*)
+        value=${line#*=}
+        case "$value" in
+          \"*\") value=${value#\"}; value=${value%\"} ;;
+          \'*\') value=${value#\'}; value=${value%\'} ;;
+        esac
+        printf '%s\n' "$value"
+        return 0
+        ;;
+    esac
+  done <"$path"
+  return 1
+}
+
+# platform_for maps one supported machine to the matching release archive name.
+platform_for() {
+  local kernel=$1 machine=$2 os_release_path=$3 id version_id
+  case "$kernel:$machine" in
+    Darwin:arm64) printf 'darwin-arm64\n' ;;
+    Darwin:x86_64) printf 'darwin-amd64\n' ;;
+    Linux:x86_64)
+      id=$(os_release_value "$os_release_path" ID 2>/dev/null || true)
+      version_id=$(os_release_value "$os_release_path" VERSION_ID 2>/dev/null || true)
+      if [ "$id" = ubuntu ] && [ "$version_id" = 24.04 ]; then
+        printf 'linux-amd64\n'
+      else
+        printf 'install.sh: this installer targets Ubuntu 24.04 on x86-64; use the release archive for %s %s\n' "$kernel" "$machine" >&2
+        return 1
+      fi
+      ;;
+    *)
+      printf 'install.sh: unsupported system %s %s; use the matching release archive\n' "$kernel" "$machine" >&2
+      return 1
+      ;;
+  esac
+}
+
+# verify_downloads checks files in a download directory with the platform tool.
+verify_downloads() {
+  local os=$1 directory=$2
+  case "$os" in
+    Linux) (cd "$directory" && sha256sum -c --ignore-missing SHA256SUMS) ;;
+    Darwin) (cd "$directory" && shasum -a 256 -c --ignore-missing SHA256SUMS) ;;
+    *) printf 'install.sh: no checksum tool for %s\n' "$os" >&2; return 1 ;;
+  esac
+}
+
+# install_cli extracts a verified archive and installs both command-line programs.
+install_cli() {
+  local archive=$1 release_dir=$2 destination=$3 extract_dir
+  extract_dir=$(dirname "$archive")
+  tar -xzf "$archive" -C "$extract_dir"
+  mkdir -p "$destination"
+  install -m 0755 "$extract_dir/$release_dir/meru" "$extract_dir/$release_dir/merud" "$destination/"
+}
+
+# ensure_path_line adds the local binary directory to one shell profile once.
+ensure_path_line() {
+  local profile_file=$1 directory=$2 line
+  line="export PATH=\"$directory:\$PATH\""
+  if [ -f "$profile_file" ] && grep -Fqx "$line" "$profile_file"; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$profile_file")"
+  printf '%s\n' "$line" >>"$profile_file"
+}
+
+# ollama_ready checks Ollama's loopback API without using a configured proxy.
+ollama_ready() {
+  curl --noproxy '*' -fsS --max-time 2 http://127.0.0.1:11434/api/version >/dev/null 2>&1
+}
+
+# install_ollama_linux keeps a working Ollama or runs its saved installer after consent.
+install_ollama_linux() {
+  local temp_dir=$1 installer_file="$1/ollama-install.sh"
+  ollama_install_ran=0
+  if ollama_ready; then
+    echo "Ollama is already answering on 127.0.0.1:11434."
+    return 0
+  fi
+  if ! ask "Download and run Ollama's Linux installer? It may use sudo."; then
+    echo "Install Ollama later from https://ollama.com/download/linux."
+    return 0
+  fi
+  curl -fsSL -o "$installer_file" https://ollama.com/install.sh || fail "couldn't download Ollama's installer"
+  ollama_install_ran=1
+  sh "$installer_file"
+}
+
+# wait_for_ollama waits for the local API and prints service checks on failure.
+wait_for_ollama() {
+  local seconds=$1 waited=0
+  while [ "$waited" -lt "$seconds" ]; do
+    ollama_ready && return 0
+    sleep 1
+    waited=$((waited + 1))
+  done
+  printf 'Ollama did not answer on http://127.0.0.1:11434. Check:\n' >&2
+  printf '  systemctl status ollama --no-pager\n' >&2
+  printf '  journalctl -u ollama -n 50 --no-pager\n' >&2
+  return 1
+}
+
+# run_with_tty gives an interactive child the terminal instead of the curl pipe.
+run_with_tty() {
+  "$@" </dev/tty
+}
+
+# run_meru_setup hands config and model setup to the existing command-line client.
+run_meru_setup() {
+  if has_tty && ask "Run meru setup now (models, config, folders, and tools)?"; then
+    run_with_tty "$bin_dir/meru" setup
+  else
+    echo "Run 'meru setup' when you're ready. A new setup uses the lite profile by default."
+  fi
+}
+
+# current_user returns the account name from the operating system, not the environment.
+current_user() {
+  id -un
+}
+
+# linux_banner names every download and privileged step before work begins.
+linux_banner() {
+  local version=$1 username
+  username=$(current_user) || username='<your-user>'
+  echo
+  echo "  Meru $version for Ubuntu 24.04 on x86-64"
+  echo "  -----------------------------------------"
+  echo "  This installer downloads Meru from GitHub."
+  echo "  It can download Ollama's installer, which may use sudo."
+  echo "  It can pull Meru's pinned SearXNG image with Podman or Docker."
+  echo "  For a headless server, it can run: sudo loginctl enable-linger \"$username\""
+  echo "  It installs neither Podman nor Docker."
+  if [ "$all" = 1 ]; then
+    echo "  MERU_YES=1 accepts every step, including Ollama's installer and lingering."
+  fi
+  echo
+}
+
+# searxng_ready accepts the JSON search response Meru's web tool needs.
+searxng_ready() {
+  local response
+  response=$(curl --noproxy '*' -fsS --max-time 3 'http://127.0.0.1:8888/search?q=test&format=json' 2>/dev/null) || return 1
+  case "$response" in *'"results"'*) return 0 ;; *) return 1 ;; esac
+}
+
+# searxng_owner reports which runtime already owns the named container.
+searxng_owner() {
+  if command -v podman >/dev/null 2>&1 && podman container exists meru-searxng >/dev/null 2>&1; then
+    printf 'podman\n'
+    return 0
+  fi
+  if command -v docker >/dev/null 2>&1 && docker inspect meru-searxng >/dev/null 2>&1; then
+    printf 'docker\n'
+    return 0
+  fi
+}
+
+# container_runtime_ready checks that a named runtime can reach its engine.
+container_runtime_ready() {
+  local runtime=$1
+  command -v "$runtime" >/dev/null 2>&1 && "$runtime" info >/dev/null 2>&1
+}
+
+# choose_container_runtime prefers working rootless Podman, then working Docker.
+choose_container_runtime() {
+  if container_runtime_ready podman; then
+    printf 'podman\n'
+  elif container_runtime_ready docker; then
+    printf 'docker\n'
+  fi
+}
+
+# write_searxng_settings creates the bounded JSON-enabled settings once.
+write_searxng_settings() {
+  local directory=$1 settings="$1/settings.yml" secret
+  mkdir -p "$directory"
+  chmod 0700 "$directory"
+  if [ -f "$settings" ]; then
+    chmod 0600 "$settings"
+    return 0
+  fi
+  secret=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+  [ "${#secret}" -eq 64 ] || fail "couldn't make SearXNG's secret key"
+  printf '%s\n' \
+    '# SearXNG settings, written by the Meru installer.' \
+    '# SearXNG reads this file as /etc/searxng/settings.yml in its container.' \
+    'use_default_settings: true' \
+    '' \
+    'general:' \
+    '  instance_name: "Meru web search"' \
+    '' \
+    'search:' \
+    '  safe_search: 1' \
+    '  autocomplete: ""' \
+    '  formats:' \
+    '    - html' \
+    '    - json' \
+    '' \
+    'server:' \
+    '  base_url: "http://127.0.0.1:8888/"' \
+    "  secret_key: \"$secret\"" \
+    '  limiter: false' \
+    '  public_instance: false' \
+    '  image_proxy: false' >"$settings"
+  chmod 0600 "$settings"
+}
+
+# setup_searxng_podman installs the Quadlet and starts its user service.
+setup_searxng_podman() {
+  local settings_dir=$1 unit_dir unit source service_action=start
+  if podman container exists meru-searxng >/dev/null 2>&1; then
+    service_action=restart
+  fi
+  unit_dir="$HOME/.config/containers/systemd"
+  unit="$unit_dir/meru-searxng.container"
+  source="$release_root/meru-searxng.container"
+  [ -f "$source" ] || { echo "The checked release archive has no SearXNG Quadlet." >&2; return 1; }
+  mkdir -p "$unit_dir"
+  if ! install -m 0644 "$source" "$unit"; then
+    echo "Could not install the checked SearXNG Quadlet." >&2
+    return 1
+  fi
+  systemctl --user daemon-reload || return 1
+  # Quadlet's [Install] section wires boot start during generation. Its generated
+  # service is transient, so systemctl cannot enable it as a regular unit.
+  systemctl --user "$service_action" meru-searxng.service || return 1
+  : "$settings_dir"
+}
+
+# searxng_image reads Docker's image from the same checked Quadlet Podman uses.
+searxng_image() {
+  local source line image=''
+  source="$release_root/meru-searxng.container"
+  [ -f "$source" ] || { echo "The checked release archive has no SearXNG Quadlet." >&2; return 1; }
+  while IFS= read -r line; do
+    case "$line" in
+      Image=*) image=${line#Image=}; break ;;
+    esac
+  done <"$source"
+  case "$image" in
+    *@sha256:*) printf '%s\n' "$image" ;;
+    *) echo "The checked SearXNG Quadlet has no pinned image." >&2; return 1 ;;
+  esac
+}
+
+# setup_searxng_docker pulls and runs one loopback-only Docker container.
+setup_searxng_docker() {
+  local settings_dir=$1 container_ref
+  container_ref=$(searxng_image) || return 1
+  local -a args=(
+    run --detach
+    --name meru-searxng
+    --restart unless-stopped
+    --publish 127.0.0.1:8888:8080
+    --volume "$settings_dir:/etc/searxng"
+    --env SEARXNG_BASE_URL=http://127.0.0.1:8888/
+    "$container_ref"
+  )
+  docker pull "$container_ref" || return 1
+  docker "${args[@]}"
+}
+
+# wait_for_searxng waits for one JSON response from the local search service.
+wait_for_searxng() {
+  local seconds=$1 waited=0
+  while [ "$waited" -lt "$seconds" ]; do
+    searxng_ready && return 0
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+# print_searxng_recovery names commands for the runtime that owns the service.
+print_searxng_recovery() {
+  case "$1" in
+    podman)
+      echo "Try: podman start meru-searxng"
+      echo "Then check: systemctl --user status meru-searxng and journalctl --user -u meru-searxng -n 50"
+      ;;
+    docker)
+      echo "Try: docker start meru-searxng"
+      echo "Then check: docker ps -a --filter name=meru-searxng and docker logs meru-searxng"
+      ;;
+  esac
+}
+
+# setup_searxng keeps an existing owner or starts the optional local service.
+setup_searxng() {
+  local owner runtime settings_dir
+  if searxng_ready; then
+    owner=$(searxng_owner)
+    if [ "$owner" = podman ] && container_runtime_ready podman; then
+      if ! ask "Refresh Meru's SearXNG service from this checked release?"; then
+        echo "SearXNG already answers JSON on 127.0.0.1:8888; keeping it."
+        return 0
+      fi
+      settings_dir="$HOME/.meru/searxng"
+      write_searxng_settings "$settings_dir"
+      if ! setup_searxng_podman "$settings_dir"; then
+        print_searxng_recovery podman
+        return 0
+      fi
+      if ! wait_for_searxng 90; then
+        echo "SearXNG did not answer JSON within 90 seconds."
+        print_searxng_recovery podman
+      fi
+      return 0
+    fi
+    echo "SearXNG already answers JSON on 127.0.0.1:8888; keeping it."
+    return 0
+  fi
+  owner=$(searxng_owner)
+  if [ -n "$owner" ]; then
+    if ! container_runtime_ready "$owner"; then
+      echo "The existing meru-searxng container belongs to $owner, but $owner is not working."
+      print_searxng_recovery "$owner"
+      return 0
+    fi
+    runtime=$owner
+  else
+    runtime=$(choose_container_runtime)
+    if [ -z "$runtime" ]; then
+      echo "Install Podman or Docker, start it, and run this installer again to add web search."
+      return 0
+    fi
+  fi
+  if ! ask "Set up optional SearXNG web search with $runtime?"; then
+    echo "Skipped web search. Run this installer again when you want it."
+    return 0
+  fi
+  settings_dir="$HOME/.meru/searxng"
+  write_searxng_settings "$settings_dir"
+  if [ "$owner" = podman ]; then
+    setup_searxng_podman "$settings_dir" || { print_searxng_recovery podman; return 0; }
+  elif [ -n "$owner" ]; then
+    "$runtime" start meru-searxng >/dev/null || { print_searxng_recovery "$runtime"; return 0; }
+  elif [ "$runtime" = podman ]; then
+    setup_searxng_podman "$settings_dir" || { print_searxng_recovery podman; return 0; }
+  else
+    setup_searxng_docker "$settings_dir" || { print_searxng_recovery docker; return 0; }
+  fi
+  if ! wait_for_searxng 90; then
+    echo "SearXNG did not answer JSON within 90 seconds."
+    print_searxng_recovery "$runtime"
+  fi
+}
+
+# show_merud_failure prints the two commands that explain a user-service failure.
+show_merud_failure() {
+  echo "merud did not start. Check:"
+  echo "  systemctl --user status merud"
+  echo "  journalctl --user -u merud -n 50 --no-pager"
+}
+
+# wait_for_merud waits for the installed client to reach the daemon socket.
+wait_for_merud() {
+  local seconds=$1 waited=0
+  while [ "$waited" -lt "$seconds" ]; do
+    "$bin_dir/meru" ping >/dev/null 2>&1 && return 0
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+# install_merud_service installs one canonical unit and restarts it on every run.
+install_merud_service() {
+  local source unit_dir unit
+  source="$release_root/merud.service"
+  unit_dir="$HOME/.config/systemd/user"
+  unit="$unit_dir/merud.service"
+  [ -f "$source" ] || { echo "The checked release archive has no merud user unit." >&2; return 1; }
+  mkdir -p "$unit_dir"
+  if ! install -m 0644 "$source" "$unit"; then
+    echo "Could not install the checked merud user unit." >&2
+    return 1
+  fi
+  if ! systemctl --user daemon-reload; then
+    show_merud_failure
+    return 1
+  fi
+  if ! systemctl --user enable merud.service; then
+    show_merud_failure
+    return 1
+  fi
+  if ! systemctl --user restart merud.service; then
+    show_merud_failure
+    return 1
+  fi
+  if ! wait_for_merud 60; then
+    show_merud_failure
+    return 1
+  fi
+  echo "merud is running as a systemd user service."
+}
+
+# offer_user_profile asks for the profile only after the daemon answers ping.
+offer_user_profile() {
+  if has_tty && ask "Tell Meru about you now?"; then
+    run_with_tty "$bin_dir/meru" setup user
+  else
+    echo "Run 'meru setup user' when you're ready."
+  fi
+}
+
+# offer_lingering enables a headless user service only after explicit consent.
+offer_lingering() {
+  local state username
+  username=$(current_user) || { echo "Could not find the current user." >&2; return 1; }
+  if ! ask "Keep merud running on this server while you are logged out? This uses sudo loginctl enable-linger."; then
+    echo "Lingering was not enabled. merud runs while your user has a login session."
+    return 0
+  fi
+  if ! sudo loginctl enable-linger "$username"; then
+    echo "Could not enable lingering for $username." >&2
+    return 1
+  fi
+  state=$(loginctl show-user "$username" -p Linger --value) || return 1
+  if [ "$state" != yes ]; then
+    echo "Lingering did not report Linger=yes for $username." >&2
+    return 1
+  fi
+  echo "Lingering is enabled for $username."
+}
+
+# install_user_service starts merud before profile and lingering questions.
+install_user_service() {
+  install_merud_service || return 1
+  offer_user_profile
+  offer_lingering
+}
+
+# finish_linux_setup starts the daemon only after meru setup has written config.
+finish_linux_setup() {
+  if [ ! -f "$HOME/.meru/config.toml" ]; then
+    echo "Run 'meru setup', then run this installer again to start merud as a service."
+    return 0
+  fi
+  install_user_service
+}
+
+# print_linux_checks gives the user a short end-to-end acceptance list.
+print_linux_checks() {
+  echo
+  echo "Check Meru:"
+  echo "  meru ping"
+  echo "  meru index -status"
+  echo "  systemctl --user status merud"
+  echo "  journalctl --user -u merud -n 50 --no-pager"
+  echo "  meru \"In one sentence, what can you help me with?\""
+  echo "  Add a unique sentence to an indexed file, then ask Meru about it and check the citation."
+}
+
+# configure_linux starts web search before setup checks it, then starts merud when configured.
+configure_linux() {
+  setup_searxng
+  if ollama_ready; then
+    run_meru_setup
+  elif [ "${ollama_install_ran:-0}" = 1 ] && wait_for_ollama 60; then
+    run_meru_setup
+  else
+    echo "Run 'meru setup' after Ollama starts."
+  fi
+  finish_linux_setup
+  print_linux_checks
+}
+
+# install_linux installs the verified CLI, then delegates setup to existing commands.
+install_linux() {
+  local version=$1 base cli release_dir choice
+  linux_banner "$version"
+  if [ "$all" != 1 ] && has_tty; then
+    printf 'Install everything [a], choose each step [s], or quit [q]? ' >/dev/tty
+    read -r choice </dev/tty || choice=q
+    case "$choice" in
+      [aA]*) all=1 ;;
+      [sS]*) all=0 ;;
+      *) echo "Nothing installed."; return 0 ;;
+    esac
+  fi
+
+  tmp=$(mktemp -d)
+  # EXIT removes the download folder whether this path succeeds or fails.
+  trap 'rm -rf "$tmp"' EXIT
+  base="https://github.com/$repo/releases/download/$version"
+  cli="meru-$version-linux-amd64.tar.gz"
+  release_dir="meru-$version-linux-amd64"
+  curl -fsSL -o "$tmp/$cli" "$base/$cli" || fail "couldn't download $cli from $base"
+  curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS" || fail "couldn't download SHA256SUMS from $base"
+
+  say "Checking the downloads against SHA256SUMS"
+  verify_downloads Linux "$tmp" || fail "a download doesn't match SHA256SUMS; nothing was installed"
+  say "Installing meru and merud in $bin_dir"
+  install_cli "$tmp/$cli" "$release_dir" "$bin_dir"
+  release_root="$tmp/$release_dir"
+  ensure_path_line "$HOME/.profile" '$HOME/.local/bin'
+  export PATH="$bin_dir:$PATH"
+
+  say "Ollama runs the models"
+  install_ollama_linux "$tmp"
+  configure_linux
+}
+
+# main performs the install when Bash executes this file rather than sourcing it.
+main() {
+local kernel machine platform os arch
+kernel=$(uname -s)
+machine=$(uname -m)
+platform=$(platform_for "$kernel" "$machine" /etc/os-release) || exit 1
+os=$kernel
+arch=${platform#*-}
 
 # The latest release's tag: github.com/<repo>/releases/latest redirects to
 # .../releases/tag/<tag>, and curl's url_effective is where it landed.
@@ -57,6 +575,10 @@ if [ -z "$version" ]; then
   version="${url##*/}"
 fi
 case "$version" in v[0-9]*.[0-9]*.[0-9]*) ;; *) fail "couldn't find the release to install (got '$version')" ;; esac
+if [ "$platform" = linux-amd64 ]; then
+  install_linux "$version"
+  return
+fi
 # What this Mac will get, so the banner can list it before anything starts.
 mem_gb=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 # The answer model to offer for this much memory, from docs/running.md,
@@ -127,18 +649,16 @@ for f in "${files[@]}"; do
 done
 
 say "Checking the downloads against SHA256SUMS"
-(cd "$tmp" && shasum -a 256 -c SHA256SUMS --ignore-missing) || fail "a download doesn't match SHA256SUMS; nothing was installed"
+verify_downloads "$os" "$tmp" || fail "a download doesn't match SHA256SUMS; nothing was installed"
 
 say "Installing meru and merud in $bin_dir"
-mkdir -p "$bin_dir"
-tar -xzf "$tmp/$cli" -C "$tmp"
-install -m 0755 "$tmp/meru-$version-darwin-$arch/meru" "$tmp/meru-$version-darwin-$arch/merud" "$bin_dir/"
+install_cli "$tmp/$cli" "meru-$version-darwin-$arch" "$bin_dir"
 case ":$PATH:" in
   *":$bin_dir:"*) ;;
   *)
     echo "$bin_dir isn't on your PATH."
     if ask "Add it to ~/.zshrc?"; then
-      echo 'export PATH="$HOME/.local/bin:$PATH"' >>"$HOME/.zshrc"
+      ensure_path_line "$HOME/.zshrc" '$HOME/.local/bin'
       echo "Added. Open a new Terminal window for it to take effect."
     fi
     export PATH="$bin_dir:$PATH"
@@ -232,3 +752,10 @@ echo "Chat:             meru chat"
 [ "$arch" = "arm64" ] && echo "Desktop app:      open Meru.app"
 echo "Gmail, Calendar and Drive: https://github.com/$repo/blob/main/docs/google-setup.md"
 if [ "$pulled_answer" = 1 ] && [ "$had_config" = 1 ]; then how_to_use; fi
+}
+
+# BASH_SOURCE differs from $0 when another script sources this file. With
+# `curl ... | bash`, BASH_SOURCE is empty, so that published form also runs main.
+if [ -z "${BASH_SOURCE[0]:-}" ] || [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

@@ -37,7 +37,7 @@ COVER_PROFILE := coverage.out
 # .claude/ that belong to other branches.
 GO_FILES = $(shell find . -path './.*' -prune -o -name '*.go' -print)
 
-.PHONY: help fmt fmt-check vet lint test cover e2e vuln sec sec-sarif secrets secrets-history tidy-check actionlint build desktop desktop-check desktop-app installer installer-app dmg router-eval pick-eval bench bench-report figures check release clean
+.PHONY: help fmt fmt-check vet lint test cover e2e vuln sec sec-sarif secrets secrets-history tidy-check install-script-test actionlint build desktop desktop-check desktop-app installer installer-app dmg router-eval pick-eval bench bench-report figures check release clean
 
 help: ## List the targets
 	@grep -E '^[a-z0-9-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
@@ -104,6 +104,10 @@ tidy-check: ## Fail if go.mod or go.sum aren't tidy or don't verify
 
 actionlint: ## Lint the GitHub Actions workflows
 	go run $(ACTIONLINT)
+
+install-script-test: ## Test the one-line release installer
+	bash -n scripts/install.sh scripts/install_test.sh
+	bash scripts/install_test.sh
 
 # cmd/meru-desktop builds only with -tags desktop, so ./cmd/... here skips
 # it and the cross-compile stays free of cgo. `make desktop` builds it.
@@ -192,7 +196,7 @@ dmg: installer-app ## Pack "Install Meru.app" in dist/Meru-VERSION-macos-arm64.d
 	rm -rf dist/dmg
 	@ls -lh "$(DMG)"
 
-check: fmt-check vet lint tidy-check test e2e build vuln sec secrets actionlint ## Run every check CI runs, in CI's order
+check: fmt-check vet lint tidy-check test e2e build vuln sec secrets install-script-test actionlint ## Run every check CI runs, in CI's order
 
 # Releases build on the owner's Mac, not in CI; docs/releasing.md says why.
 release: ## Build, pack and publish a release: make release VERSION=v0.4.1 [DRY_RUN=1]

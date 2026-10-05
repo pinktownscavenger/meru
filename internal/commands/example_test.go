@@ -54,8 +54,10 @@ func TestExampleCommands(t *testing.T) {
 		names = append(names, spec.Name)
 	}
 	if strings.Join(names, " ") != "cmd.git-log cmd.git-status cmd.search-notes cmd.disk-free "+
-		"cmd.system-load cmd.top-processes cmd.find-process cmd.memory-free "+
-		"cmd.kernel cmd.macos-version cmd.hardware-summary cmd.system-report cmd.battery cmd.disk-list cmd.uptime "+
+		"cmd.find-process cmd.kernel cmd.uptime "+
+		"cmd.linux-system-load cmd.linux-memory cmd.linux-cpu cmd.linux-disks "+
+		"cmd.system-load cmd.top-processes cmd.memory-free "+
+		"cmd.macos-version cmd.hardware-summary cmd.system-report cmd.battery cmd.disk-list "+
 		"cmd.file-lines cmd.count-lines cmd.csv-column cmd.csv-sum "+
 		"cmd.gh-prs cmd.gh-pr cmd.gh-issues cmd.gh-issue cmd.gh-runs cmd.gh-repos" {
 		t.Errorf("samples give %v", names)

@@ -56,11 +56,14 @@ fails:
    `Info.plist` version to `0.4.1`, so Finder's Get Info shows it.
 4. **Packing.** Into `dist/`, which git ignores:
 
+   `scripts/release-archive.sh` packs each command-line archive. Keeping this
+   step separate lets the installer tests inspect both Linux archives.
+
    | File | What it holds |
    | --- | --- |
    | `meru-v0.4.1-darwin-arm64.tar.gz` | `meru`, `merud`, `LICENSE` and `README.md` for a Mac with Apple silicon |
    | `meru-v0.4.1-darwin-amd64.tar.gz` | the same for an Intel Mac |
-   | `meru-v0.4.1-linux-amd64.tar.gz`, `meru-v0.4.1-linux-arm64.tar.gz` | the same for Linux |
+   | `meru-v0.4.1-linux-amd64.tar.gz`, `meru-v0.4.1-linux-arm64.tar.gz` | the same for Linux, plus the systemd user unit and Podman Quadlet |
    | `meru-v0.4.1-windows-amd64.zip` | `meru.exe`, `merud.exe`, `LICENSE` and `README.md` |
    | `Meru-v0.4.1-macos-arm64.zip` | `Meru.app`, for Apple silicon only |
    | `Meru-v0.4.1-macos-arm64.dmg` | the Mac installer, "Install Meru.app", with `meru`, `merud` and `Meru.app` inside, and "Read me first.txt"; about 60 MB |

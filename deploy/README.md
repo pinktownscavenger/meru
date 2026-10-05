@@ -6,18 +6,29 @@ Files that run Meru as a service and show what it is doing:
 | --- | --- |
 | `launchd/com.meru.merud.plist` | starts `merud` at login on macOS and restarts it if it exits |
 | `systemd/merud.service` | the same on Linux, as a systemd user unit |
+| `systemd/meru-searxng.container` | runs SearXNG with rootless Podman and exposes it on loopback only |
 | `observability/compose.yaml` | a local Grafana stack that receives `merud`'s metrics and traces |
 | `observability/dashboards/meru.json` | the Meru dashboard that stack loads |
 | `observability/dashboards/meru-usage.json` | the Meru usage dashboard: totals for the chosen range, then one bar per hour over the last 24 hours |
 
-All the steps below assume you built and installed `merud` with:
+The Linux release archive holds both service definitions beside the binaries, so
+the checksum covers the files before the installer copies them. The installer
+puts `merud` in `~/.local/bin`, which is the path in the Linux unit and the
+release form of the Mac commands below. Run it with:
 
 ```sh
-go install ./cmd/merud      # puts the binary in ~/go/bin/merud
+curl -fsSL https://github.com/aarora79/meru/releases/latest/download/install.sh | bash
 ```
 
-If your binary lives somewhere else, change the path in the service file before you
-install it.
+If you build from source with `go install ./cmd/merud`, the binary goes in
+`~/go/bin`. Keep that source-build edit separate from the canonical release
+unit:
+
+```sh
+mkdir -p ~/.config/systemd/user
+sed 's|%h/.local/bin/merud|%h/go/bin/merud|' deploy/systemd/merud.service \
+  > ~/.config/systemd/user/merud.service
+```
 
 ## macOS: launchd
 
@@ -54,7 +65,9 @@ launchctl bootout gui/$(id -u)/com.meru.merud
 
 ## Linux: systemd
 
-Install it as a user unit, so `merud` runs as you and reads your `~/.meru`:
+The release installer does these steps after `meru setup` has written a config.
+To do them by hand, install the unit for your user, so `merud` runs as you and
+reads your `~/.meru`:
 
 ```sh
 mkdir -p ~/.config/systemd/user
@@ -76,8 +89,34 @@ Check it and read its output:
 
 ```sh
 systemctl --user status merud
-journalctl --user -u merud -f
+journalctl --user -u merud -n 50 --no-pager
 ```
+
+The installer asks before it runs `sudo loginctl enable-linger "$USER"`. Say yes
+only when this is a server that should keep Meru running after you log out. The
+choice is not needed on a workstation where your login session stays open.
+
+### SearXNG with rootless Podman
+
+The release installer prefers a working rootless Podman, then falls back to a
+working Docker daemon. It installs neither. With Podman, it copies the Quadlet
+to `~/.config/containers/systemd/meru-searxng.container`, reloads the user
+manager and starts `meru-searxng.service`. The Quadlet's `[Install]` section
+wires it to `default.target` each time the generator runs. The generated service
+mounts `~/.meru/searxng` and publishes only `127.0.0.1:8888`.
+
+Check or restart it with:
+
+```sh
+systemctl --user status meru-searxng
+journalctl --user -u meru-searxng -n 50 --no-pager
+systemctl --user restart meru-searxng
+```
+
+Use the same lingering choice as `merud` if SearXNG must run after logout. With
+Docker, the installer creates the named container `meru-searxng` with restart
+policy `unless-stopped`; inspect it with `docker ps -a --filter
+name=meru-searxng` and `docker logs meru-searxng`.
 
 ## Windows
 

@@ -109,12 +109,19 @@ OpenTelemetry stack.
 | Platform | Status | Restarts `merud` after a reboot |
 | --- | --- | --- |
 | macOS, Apple silicon | supported and tested; the development machine is a Mac Studio (M4 Max, 64 GB) | `launchd` |
-| Linux, x86-64 or arm64 (home servers, cloud virtual machines) | supported | `systemd` |
+| Ubuntu 24.04, x86-64 (home servers, cloud virtual machines) | command-line clients and daemon implemented; fresh-host acceptance pending | `systemd --user` |
+| Other Linux systems and Linux arm64 | should work; not tested at first | `systemd` |
 | Windows 10 and later | should work; not tested at first | a Windows service |
 
 Code must not assume one platform: build paths with `filepath`, find the home
 directory with `os.UserHomeDir`, and keep platform-specific code behind Go build tags
 in as few files as possible.
+
+On Ubuntu 24.04 x86-64, `scripts/install.sh` is the candidate install path. It
+installs the command-line clients and daemon, uses the `lite` profile by default,
+and makes no GPU-based model recommendation. Fresh-host acceptance must pass before
+the project calls this path supported. The desktop app and its Wails installer
+remain Mac-only in this stage.
 
 **On a cloud server**, Meru still sends no prompt to a model provider,
 but your notes, email and transcripts live on that server. Meru's promise is "a
@@ -2886,6 +2893,30 @@ match ordinary words. A config file you share or commit holds names only.
 
 ## Installer
 
+Meru has one release installer for each accepted path. `scripts/install.sh` contains
+the candidate command-line and daemon path for Ubuntu 24.04 x86-64. The Wails
+installer, "Install Meru.app", remains the Mac path.
+
+### Ubuntu terminal installer
+
+The same one-line `scripts/install.sh` entry point that installs release archives on
+macOS also installs Ubuntu. The checked Linux archive holds `meru`, `merud`, the
+systemd user unit and the Podman Quadlet. The installer verifies the archive before
+it uses any of them, then runs `meru setup` with the existing `lite` default. This
+stage does not inspect a GPU or suggest a larger model.
+
+The installer keeps a SearXNG that already answers on `127.0.0.1:8888`. Otherwise
+it uses working rootless Podman when present, then working Docker. It installs
+neither container runtime. Both paths bind SearXNG to loopback only and keep its
+settings and secret when the installer runs again.
+
+`merud` runs through the user's systemd instance from `%h/.local/bin/merud`. The
+installer enables and starts that user service. On a headless server it offers to
+enable lingering, explains that this runs the user service without a login session,
+and calls `sudo loginctl enable-linger` only after the user accepts that step.
+
+### Mac installer
+
 The Mac installer, "Install Meru.app", takes a Mac with Apple silicon from nothing
 to a running Meru in ten steps: Ollama and the models, folders in the index, web
 search, your Obsidian notes, skills and commands, Google if you want it, your
@@ -4667,8 +4698,10 @@ We'll settle these with working code and measurements.
 
 - **Language:** Go, for a small footprint, easy distribution, room to scale, built-in
   concurrency and fewer dependencies (see [Why Go](#why-go)).
-- **Platforms:** macOS on Apple silicon first, Linux supported, Windows untested at
-  first. Cloud servers count as "a machine you control".
+- **Platforms:** macOS on Apple silicon first; Ubuntu 24.04 x86-64 command-line
+  support is implemented and awaits fresh-host acceptance; other Linux systems
+  should work; Windows remains untested. Cloud servers count as "a machine you
+  control".
 - **Agent harness:** our own loop plus the official MCP and A2A Go SDKs. We looked at
   Eino and ADK Go. ADK Go pulls a cloud-model client into the dependency tree, and
   neither saves much once the allowlist, audit and budget logic are ours.
