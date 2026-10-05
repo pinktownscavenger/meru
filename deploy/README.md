@@ -11,8 +11,10 @@ Files that run Meru as a service and show what it is doing:
 | `observability/dashboards/meru.json` | the Meru dashboard that stack loads |
 | `observability/dashboards/meru-usage.json` | the Meru usage dashboard: totals for the chosen range, then one bar per hour over the last 24 hours |
 
-The release installer puts `merud` in `~/.local/bin`, which is the path in the
-Linux unit and the release form of the Mac commands below. Run it with:
+The Linux release archive holds both service definitions beside the binaries, so
+the checksum covers the files before the installer copies them. The installer
+puts `merud` in `~/.local/bin`, which is the path in the Linux unit and the
+release form of the Mac commands below. Run it with:
 
 ```sh
 curl -fsSL https://github.com/aarora79/meru/releases/latest/download/install.sh | bash

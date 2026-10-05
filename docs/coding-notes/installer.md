@@ -11,39 +11,44 @@ the one in `deploy/`), plus `cmd/meru-installer/main.go` and its `Info.plist`
 ## What it does
 
 Meru has two installers. `scripts/install.sh` is the release installer for a
-terminal. It supports macOS and Ubuntu 24.04 on x86-64. The Go package described
-in the rest of this note powers the Mac installer window.
+terminal. It supports macOS and contains the Ubuntu 24.04 x86-64 candidate whose
+fresh-host acceptance run is pending. The Go package described in the rest of
+this note powers the Mac installer window.
 
 ### The release script on Ubuntu
 
 The script detects Ubuntu from `/etc/os-release` without executing that file. It
-downloads the Linux archive and `SHA256SUMS`, checks the archive with
-`sha256sum`, and only then copies `meru` and `merud` to `~/.local/bin`. A new
-setup uses the `lite` profile because the script leaves model choice with `meru
-setup` instead of putting model names in the installer.
+downloads the Linux archive and `SHA256SUMS`, then checks the archive with
+`sha256sum`. The archive holds both binaries, the systemd user unit and the
+Podman Quadlet. The script copies or runs none of them before the check passes.
+A new setup uses the `lite` profile because the script leaves model choice with
+`meru setup` instead of putting model names in the installer.
 
 After the binaries land, the script offers Ollama and waits for its loopback API.
 It offers optional web search before it gives the terminal to `meru setup`, so
 setup can check the service. Setup owns model downloads, folders and tools. The
 script keeps an existing `meru-searxng` container with its current runtime; for a
 new one it prefers working rootless Podman and falls back to working Docker.
-Podman uses the checked-in Quadlet and a systemd user service. Docker uses one
-named container. Both publish only `127.0.0.1:8888`, and the script never
-installs a container runtime. Quadlet's generator applies the file's `[Install]`
-section during `daemon-reload`, so the script starts the generated transient
-service but does not try to enable it as a regular unit.
+Podman copies the checked Quadlet from the extracted archive and uses a systemd
+user service. Docker uses one named container. Both publish only
+`127.0.0.1:8888`, and the script never installs a container runtime. Quadlet's
+generator applies the file's `[Install]` section during `daemon-reload`, so the
+script starts the generated transient service but does not try to enable it as a
+regular unit.
 
-The last step installs `deploy/systemd/merud.service`, waits for `meru ping`, and
-then offers the user profile. A headless server can keep the user services alive
-after logout with lingering. The script shows the exact `sudo loginctl` command
-and runs it only after consent.
+The last step copies the checked `merud.service` from the extracted archive,
+waits for `meru ping`, and then offers the user profile. A headless server can
+keep the user services alive after logout with lingering. The script shows the
+exact `sudo loginctl` command and runs it only after consent.
 
 The flow is safe to rerun. It replaces verified binaries and service files,
 restarts the services, keeps an existing SearXNG settings file, and leaves Meru's
 config and data in place. With no terminal it cannot answer setup questions, so
 it prints the commands that remain instead of starting `merud` without a config.
 `scripts/install_test.sh` sources the functions, replaces commands with fakes and
-checks the order, consent gates, runtime choice and recovery text.
+checks the order, consent gates, runtime choice and recovery text. It also runs
+`scripts/release-archive.sh` with fake binaries and checks that both Linux
+archives hold the two service definitions.
 
 The Mac installer is "Install Meru.app" on each release's disk image. It walks a
 person through nine steps, from checking the Mac to starting `merud`, and each step

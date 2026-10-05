@@ -3,7 +3,7 @@
 #
 #   curl -fsSL https://github.com/aarora79/meru/releases/latest/download/install.sh | bash
 #
-# It downloads the release, checks every file against SHA256SUMS, puts meru
+# It downloads the release, checks each archive against SHA256SUMS, puts meru
 # and merud in ~/.local/bin and Meru.app in /Applications, and then offers
 # the next steps: Ollama, the models, `meru setup`, and starting merud at
 # login. It first lists what it will install and asks once: everything, each
@@ -78,7 +78,7 @@ platform_for() {
       if [ "$id" = ubuntu ] && [ "$version_id" = 24.04 ]; then
         printf 'linux-amd64\n'
       else
-        printf 'install.sh: this stage supports Ubuntu 24.04 on x86-64; use the release archive for %s %s\n' "$kernel" "$machine" >&2
+        printf 'install.sh: this installer targets Ubuntu 24.04 on x86-64; use the release archive for %s %s\n' "$kernel" "$machine" >&2
         return 1
       fi
       ;;
@@ -263,20 +263,23 @@ write_searxng_settings() {
 
 # setup_searxng_podman installs the Quadlet and starts its user service.
 setup_searxng_podman() {
-  local settings_dir=$1 unit_dir unit raw_url
+  local settings_dir=$1 unit_dir unit source service_action=start
   if podman container exists meru-searxng >/dev/null 2>&1; then
-    podman start meru-searxng >/dev/null
-    return 0
+    service_action=restart
   fi
   unit_dir="$HOME/.config/containers/systemd"
   unit="$unit_dir/meru-searxng.container"
-  raw_url="https://raw.githubusercontent.com/$repo/$version/deploy/systemd/meru-searxng.container"
+  source="$release_root/meru-searxng.container"
+  [ -f "$source" ] || { echo "The checked release archive has no SearXNG Quadlet." >&2; return 1; }
   mkdir -p "$unit_dir"
-  curl -fsSL -o "$unit" "$raw_url" || return 1
+  if ! install -m 0644 "$source" "$unit"; then
+    echo "Could not install the checked SearXNG Quadlet." >&2
+    return 1
+  fi
   systemctl --user daemon-reload || return 1
   # Quadlet's [Install] section wires boot start during generation. Its generated
   # service is transient, so systemctl cannot enable it as a regular unit.
-  systemctl --user start meru-searxng.service || return 1
+  systemctl --user "$service_action" meru-searxng.service || return 1
   : "$settings_dir"
 }
 
@@ -325,6 +328,24 @@ print_searxng_recovery() {
 setup_searxng() {
   local owner runtime settings_dir
   if searxng_ready; then
+    owner=$(searxng_owner)
+    if [ "$owner" = podman ] && container_runtime_ready podman; then
+      if ! ask "Refresh Meru's SearXNG service from this checked release?"; then
+        echo "SearXNG already answers JSON on 127.0.0.1:8888; keeping it."
+        return 0
+      fi
+      settings_dir="$HOME/.meru/searxng"
+      write_searxng_settings "$settings_dir"
+      if ! setup_searxng_podman "$settings_dir"; then
+        print_searxng_recovery podman
+        return 0
+      fi
+      if ! wait_for_searxng 90; then
+        echo "SearXNG did not answer JSON within 90 seconds."
+        print_searxng_recovery podman
+      fi
+      return 0
+    fi
     echo "SearXNG already answers JSON on 127.0.0.1:8888; keeping it."
     return 0
   fi
@@ -349,7 +370,9 @@ setup_searxng() {
   fi
   settings_dir="$HOME/.meru/searxng"
   write_searxng_settings "$settings_dir"
-  if [ -n "$owner" ]; then
+  if [ "$owner" = podman ]; then
+    setup_searxng_podman "$settings_dir" || { print_searxng_recovery podman; return 0; }
+  elif [ -n "$owner" ]; then
     "$runtime" start meru-searxng >/dev/null || { print_searxng_recovery "$runtime"; return 0; }
   elif [ "$runtime" = podman ]; then
     setup_searxng_podman "$settings_dir" || { print_searxng_recovery podman; return 0; }
@@ -360,12 +383,6 @@ setup_searxng() {
     echo "SearXNG did not answer JSON within 90 seconds."
     print_searxng_recovery "$runtime"
   fi
-}
-
-# download_merud_unit gets the canonical unit from the same release as the binaries.
-download_merud_unit() {
-  local destination=$1
-  curl -fsSL -o "$destination" "https://raw.githubusercontent.com/$repo/$version/deploy/systemd/merud.service"
 }
 
 # show_merud_failure prints the two commands that explain a user-service failure.
@@ -388,17 +405,16 @@ wait_for_merud() {
 
 # install_merud_service installs one canonical unit and restarts it on every run.
 install_merud_service() {
-  local work_dir source unit_dir unit
-  work_dir=${tmp:-}
-  if [ -z "$work_dir" ]; then
-    work_dir=$(mktemp -d)
-  fi
-  source="$work_dir/merud.service"
+  local source unit_dir unit
+  source="$release_root/merud.service"
   unit_dir="$HOME/.config/systemd/user"
   unit="$unit_dir/merud.service"
-  mkdir -p "$work_dir" "$unit_dir"
-  download_merud_unit "$source" || { echo "Could not download the merud user unit."; return 1; }
-  install -m 0644 "$source" "$unit"
+  [ -f "$source" ] || { echo "The checked release archive has no merud user unit." >&2; return 1; }
+  mkdir -p "$unit_dir"
+  if ! install -m 0644 "$source" "$unit"; then
+    echo "Could not install the checked merud user unit." >&2
+    return 1
+  fi
   if ! systemctl --user daemon-reload; then
     show_merud_failure
     return 1
@@ -516,6 +532,7 @@ install_linux() {
   verify_downloads Linux "$tmp" || fail "a download doesn't match SHA256SUMS; nothing was installed"
   say "Installing meru and merud in $bin_dir"
   install_cli "$tmp/$cli" "$release_dir" "$bin_dir"
+  release_root="$tmp/$release_dir"
   ensure_path_line "$HOME/.profile" '$HOME/.local/bin'
   export PATH="$bin_dir:$PATH"
 

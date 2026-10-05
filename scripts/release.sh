@@ -157,23 +157,13 @@ export COPYFILE_DISABLE=1
 
 for platform in $platforms; do
   name="meru-$version-$platform"
-  dir="dist/stage/$name"
-  mkdir -p "$dir"
 
   # Windows programs end in .exe.
   ext=""
   if [ "${platform%%-*}" = "windows" ]; then
     ext=".exe"
   fi
-  cp "bin/$platform/meru$ext" "bin/$platform/merud$ext" LICENSE README.md "$dir/"
-
-  # tar -C and zip inside ( cd ... ) keep the stage path out of the
-  # archive, so each one opens to a single folder named $name.
-  if [ -n "$ext" ]; then
-    (cd dist/stage && zip -q -r -X "../$name.zip" "$name")
-  else
-    tar -C dist/stage --uid 0 --gid 0 --uname root --gname root -czf "dist/$name.tar.gz" "$name"
-  fi
+  bash scripts/release-archive.sh "$platform" "$name" "$ext"
 done
 
 # ditto is the Mac's own copier. -c -k writes a zip, and --keepParent puts

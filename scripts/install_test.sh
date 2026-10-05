@@ -105,13 +105,50 @@ test_direct_and_pipe_execution_reach_main() {
   assert_contains "$piped" "couldn't find the release"
 }
 
-# make_cli_archive writes a small release archive for install helper tests.
+# make_cli_archive writes a small Linux release archive for install helper tests.
 make_cli_archive() {
   local directory=$1 release_dir=$2
   mkdir -p "$directory/$release_dir"
   printf '#!/bin/sh\necho meru\n' >"$directory/$release_dir/meru"
   printf '#!/bin/sh\necho merud\n' >"$directory/$release_dir/merud"
+  cp "$script_dir/../deploy/systemd/merud.service" "$directory/$release_dir/"
+  cp "$script_dir/../deploy/systemd/meru-searxng.container" "$directory/$release_dir/"
   tar -czf "$directory/release.tar.gz" -C "$directory" "$release_dir"
+  rm -rf "$directory/$release_dir"
+}
+
+# test_linux_release_archives_include_units checks both published Linux targets.
+test_linux_release_archives_include_units() {
+  local dir platform name archive extracted
+  dir=$(mktemp -d)
+  mkdir -p "$dir/bin/linux-amd64" "$dir/bin/linux-arm64" "$dir/deploy/systemd"
+  cp "$script_dir/../deploy/systemd/merud.service" "$script_dir/../deploy/systemd/meru-searxng.container" "$dir/deploy/systemd/"
+  printf 'licence\n' >"$dir/LICENSE"
+  printf 'read me\n' >"$dir/README.md"
+  for platform in linux-amd64 linux-arm64; do
+    printf 'meru\n' >"$dir/bin/$platform/meru"
+    printf 'merud\n' >"$dir/bin/$platform/merud"
+    name="meru-test-$platform"
+    (cd "$dir" && bash "$script_dir/release-archive.sh" "$platform" "$name" "")
+    archive="$dir/dist/$name.tar.gz"
+    if gzip -dc "$archive" | grep -aFq 'LIBARCHIVE.xattr.com.apple'; then
+      rm -rf "$dir"
+      test_fail "$platform archive contains macOS extended attributes"
+      return
+    fi
+    if gzip -dc "$archive" | grep -aFq 'SCHILY.fflags'; then
+      rm -rf "$dir"
+      test_fail "$platform archive contains macOS file flags"
+      return
+    fi
+    extracted="$dir/extracted-$platform"
+    mkdir -p "$extracted"
+    tar -xzf "$archive" -C "$extracted"
+    cmp "$dir/deploy/systemd/merud.service" "$extracted/$name/merud.service"
+    cmp "$dir/deploy/systemd/meru-searxng.container" "$extracted/$name/meru-searxng.container"
+  done
+  grep -Fq 'bash scripts/release-archive.sh "$platform" "$name" "$ext"' "$script_dir/release.sh"
+  rm -rf "$dir"
 }
 
 # make_command_stub records one checksum program's argv.
@@ -351,17 +388,82 @@ test_linux_checks_name_acceptance_commands() {
   assert_contains "$output" 'indexed file'
 }
 
-# test_ready_searxng_is_kept performs no container work when JSON already answers.
+# test_ready_searxng_is_kept leaves a healthy service that Meru does not own alone.
 test_ready_searxng_is_kept() {
-  local dir log
-  dir=$(mktemp -d); log="$dir/log"
+  local dir output
+  dir=$(mktemp -d)
   load_installer
   type searxng_ready >/dev/null 2>&1 || { rm -rf "$dir"; test_fail "searxng_ready is missing"; return; }
   searxng_ready() { return 0; }
-  podman() { printf 'podman %s\n' "$*" >>"$log"; }
-  docker() { printf 'docker %s\n' "$*" >>"$log"; }
-  setup_searxng
-  [ ! -s "$log" ] || { test_fail "ready SearXNG caused container work"; rm -rf "$dir"; return; }
+  podman() { return 1; }
+  docker() { return 1; }
+  output=$(setup_searxng)
+  rm -rf "$dir"
+  assert_contains "$output" "keeping it"
+}
+
+# test_ready_podman_refreshes_verified_quadlet upgrades the old service definition.
+test_ready_podman_refreshes_verified_quadlet() {
+  local dir log old_home unit
+  dir=$(mktemp -d); log="$dir/log"; old_home=$HOME
+  load_installer
+  HOME="$dir/home"; release_root="$script_dir/../deploy/systemd"
+  unit="$HOME/.config/containers/systemd/meru-searxng.container"
+  mkdir -p "$(dirname "$unit")"
+  printf 'old unchecked Quadlet\n' >"$unit"
+  searxng_ready() { return 0; }
+  podman() { return 0; }
+  docker() { return 1; }
+  ask() { return 0; }
+  systemctl() { printf 'systemctl %s\n' "$*" >>"$log"; }
+  wait_for_searxng() { printf 'wait_for_searxng %s\n' "$*" >>"$log"; }
+  setup_searxng >/dev/null
+  cmp "$release_root/meru-searxng.container" "$unit"
+  grep -Fqx 'systemctl --user restart meru-searxng.service' "$log"
+  grep -Fqx 'wait_for_searxng 90' "$log"
+  HOME=$old_home
+  rm -rf "$dir"
+}
+
+# test_ready_podman_refresh_needs_consent keeps optional services unchanged on no.
+test_ready_podman_refresh_needs_consent() {
+  local dir log old_home unit before after
+  dir=$(mktemp -d); log="$dir/log"; old_home=$HOME
+  load_installer
+  HOME="$dir/home"; release_root="$script_dir/../deploy/systemd"
+  unit="$HOME/.config/containers/systemd/meru-searxng.container"
+  mkdir -p "$(dirname "$unit")"
+  printf 'existing Quadlet\n' >"$unit"
+  before=$(cat "$unit")
+  searxng_ready() { return 0; }
+  podman() { return 0; }
+  docker() { return 1; }
+  ask() { return 1; }
+  systemctl() { printf 'systemctl %s\n' "$*" >>"$log"; }
+  setup_searxng >/dev/null
+  after=$(cat "$unit")
+  assert_equal "$before" "$after"
+  [ ! -s "$log" ] || { HOME=$old_home; rm -rf "$dir"; test_fail "declined refresh called systemctl"; return; }
+  HOME=$old_home
+  rm -rf "$dir"
+}
+
+# test_ready_podman_refresh_timeout_prints_recovery explains a failed restart.
+test_ready_podman_refresh_timeout_prints_recovery() {
+  local dir old_home output
+  dir=$(mktemp -d); old_home=$HOME
+  load_installer
+  HOME="$dir/home"; release_root="$script_dir/../deploy/systemd"
+  searxng_ready() { return 0; }
+  podman() { return 0; }
+  docker() { return 1; }
+  ask() { return 0; }
+  systemctl() { return 0; }
+  wait_for_searxng() { return 1; }
+  output=$(setup_searxng)
+  assert_contains "$output" "SearXNG did not answer JSON within 90 seconds."
+  assert_contains "$output" "Try: podman start meru-searxng"
+  HOME=$old_home
   rm -rf "$dir"
 }
 
@@ -470,21 +572,31 @@ test_podman_quadlet_binds_loopback_and_uses_percent_h() {
   grep -Fqx 'WantedBy=default.target' "$unit"
 }
 
+# test_podman_uses_verified_release_quadlet avoids a second network download.
+test_podman_uses_verified_release_quadlet() {
+  local dir log old_home
+  dir=$(mktemp -d); log="$dir/log"; old_home=$HOME
+  make_cli_archive "$dir" meru-test-linux-amd64
+  load_installer
+  HOME="$dir/home"; bin_dir="$HOME/.local/bin"
+  install_cli "$dir/release.tar.gz" meru-test-linux-amd64 "$bin_dir"
+  release_root="$dir/meru-test-linux-amd64"
+  podman() { return 1; }
+  curl() { test_fail "Podman downloaded an unchecked Quadlet"; }
+  systemctl() { printf 'systemctl %s\n' "$*" >>"$log"; }
+  setup_searxng_podman "$HOME/.meru/searxng"
+  cmp "$release_root/meru-searxng.container" "$HOME/.config/containers/systemd/meru-searxng.container"
+  HOME=$old_home
+  rm -rf "$dir"
+}
+
 # test_podman_starts_generated_service_without_enable follows Quadlet's boot model.
 test_podman_starts_generated_service_without_enable() {
   local dir log old_home
   dir=$(mktemp -d); log="$dir/log"; old_home=$HOME
   load_installer
-  HOME="$dir/home"; version=v0.0.0
+  HOME="$dir/home"; release_root="$script_dir/../deploy/systemd"
   podman() { return 1; }
-  curl() {
-    local destination
-    while [ "$#" -gt 0 ]; do
-      if [ "$1" = -o ]; then destination=$2; break; fi
-      shift
-    done
-    cp "$script_dir/../deploy/systemd/meru-searxng.container" "$destination"
-  }
   systemctl() { printf 'systemctl %s\n' "$*" >>"$log"; }
   setup_searxng_podman "$HOME/.meru/searxng"
   grep -Fqx 'systemctl --user daemon-reload' "$log"
@@ -499,17 +611,8 @@ test_podman_systemd_failure_returns() {
   local dir old_home
   dir=$(mktemp -d); old_home=$HOME
   load_installer
-  HOME="$dir/home"; version=v0.0.0
+  HOME="$dir/home"; release_root="$script_dir/../deploy/systemd"
   podman() { return 1; }
-  curl() {
-    local destination
-    while [ "$#" -gt 0 ]; do
-      if [ "$1" = -o ]; then destination=$2; break; fi
-      shift
-    done
-    mkdir -p "$(dirname "$destination")"
-    : >"$destination"
-  }
   systemctl() { return 1; }
   if setup_searxng_podman "$HOME/.meru/searxng"; then
     HOME=$old_home
@@ -578,14 +681,51 @@ test_merud_unit_uses_local_bin() {
   grep -Fqx 'WantedBy=default.target' "$unit"
 }
 
+# test_service_uses_verified_release_unit avoids a second network download.
+test_service_uses_verified_release_unit() {
+  local dir old_home
+  dir=$(mktemp -d); old_home=$HOME
+  make_cli_archive "$dir" meru-test-linux-amd64
+  load_installer
+  HOME="$dir/home"; bin_dir="$HOME/.local/bin"; tmp="$dir/tmp"; mkdir -p "$tmp"
+  install_cli "$dir/release.tar.gz" meru-test-linux-amd64 "$bin_dir"
+  release_root="$dir/meru-test-linux-amd64"
+  curl() { test_fail "service setup downloaded an unchecked unit"; }
+  systemctl() { return 0; }
+  wait_for_merud() { return 0; }
+  install_merud_service
+  cmp "$release_root/merud.service" "$HOME/.config/systemd/user/merud.service"
+  HOME=$old_home
+  rm -rf "$dir"
+}
+
+# test_service_copy_failure_stops_before_systemd keeps an old unit from restarting.
+test_service_copy_failure_stops_before_systemd() {
+  local dir log old_home
+  dir=$(mktemp -d); log="$dir/log"; old_home=$HOME
+  load_installer
+  HOME="$dir/home"; release_root="$script_dir/../deploy/systemd"
+  install() { return 1; }
+  systemctl() { printf 'systemctl %s\n' "$*" >>"$log"; }
+  wait_for_merud() { return 0; }
+  if install_merud_service >/dev/null 2>&1; then
+    HOME=$old_home
+    rm -rf "$dir"
+    test_fail "service setup hid a unit copy failure"
+    return
+  fi
+  [ ! -s "$log" ] || { test_fail "systemd ran after the unit copy failed"; HOME=$old_home; rm -rf "$dir"; return; }
+  HOME=$old_home
+  rm -rf "$dir"
+}
+
 # test_service_install_reloads_enables_and_starts records the user-manager calls.
 test_service_install_reloads_enables_and_starts() {
   local dir log old_home
   dir=$(mktemp -d); log="$dir/log"; old_home=$HOME
   load_installer
   type install_merud_service >/dev/null 2>&1 || { rm -rf "$dir"; test_fail "install_merud_service is missing"; return; }
-  HOME="$dir/home"; bin_dir="$HOME/.local/bin"; tmp="$dir/tmp"; mkdir -p "$tmp"
-  download_merud_unit() { cp "$script_dir/../deploy/systemd/merud.service" "$1"; }
+  HOME="$dir/home"; bin_dir="$HOME/.local/bin"; release_root="$script_dir/../deploy/systemd"
   systemctl() { printf 'systemctl %s\n' "$*" >>"$log"; }
   wait_for_merud() { return 0; }
   install_merud_service
@@ -601,8 +741,7 @@ test_service_rerun_replaces_one_unit_and_restarts() {
   local dir log old_home count
   dir=$(mktemp -d); log="$dir/log"; old_home=$HOME
   load_installer
-  HOME="$dir/home"; bin_dir="$HOME/.local/bin"; tmp="$dir/tmp"; mkdir -p "$tmp"
-  download_merud_unit() { cp "$script_dir/../deploy/systemd/merud.service" "$1"; }
+  HOME="$dir/home"; bin_dir="$HOME/.local/bin"; release_root="$script_dir/../deploy/systemd"
   systemctl() { printf 'systemctl %s\n' "$*" >>"$log"; }
   wait_for_merud() { return 0; }
   install_merud_service
@@ -621,8 +760,7 @@ test_missing_user_bus_prints_status_and_journal() {
   dir=$(mktemp -d); old_home=$HOME
   load_installer
   type show_merud_failure >/dev/null 2>&1 || { rm -rf "$dir"; test_fail "show_merud_failure is missing"; return; }
-  HOME="$dir/home"; bin_dir="$HOME/.local/bin"; tmp="$dir/tmp"; mkdir -p "$tmp"
-  download_merud_unit() { cp "$script_dir/../deploy/systemd/merud.service" "$1"; }
+  HOME="$dir/home"; bin_dir="$HOME/.local/bin"; release_root="$script_dir/../deploy/systemd"
   systemctl() { return 1; }
   output=$(install_merud_service 2>&1 || true)
   assert_contains "$output" 'systemctl --user status merud'
@@ -636,8 +774,7 @@ test_service_handles_home_with_spaces() {
   local dir old_home
   dir=$(mktemp -d); old_home=$HOME
   load_installer
-  HOME="$dir/home with spaces"; bin_dir="$HOME/.local/bin"; tmp="$dir/tmp"; mkdir -p "$tmp"
-  download_merud_unit() { cp "$script_dir/../deploy/systemd/merud.service" "$1"; }
+  HOME="$dir/home with spaces"; bin_dir="$HOME/.local/bin"; release_root="$script_dir/../deploy/systemd"
   systemctl() { return 0; }
   wait_for_merud() { return 0; }
   install_merud_service
@@ -742,6 +879,7 @@ run_test() {
 }
 
 for test_name in \
+  test_linux_release_archives_include_units \
   test_platform_for_ubuntu_2404_amd64 \
   test_platform_for_macos \
   test_platform_rejects_other_linux \
@@ -764,6 +902,9 @@ for test_name in \
   test_linux_configures_web_before_setup \
   test_linux_checks_name_acceptance_commands \
   test_ready_searxng_is_kept \
+  test_ready_podman_refreshes_verified_quadlet \
+  test_ready_podman_refresh_needs_consent \
+  test_ready_podman_refresh_timeout_prints_recovery \
   test_existing_podman_container_keeps_podman \
   test_existing_docker_container_keeps_docker \
   test_broken_podman_falls_back_to_docker \
@@ -772,12 +913,15 @@ for test_name in \
   test_settings_have_json_random_secret_and_modes \
   test_existing_settings_secret_is_kept \
   test_podman_quadlet_binds_loopback_and_uses_percent_h \
+  test_podman_uses_verified_release_quadlet \
   test_podman_starts_generated_service_without_enable \
   test_podman_systemd_failure_returns \
   test_docker_argv_binds_loopback_and_restarts \
   test_docker_pull_failure_stops_before_run \
   test_searxng_handles_home_with_spaces \
   test_merud_unit_uses_local_bin \
+  test_service_uses_verified_release_unit \
+  test_service_copy_failure_stops_before_systemd \
   test_service_install_reloads_enables_and_starts \
   test_service_rerun_replaces_one_unit_and_restarts \
   test_missing_user_bus_prints_status_and_journal \
