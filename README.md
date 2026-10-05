@@ -75,9 +75,9 @@ with nothing behind it.
 
 ## Install on Ubuntu
 
-Meru supports Ubuntu 24.04 on x86-64 as a terminal application. It installs the
-native `meru` and `merud` binaries and uses the `lite` model profile by default;
-the desktop app remains macOS-only in this stage.
+Meru's Ubuntu 24.04 x86-64 terminal installer is awaiting its fresh-host
+acceptance run. It installs the native `meru` and `merud` binaries and uses the
+`lite` model profile by default; the desktop app remains macOS-only in this stage.
 
 ```sh
 curl -fsSL https://github.com/aarora79/meru/releases/latest/download/install.sh | bash
@@ -184,8 +184,9 @@ Meru runs wherever Ollama and Go do:
 
 - **macOS on Apple silicon:** supported and tested. Developed on a Mac Studio, M4 Max,
   64 GB.
-- **Ubuntu 24.04 on x86-64:** supported and tested for `meru`, `meru chat` and
-  `merud`; the desktop app is not part of this stage.
+- **Ubuntu 24.04 on x86-64:** command-line support is implemented for `meru`,
+  `meru chat` and `merud`; fresh-host acceptance is pending, and the desktop app
+  is not part of this stage.
 - **Other Linux systems:** the native binaries should work, but the release
   installer does not support them yet.
 - **Windows 10 and later:** should work; not tested at first.

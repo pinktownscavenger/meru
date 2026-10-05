@@ -190,10 +190,10 @@ Install a release, or build Meru from source. A release needs no Go.
 
 ### Ubuntu 24.04 command-line install
 
-This stage supports Ubuntu 24.04 on x86-64. It installs the terminal clients
-`meru` and `meru chat`, plus the `merud` daemon. It does not install a Linux
-desktop app. A new setup defaults to the `lite` profile: MiniCPM5-2B and
-`nomic-embed-text`.
+This stage targets Ubuntu 24.04 on x86-64. Its fresh-host acceptance run is still
+pending. It installs the terminal clients `meru` and `meru chat`, plus the `merud`
+daemon. It does not install a Linux desktop app. A new setup defaults to the
+`lite` profile: MiniCPM5-2B and `nomic-embed-text`.
 
 You need `curl`, `tar` and `sha256sum`, which Ubuntu 24.04 normally includes.
 Web search also needs an existing, working rootless Podman or Docker install.
@@ -206,16 +206,17 @@ curl -fsSL https://github.com/aarora79/meru/releases/latest/download/install.sh 
 The script names every download and privileged step before it starts. It then:
 
 1. downloads the native release archive and `SHA256SUMS` from GitHub;
-2. checks the archive before it installs `meru` and `merud` in
-   `~/.local/bin`;
-3. offers Ollama's Linux installer, which may use `sudo`, and waits for Ollama;
-4. offers SearXNG through working rootless Podman, or working Docker when
+2. checks the archive, which holds the two binaries, the systemd user unit and
+   the Podman Quadlet;
+3. installs `meru` and `merud` in `~/.local/bin`;
+4. offers Ollama's Linux installer, which may use `sudo`, and waits for Ollama;
+5. offers SearXNG through working rootless Podman, or working Docker when
    Podman is unavailable;
-5. runs `meru setup` for the `lite` models, folders and tools, including its
+6. runs `meru setup` for the `lite` models, folders and tools, including its
    check of the SearXNG service;
-6. installs and starts `merud` as a systemd user service;
-7. after `meru ping` works, offers `meru setup user`; and
-8. offers `sudo loginctl enable-linger "$USER"` for a server that should keep
+7. installs and starts `merud` as a systemd user service;
+8. after `meru ping` works, offers `meru setup user`; and
+9. offers `sudo loginctl enable-linger "$USER"` for a server that should keep
    running after logout.
 
 Each optional or privileged step asks first. Choose `s` at the first prompt to
