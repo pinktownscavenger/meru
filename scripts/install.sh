@@ -3,8 +3,9 @@
 #
 #   curl -fsSL https://github.com/aarora79/meru/releases/latest/download/install.sh | bash
 #
-# It downloads the release, checks each archive against SHA256SUMS, puts meru
-# and merud in ~/.local/bin and Meru.app in /Applications, and then offers
+# It downloads the release, checks each asset against SHA256SUMS, puts meru
+# and merud in ~/.local/bin, Meru.app in /Applications or the optional Ubuntu
+# desktop package in /usr, and then offers
 # the next steps: Ollama, the models, `meru setup`, and starting merud at
 # login. It first lists what it will install and asks once: everything, each
 # step in turn, or quit. MERU_YES=1 answers "everything" without asking.
@@ -184,12 +185,36 @@ linux_banner() {
   echo "  This installer downloads Meru from GitHub."
   echo "  It can download Ollama's installer, which may use sudo."
   echo "  It can pull Meru's pinned SearXNG image with Podman or Docker."
+  echo "  It can install the checked desktop package with sudo apt-get."
+  echo "  apt-get may download GTK4, WebKitGTK 6.0 and xdg-utils from Ubuntu."
   echo "  For a headless server, it can run: sudo loginctl enable-linger \"$username\""
   echo "  It installs neither Podman nor Docker."
   if [ "$all" = 1 ]; then
-    echo "  MERU_YES=1 accepts every step, including Ollama's installer and lingering."
+    echo "  MERU_YES=1 accepts every step, including Ollama, the desktop package and lingering."
   fi
   echo
+}
+
+# install_desktop_deb offers the already checked app package. On a headless
+# run it keeps that package in the user's cache, because tmp disappears on exit.
+install_desktop_deb() {
+  local package=$1 cached
+  if [ "$all" != 1 ]; then
+    if ! has_tty; then
+      cached="$HOME/.cache/meru/$(basename "$package")"
+      mkdir -p "$(dirname "$cached")"
+      install -m 0644 "$package" "$cached"
+      echo "Command-line Meru is ready. To add the desktop app later, run:"
+      printf "  sudo apt-get install --yes -- '%s'\n" "$cached"
+      return 0
+    fi
+    if ! ask "Install the optional Meru desktop app?"; then
+      echo "Command-line Meru is ready; the desktop app was not installed."
+      return 0
+    fi
+  fi
+  say "Installing the Meru desktop app"
+  sudo apt-get install --yes -- "$package"
 }
 
 # searxng_ready accepts the JSON search response Meru's web tool needs.
@@ -524,7 +549,7 @@ configure_linux() {
 
 # install_linux installs the verified CLI, then delegates setup to existing commands.
 install_linux() {
-  local version=$1 base cli release_dir choice
+  local version=$1 base cli desktop release_dir choice
   linux_banner "$version"
   if [ "$all" != 1 ] && has_tty; then
     printf 'Install everything [a], choose each step [s], or quit [q]? ' >/dev/tty
@@ -541,8 +566,10 @@ install_linux() {
   trap 'rm -rf "$tmp"' EXIT
   base="https://github.com/$repo/releases/download/$version"
   cli="meru-$version-linux-amd64.tar.gz"
+  desktop="Meru-$version-linux-amd64.deb"
   release_dir="meru-$version-linux-amd64"
   curl -fsSL -o "$tmp/$cli" "$base/$cli" || fail "couldn't download $cli from $base"
+  curl -fsSL -o "$tmp/$desktop" "$base/$desktop" || fail "couldn't download $desktop from $base"
   curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS" || fail "couldn't download SHA256SUMS from $base"
 
   say "Checking the downloads against SHA256SUMS"
@@ -556,6 +583,7 @@ install_linux() {
   say "Ollama runs the models"
   install_ollama_linux "$tmp"
   configure_linux
+  install_desktop_deb "$tmp/$desktop"
 }
 
 # main performs the install when Bash executes this file rather than sourcing it.

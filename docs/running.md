@@ -189,12 +189,12 @@ loaded model got.
 
 Install a release, or build Meru from source. A release needs no Go.
 
-### Ubuntu 24.04 command-line install
+### Ubuntu 24.04 install
 
 This stage targets Ubuntu 24.04 on x86-64. Its fresh-host acceptance run is still
 pending. It installs the terminal clients `meru` and `meru chat`, plus the `merud`
-daemon. It does not install a Linux desktop app. A new setup defaults to the
-`lite` profile: MiniCPM5-2B and `nomic-embed-text`.
+daemon, and offers the desktop app as a final optional step. A new setup defaults
+to the `lite` profile: MiniCPM5-2B and `nomic-embed-text`.
 
 You need `curl`, `tar` and `sha256sum`, which Ubuntu 24.04 normally includes.
 Web search also needs an existing, working rootless Podman or Docker install.
@@ -206,9 +206,10 @@ curl -fsSL https://github.com/aarora79/meru/releases/latest/download/install.sh 
 
 The script names every download and privileged step before it starts. It then:
 
-1. downloads the native release archive and `SHA256SUMS` from GitHub;
-2. checks the archive, which holds the two binaries, the systemd user unit and
-   the Podman Quadlet;
+1. downloads the native release archive, desktop `.deb` and `SHA256SUMS` from
+   GitHub;
+2. checks the archive and desktop package; the archive holds the two binaries,
+   the systemd user unit and the Podman Quadlet;
 3. installs `meru` and `merud` in `~/.local/bin`;
 4. offers Ollama's Linux installer, which may use `sudo`, and waits for Ollama;
 5. offers SearXNG through working rootless Podman, or working Docker when
@@ -218,11 +219,14 @@ The script names every download and privileged step before it starts. It then:
 7. installs and starts `merud` as a systemd user service;
 8. after `meru ping` works, offers `meru setup user`; and
 9. offers `sudo loginctl enable-linger "$USER"` for a server that should keep
-   running after logout.
+   running after logout;
+10. offers the checked desktop package through `sudo apt-get install`; apt may
+    download GTK 4, WebKitGTK and `xdg-utils` for the app.
 
 Each optional or privileged step asks first. Choose `s` at the first prompt to
 accept one step at a time. `MERU_YES=1` accepts every step, including Ollama's
-installer and lingering, so use it only when that is what you want:
+installer, lingering and the desktop package, so use it only when that is what
+you want:
 
 ```sh
 curl -fsSL https://github.com/aarora79/meru/releases/latest/download/install.sh \
@@ -230,7 +234,9 @@ curl -fsSL https://github.com/aarora79/meru/releases/latest/download/install.sh 
 ```
 
 With no terminal, the script installs and checks the binaries but cannot answer
-`meru setup`. It prints the commands that remain and does not start `merud`
+`meru setup` or consent to `sudo`. It keeps the checked desktop package at
+`~/.cache/meru/Meru-vX.Y.Z-linux-amd64.deb`, prints the exact apt command and
+does not run it. It also prints the setup commands and does not start `merud`
 without a config. Run `meru setup`, then run the installer again from a terminal.
 
 Check the install:
@@ -2547,6 +2553,14 @@ later.
 
 On Ubuntu, stop the user services first. Remove only the files the release
 installer owns:
+
+```sh
+sudo apt-get remove --yes meru-desktop
+```
+
+That command removes only the optional app. It keeps the command-line programs,
+service and user data. Remove those core files separately when you want the full
+uninstall:
 
 ```sh
 systemctl --user disable --now merud.service
