@@ -591,8 +591,9 @@ scripts.
 
 ### The desktop app
 
-`meru-desktop` shows the same conversations in a window. It runs on macOS for now,
-and it talks to the `merud` you already run, so start `merud` first.
+`meru-desktop` shows the same conversations in a window. It runs on macOS and
+Ubuntu 24.04 x86-64, and it talks to the `merud` you already run, so start
+`merud` first.
 
 It builds on its own, because its window library, Wails, needs a C compiler and
 the system's WebView. On a Mac, the Xcode command line tools bring both
@@ -602,6 +603,12 @@ the system's WebView. On a Mac, the Xcode command line tools bring both
 make desktop            # writes bin/meru-desktop
 ./bin/meru-desktop      # opens the window
 ```
+
+On Ubuntu, the release installer offers the app-only package after it sets up
+the command-line programs. For a source build, install `build-essential`,
+`pkg-config`, `libgtk-4-dev` and `libwebkitgtk-6.0-dev`, then run `make
+desktop-linux`. `make desktop-deb VERSION=v0.0.0` builds and checks a local
+package in `dist/`.
 
 `make desktop-app` wraps the same binary in `bin/Meru.app`, with the Meru icon,
 which you can drag to `/Applications` and open like any app. The app finds `merud` at

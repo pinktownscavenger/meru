@@ -78,20 +78,22 @@ with nothing behind it.
 
 ## Install on Ubuntu
 
-Meru's Ubuntu 24.04 x86-64 terminal installer is awaiting its fresh-host
-acceptance run. It installs the native `meru` and `merud` binaries and uses the
-`lite` model profile by default; the desktop app remains macOS-only in this stage.
+Meru's Ubuntu 24.04 x86-64 installer is awaiting its fresh-host acceptance run.
+It installs the native `meru` and `merud` binaries, uses the `lite` model profile
+by default, and offers the desktop app as an optional app-only `.deb`.
 
 ```sh
 curl -fsSL https://github.com/aarora79/meru/releases/latest/download/install.sh | bash
 ```
 
 The script checks the release files, offers to install Ollama, runs `meru setup`,
-and can start `merud` as a systemd user service. It can also run SearXNG with an
-existing rootless Podman or Docker installation. It installs neither container
-runtime. Each optional or privileged step asks first. See the
-[Ubuntu install guide](docs/running.md#ubuntu-2404-command-line-install) for
-prerequisites, headless servers, updates, recovery and removal.
+and can start `merud` as a systemd user service. Its final choice installs only
+the desktop app with apt; removing that package keeps the command-line programs,
+service, config and user data. The script can also run SearXNG with an existing
+rootless Podman or Docker installation. It installs neither container runtime.
+Each optional or privileged step asks first. See the
+[Ubuntu install guide](docs/running.md#ubuntu-2404-install) for prerequisites,
+headless servers, updates, recovery and removal.
 
 ## What it does
 
@@ -187,9 +189,8 @@ Meru runs wherever Ollama and Go do:
 
 - **macOS on Apple silicon:** supported and tested. Developed on a Mac Studio, M4 Max,
   64 GB.
-- **Ubuntu 24.04 on x86-64:** command-line support is implemented for `meru`,
-  `meru chat` and `merud`; fresh-host acceptance is pending, and the desktop app
-  is not part of this stage.
+- **Ubuntu 24.04 on x86-64:** `meru`, `meru chat`, `merud` and the optional
+  desktop app are implemented; fresh-host and graphical acceptance are pending.
 - **Other Linux systems:** the native binaries should work, but the release
   installer does not support them yet.
 - **Windows 10 and later:** should work; not tested at first.
