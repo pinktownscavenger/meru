@@ -28,6 +28,7 @@ CI builds no releases. The owner builds each one on a Mac with
 | Coverage | ci / test | Nothing fails on it; the job summary shows the total and the profile is kept as an artifact for 14 days | `make cover` |
 | Cross-compile | ci / build | Code that builds on your OS but not on another; accidental cgo | `make build` |
 | Desktop app and installer | ci / desktop (macOS) | The desktop app or the Mac installer failing to build with cgo and the WebView, or failing vet, staticcheck or govulncheck with their build tags | `make desktop installer desktop-check` (needs cgo) |
+| Debian package structure | ci / installer and `make check` | A wrong version, commit, architecture, dependency, installed path, mode, link or maintainer script | `make desktop-package-test` |
 | Ubuntu installer | ci / installer | A broken shell flow, systemd user unit or rootless Podman Quadlet; a web fetch that can reach a private address | `make install-script-test`; the service checks need systemd and Podman from Ubuntu 24.04 |
 | End-to-end | ci / e2e | A real `merud` and `meru` failing together against the fake Ollama | `make e2e` |
 | actionlint | ci / actionlint | Mistakes in the workflow files themselves | `make actionlint` |
@@ -44,12 +45,14 @@ without a C compiler.
 
 The desktop app is the one exception, kept apart. Its window library, Wails v3,
 needs cgo and the system's WebView, so `cmd/meru-desktop` builds only with the
-`desktop` build tag. Every other job, and `make check`, skips it. The `desktop`
+`desktop` build tag. The ordinary Go jobs skip it. `make check` still runs the
+cross-platform Debian package fixtures, which need no WebView. The `desktop`
 job builds it on a macOS runner with `make desktop`, then runs `make
 desktop-check`: go vet, staticcheck and govulncheck with the same tags, since the
 usual jobs never see its code. The rest of the app, `internal/desktop`, has no
-tag and runs in the test job. Linux (WebKitGTK) and Windows (WebView2) jobs come
-later. The Mac installer, `cmd/meru-installer`, is built the same way in the
+tag and runs in the test job. Ubuntu 24.04 builds the WebKitGTK app and inspects
+the real `.deb`; Windows (WebView2) comes later. The Mac installer,
+`cmd/meru-installer`, is built the same way in the
 same job with `make installer`, and `internal/installer` runs in the test job.
 
 The end-to-end tests live in `test/e2e/` behind the `e2e` build tag. They build
