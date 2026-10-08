@@ -38,7 +38,7 @@ COVER_PROFILE := coverage.out
 # .claude/ that belong to other branches.
 GO_FILES = $(shell find . -path './.*' -prune -o -name '*.go' -print)
 
-.PHONY: help fmt fmt-check vet lint test cover e2e vuln sec sec-sarif secrets secrets-history tidy-check install-script-test desktop-package-test actionlint build desktop desktop-linux desktop-deb desktop-check desktop-app installer installer-app dmg router-eval pick-eval bench bench-report figures check release clean
+.PHONY: help fmt fmt-check vet lint test cover e2e vuln sec sec-sarif secrets secrets-history tidy-check install-script-test desktop-package-test release-linux-desktop-test actionlint build desktop desktop-linux desktop-deb desktop-check desktop-app installer installer-app dmg router-eval pick-eval bench bench-report figures check release clean
 
 help: ## List the targets
 	@grep -E '^[a-z0-9-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
@@ -113,6 +113,10 @@ install-script-test: ## Test the one-line release installer
 desktop-package-test: ## Test Debian package construction and inspection
 	bash -n scripts/package-deb.sh scripts/check-deb.sh scripts/package-deb_test.sh
 	bash scripts/package-deb_test.sh
+
+release-linux-desktop-test: ## Test the exact-run GitHub handoff for the Ubuntu app
+	bash -n scripts/release-linux-desktop.sh scripts/release-linux-desktop_test.sh
+	bash scripts/release-linux-desktop_test.sh
 
 # cmd/meru-desktop builds only with -tags desktop, so ./cmd/... here skips
 # it and the cross-compile stays free of cgo. `make desktop` builds it.
@@ -217,9 +221,10 @@ dmg: installer-app ## Pack "Install Meru.app" in dist/Meru-VERSION-macos-arm64.d
 	rm -rf dist/dmg
 	@ls -lh "$(DMG)"
 
-check: fmt-check vet lint tidy-check test e2e build vuln sec secrets install-script-test desktop-package-test actionlint ## Run every check CI runs, in CI's order
+check: fmt-check vet lint tidy-check test e2e build vuln sec secrets install-script-test desktop-package-test release-linux-desktop-test actionlint ## Run every check CI runs, in CI's order
 
-# Releases build on the owner's Mac, not in CI; docs/releasing.md says why.
+# The owner's Mac publishes releases and collects the Ubuntu app from the
+# exact-commit GitHub Actions job; docs/releasing.md explains that split.
 release: ## Build, pack and publish a release: make release VERSION=v0.4.1 [DRY_RUN=1]
 	VERSION="$(VERSION)" DRY_RUN="$(DRY_RUN)" bash scripts/release.sh
 

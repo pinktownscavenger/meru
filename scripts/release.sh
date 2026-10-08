@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# release.sh builds a Meru release on the owner's Mac and publishes it on
+# release.sh collects a Meru release on the owner's Mac and publishes it on
 # GitHub. `make release VERSION=v0.4.1` runs it; docs/releasing.md explains
-# each step and why the build runs here and not in CI.
+# how the Mac build and the exact-commit Ubuntu build meet in one release.
 #
 # What it does, in order:
 #   1. refuses to start unless the repo and the version are ready;
 #   2. runs `make check`;
 #   3. builds meru and merud for five platforms, and Meru.app and the Mac
 #      installer's disk image for this Mac, with the version stamped in;
-#   4. packs them into dist/ with a SHA256SUMS file;
-#   5. tags the commit, pushes the tag and creates the GitHub release.
+#   4. asks GitHub Actions to build the Ubuntu app from the same commit;
+#   5. packs them into dist/ with a SHA256SUMS file;
+#   6. tags the commit, pushes the tag and creates the GitHub release.
 #
-# DRY_RUN=1 does steps 1 to 4 and stops before it tags anything. In a dry run
+# DRY_RUN=1 does steps 1 to 5 and stops before it tags anything. In a dry run
 # the branch, clean-tree and up-to-date checks only warn, so you can try the
 # script on a branch.
 #
@@ -98,9 +99,8 @@ if [ -n "$(git ls-remote --tags origin "refs/tags/$version")" ]; then
   fail "tag $version already exists on GitHub"
 fi
 
-if [ -z "$dry_run" ]; then
-  gh auth status >/dev/null 2>&1 || fail "gh isn't signed in; run gh auth login"
-fi
+# Dry runs also dispatch the Ubuntu build, so every release needs GitHub access.
+gh auth status >/dev/null 2>&1 || fail "gh isn't signed in; run gh auth login"
 
 # The release notes, which the release-notes skill in .claude/skills/
 # writes and a pull request merges before the release. The same file is the
@@ -148,7 +148,15 @@ make dmg LDFLAGS="$ldflags"
 # the next.
 cp "dist/Meru-$version-macos-arm64.dmg" dist/Meru-macos-arm64.dmg
 
-# ---- 4. Pack ----
+# ---- 4. Collect the Ubuntu app ----
+
+# GitHub Actions owns the Linux cgo toolchain. The helper dispatches a build of
+# this exact commit, waits by run ID, checks the one package and copies it into
+# dist. This Mac script still owns the tag and the GitHub release.
+commit=$(git rev-parse HEAD)
+bash scripts/release-linux-desktop.sh "$version" "$commit" dist
+
+# ---- 5. Pack ----
 
 # COPYFILE_DISABLE stops macOS tar from adding ._ files that hold Finder
 # metadata. The uid and gid options keep this Mac's user name out of the
@@ -177,12 +185,12 @@ rm -rf dist/stage
 
 # One line per file: its SHA-256 and its name. Installers check the files
 # they download with: shasum -a 256 -c SHA256SUMS --ignore-missing
-(cd dist && shasum -a 256 *.tar.gz *.zip *.dmg > SHA256SUMS)
+(cd dist && shasum -a 256 *.tar.gz *.zip *.dmg *.deb > SHA256SUMS)
 
 echo "release: built in dist/:"
 ls -l dist
 
-# ---- 5. Tag and publish ----
+# ---- 6. Tag and publish ----
 
 if [ -n "$dry_run" ]; then
   echo "release: dry run; no tag, no push, no release"
@@ -205,6 +213,6 @@ gh release create "$version" \
   --title "Meru $version" \
   --verify-tag \
   "${notes_args[@]}" \
-  dist/*.tar.gz dist/*.zip dist/*.dmg dist/SHA256SUMS scripts/install.sh
+  dist/*.tar.gz dist/*.zip dist/*.dmg dist/*.deb dist/SHA256SUMS scripts/install.sh
 
 echo "release: published https://github.com/$repo/releases/tag/$version"
