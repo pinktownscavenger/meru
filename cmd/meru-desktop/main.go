@@ -27,8 +27,13 @@ import (
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
 
+	"github.com/aarora79/meru/internal/about"
 	"github.com/aarora79/meru/internal/desktop"
 )
+
+// linuxApplicationID joins the GTK window to the installed desktop entry and
+// icon. Reverse-domain names stay unique in a Linux desktop session.
+const linuxApplicationID = "com.meru.desktop"
 
 // main runs the app and turns an error into exit status 1.
 func main() {
@@ -44,8 +49,13 @@ func main() {
 func run(args []string) error {
 	flags := flag.NewFlagSet("meru-desktop", flag.ContinueOnError)
 	socket := flags.String("socket", "", "merud's socket (default ~/.meru/merud.sock)")
+	version := flags.Bool("version", false, "print the version and exit")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if *version {
+		fmt.Println(about.Version())
+		return nil
 	}
 	opts, err := desktop.DefaultOptions(*socket)
 	if err != nil {
@@ -75,6 +85,9 @@ func run(args []string) error {
 	app = application.New(application.Options{
 		Name:        "Meru",
 		Description: desktop.Tagline,
+		Linux: application.LinuxOptions{
+			ApplicationID: linuxApplicationID,
+		},
 		// NewService binds every exported method of the Bridge, so the
 		// page can call it by name, and calls its ServiceShutdown when
 		// the app quits.

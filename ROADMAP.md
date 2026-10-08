@@ -122,7 +122,8 @@ from a later milestone.
   `attach_file` copies it to `~/meru-output/uploads/`; images go to a vision model
 - [x] The chat list, in both clients: delete a chat for good, chat folders, tags
   that recall searches, and incognito chats that leave no transcript
-- [ ] Linux (WebKitGTK) and Windows (WebView2) builds in CI
+- [ ] Linux (WebKitGTK) build and app-only Debian package in CI
+- [ ] Windows (WebView2) build in CI
 
 **Done when:** you open the app, ask a question that uses a tool, approve it in
 the answer, and reopen the chat the next day to carry on.
@@ -207,8 +208,8 @@ fastest, with a median of 6.5 s to the last token.
 - Optional SearXNG through working rootless Podman or Docker, with neither runtime
   installed by Meru
 - `merud` as a systemd user service, with lingering only after the user accepts it
-- Ubuntu desktop packaging follows in phase two of
-  [#84](https://github.com/aarora79/meru/issues/84)
+- App-only Ubuntu desktop package through the same checked setup path, built on
+  Ubuntu from the exact release commit
 - Job definitions (prompt + cron) as `[[jobs]]` in `config.toml`
 - In-daemon scheduler sharing the warm model
 - Digests, notifications, `meru brief`
@@ -216,6 +217,10 @@ fastest, with a median of 6.5 s to the last token.
 **Ubuntu done when:** on a fresh Ubuntu 24.04 x86-64 machine, one documented
 command installs command-line Meru with the `lite` profile, starts `merud`, and a
 normal question plus a question about an indexed file both use the right model.
+
+**Ubuntu desktop done when:** on a fresh Ubuntu 24.04 x86-64 desktop, the checked
+`.deb` installs from that command; Meru opens from the app menu, chats through the
+user service, attaches and drops files, picks a folder, and opens HTTP and file links.
 
 **Scheduler done when:** a morning brief lands without you asking.
 

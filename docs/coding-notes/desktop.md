@@ -593,6 +593,13 @@ renders SVG will do), scale it with `sips` to the ten sizes an `.iconset` folder
 holds (16 to 512 pixels, each also at double size), and run
 `iconutil -c icns Meru.iconset -o cmd/meru-desktop/Meru.icns`.
 
+On Linux, `linuxApplicationID` sets Wails' GTK application ID to
+`com.meru.desktop`. The desktop entry has that basename and uses the same text for
+its icon and `StartupWMClass`. GNOME can then group the running window under the
+menu entry and show the installed icon on X11 and Wayland. The `--version` path
+prints `about.Version()` and returns before Wails starts. The Debian package checker
+uses it without a display to prove that the package holds the release build.
+
 ## Go ideas used here
 
 - **Goroutines** — each turn reads its events in its own. More in
@@ -618,6 +625,7 @@ foot of the rail, and "Run setup again" in Settings, About opens Setup.
 ```sh
 go test ./internal/desktop/...      # runs anywhere, no cgo
 make desktop                        # builds bin/meru-desktop (macOS, needs Xcode tools)
+./bin/meru-desktop --version        # prints the stamped build without opening a window
 ./bin/meru-desktop                  # with merud running
 ```
 
