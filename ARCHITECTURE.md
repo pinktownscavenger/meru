@@ -109,7 +109,7 @@ OpenTelemetry stack.
 | Platform | Status | Restarts `merud` after a reboot |
 | --- | --- | --- |
 | macOS, Apple silicon | supported and tested; the development machine is a Mac Studio (M4 Max, 64 GB) | `launchd` |
-| Ubuntu 24.04, x86-64 (home servers, cloud virtual machines) | command-line clients and daemon implemented; fresh-host acceptance pending | `systemd --user` |
+| Ubuntu 24.04, x86-64 (desktops, home servers, cloud virtual machines) | command-line clients, daemon and desktop package implemented; fresh-host acceptance pending | `systemd --user` |
 | Other Linux systems and Linux arm64 | should work; not tested at first | `systemd` |
 | Windows 10 and later | should work; not tested at first | a Windows service |
 
@@ -120,8 +120,10 @@ in as few files as possible.
 On Ubuntu 24.04 x86-64, `scripts/install.sh` is the candidate install path. It
 installs the command-line clients and daemon, uses the `lite` profile by default,
 and makes no GPU-based model recommendation. Fresh-host acceptance must pass before
-the project calls this path supported. The desktop app and its Wails installer
-remain Mac-only in this stage.
+the project calls this path supported. On a desktop, the same checked setup path
+offers an app-only Debian package after the command-line install. The package owns
+the desktop binary, menu entry, icon and licence copy. It owns no daemon, service,
+config or user data.
 
 **On a cloud server**, Meru still sends no prompt to a model provider,
 but your notes, email and transcripts live on that server. Meru's promise is "a
@@ -329,7 +331,8 @@ platform's WebView headers, so the app sits apart from the cgo-free build:
 - `internal/desktop` holds everything else: the Bridge the page calls, the views
   it sends, and the page itself, embedded with `go:embed`. It doesn't import
   Wails, so its tests run everywhere.
-- CI builds the app on macOS. Linux and Windows builds come later.
+- CI builds the app on macOS and Ubuntu 24.04 x86-64. Ubuntu packages it as an
+  app-only `.deb`; Windows builds come later.
 
 **The Bridge.** The window binds one Go value, the Bridge, whose methods the page
 calls by name. `Send` opens an `ask` request with source `desktop` and the scope
@@ -2915,6 +2918,26 @@ installer enables and starts that user service. On a headless server it offers t
 enable lingering, explains that this runs the user service without a login session,
 and calls `sudo loginctl enable-linger` only after the user accepts that step.
 
+### Ubuntu desktop package
+
+The Ubuntu installer downloads `Meru-vX.Y.Z-linux-amd64.deb` beside the command-line
+archive and checks both against `SHA256SUMS`. After the command-line setup works, it
+offers the app as an optional final step. A decline leaves command-line Meru ready.
+With no terminal, the installer prints the checked local-package command and runs no
+privileged step.
+
+The package installs `/usr/bin/meru-desktop`, one desktop entry, one 512-pixel icon
+and the Apache License 2.0 text. It declares GTK4, WebKitGTK 6.0 and `xdg-open` as
+runtime dependencies. It has no maintainer scripts, so install, upgrade and removal
+cannot start `merud` or change files under `~/.meru`.
+
+Linux cgo builds run on an Ubuntu 24.04 GitHub Actions runner. The release owner
+starts that workflow with the version and exact commit that `scripts/release.sh`
+checked. The workflow checks out that commit, builds and inspects the package, then
+uploads one run artifact. The Mac release script downloads that artifact by run ID
+and checks its version, commit, architecture, dependencies and files before it makes
+a tag. `scripts/release.sh` remains the only publisher.
+
 ### Mac installer
 
 The Mac installer, "Install Meru.app", takes a Mac with Apple silicon from nothing
@@ -4699,9 +4722,9 @@ We'll settle these with working code and measurements.
 - **Language:** Go, for a small footprint, easy distribution, room to scale, built-in
   concurrency and fewer dependencies (see [Why Go](#why-go)).
 - **Platforms:** macOS on Apple silicon first; Ubuntu 24.04 x86-64 command-line
-  support is implemented and awaits fresh-host acceptance; other Linux systems
-  should work; Windows remains untested. Cloud servers count as "a machine you
-  control".
+  support and the app-only desktop package are implemented and await fresh-host
+  acceptance; other Linux systems should work; Windows remains untested. Cloud
+  servers count as "a machine you control".
 - **Agent harness:** our own loop plus the official MCP and A2A Go SDKs. We looked at
   Eino and ADK Go. ADK Go pulls a cloud-model client into the dependency tree, and
   neither saves much once the allowlist, audit and budget logic are ours.

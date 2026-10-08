@@ -26,9 +26,10 @@ PLATFORMS := darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 windows/amd64
 # empty unless scripts/release.sh sets it to stamp the version in.
 LDFLAGS ?=
 
-# VERSION and DRY_RUN are for `make release`; docs/releasing.md explains them.
+# VERSION and DRY_RUN are for releases; COMMIT binds a Linux package to its source.
 VERSION ?=
 DRY_RUN ?=
+COMMIT  ?= $(shell git rev-parse HEAD)
 
 COVER_PROFILE := coverage.out
 
@@ -37,7 +38,7 @@ COVER_PROFILE := coverage.out
 # .claude/ that belong to other branches.
 GO_FILES = $(shell find . -path './.*' -prune -o -name '*.go' -print)
 
-.PHONY: help fmt fmt-check vet lint test cover e2e vuln sec sec-sarif secrets secrets-history tidy-check install-script-test actionlint build desktop desktop-check desktop-app installer installer-app dmg router-eval pick-eval bench bench-report figures check release clean
+.PHONY: help fmt fmt-check vet lint test cover e2e vuln sec sec-sarif secrets secrets-history tidy-check install-script-test desktop-package-test release-linux-desktop-test actionlint build desktop desktop-linux desktop-deb desktop-check desktop-app installer installer-app dmg router-eval pick-eval bench bench-report figures check release clean
 
 help: ## List the targets
 	@grep -E '^[a-z0-9-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
@@ -109,6 +110,14 @@ install-script-test: ## Test the one-line release installer
 	bash -n scripts/install.sh scripts/install_test.sh
 	bash scripts/install_test.sh
 
+desktop-package-test: ## Test Debian package construction and inspection
+	bash -n scripts/package-deb.sh scripts/check-deb.sh scripts/package-deb_test.sh
+	bash scripts/package-deb_test.sh
+
+release-linux-desktop-test: ## Test the exact-run GitHub handoff for the Ubuntu app
+	bash -n scripts/release-linux-desktop.sh scripts/release-linux-desktop_test.sh
+	bash scripts/release-linux-desktop_test.sh
+
 # cmd/meru-desktop builds only with -tags desktop, so ./cmd/... here skips
 # it and the cross-compile stays free of cgo. `make desktop` builds it.
 build: ## Cross-compile ./cmd/... into ./bin/GOOS-GOARCH/
@@ -132,6 +141,22 @@ endif
 
 desktop: ## Build the desktop app for this machine into bin/meru-desktop (needs cgo)
 	$(DESKTOP_CGO) go build -trimpath -tags "$(DESKTOP_TAGS)" -ldflags "$(LDFLAGS)" -o bin/meru-desktop ./cmd/meru-desktop
+
+# Linux builds need the native GTK4 and WebKitGTK 6.0 headers. This target
+# refuses a cross-build before cgo prints a long compiler error.
+desktop-linux: ## Build the Ubuntu 24.04 x86-64 desktop app (needs GTK4 and WebKitGTK 6.0)
+	@[ "$$(uname -s)" = Linux ] && [ "$$(uname -m)" = x86_64 ] || { echo "make desktop-linux runs on Linux x86-64"; exit 1; }
+	@pkg-config --exists gtk4 || { echo "make desktop-linux needs the GTK4 development package"; exit 1; }
+	@pkg-config --exists webkitgtk-6.0 || { echo "make desktop-linux needs the WebKitGTK 6.0 development package"; exit 1; }
+	@mkdir -p bin/linux-amd64
+	@ldflags='$(LDFLAGS)'; \
+	if [ -n "$(VERSION)" ]; then ldflags="$$ldflags -X github.com/aarora79/meru/internal/about.releaseVersion=$(VERSION)"; fi; \
+	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -tags "$(DESKTOP_TAGS)" -ldflags "$$ldflags" -o bin/linux-amd64/meru-desktop ./cmd/meru-desktop
+
+desktop-deb: desktop-linux ## Build and inspect the app-only Ubuntu package
+	@[ -n "$(VERSION)" ] || { echo "make desktop-deb needs VERSION=vX.Y.Z"; exit 1; }
+	bash scripts/package-deb.sh "$(VERSION)" "$(COMMIT)" bin/linux-amd64/meru-desktop dist
+	bash scripts/check-deb.sh "$(VERSION)" "$(COMMIT)" "dist/Meru-$(VERSION)-linux-amd64.deb"
 
 desktop-check: ## Vet, lint and vuln-check cmd/meru-desktop and cmd/meru-installer with their tags (needs cgo)
 	$(DESKTOP_CGO) go vet -tags "$(DESKTOP_TAGS)" ./cmd/meru-desktop ./cmd/meru-installer
@@ -196,9 +221,10 @@ dmg: installer-app ## Pack "Install Meru.app" in dist/Meru-VERSION-macos-arm64.d
 	rm -rf dist/dmg
 	@ls -lh "$(DMG)"
 
-check: fmt-check vet lint tidy-check test e2e build vuln sec secrets install-script-test actionlint ## Run every check CI runs, in CI's order
+check: fmt-check vet lint tidy-check test e2e build vuln sec secrets install-script-test desktop-package-test release-linux-desktop-test actionlint ## Run every check CI runs, in CI's order
 
-# Releases build on the owner's Mac, not in CI; docs/releasing.md says why.
+# The owner's Mac publishes releases and collects the Ubuntu app from the
+# exact-commit GitHub Actions job; docs/releasing.md explains that split.
 release: ## Build, pack and publish a release: make release VERSION=v0.4.1 [DRY_RUN=1]
 	VERSION="$(VERSION)" DRY_RUN="$(DRY_RUN)" bash scripts/release.sh
 

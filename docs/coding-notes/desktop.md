@@ -593,6 +593,22 @@ renders SVG will do), scale it with `sips` to the ten sizes an `.iconset` folder
 holds (16 to 512 pixels, each also at double size), and run
 `iconutil -c icns Meru.iconset -o cmd/meru-desktop/Meru.icns`.
 
+On Linux, `linuxApplicationID` sets Wails' GTK application ID to
+`com.meru.desktop`. The desktop entry has that basename and uses the same text for
+its icon and `StartupWMClass`. GNOME can then group the running window under the
+menu entry and show the installed icon on X11 and Wayland. The `--version` path
+prints `about.Version()` and returns before Wails starts. Ubuntu package checks run
+that path without a display. The Mac release host cannot run a Linux program, so its
+checker reads the same stamped text from the binary with `strings`.
+
+`scripts/package-deb.sh` makes one fixed Debian tree. It installs the binary,
+desktop entry, 512-pixel icon and licence copy, then gives that tree to `dpkg-deb`.
+The control file holds the release version, `amd64`, the three runtime packages and
+the source commit. It has no maintainer script. `scripts/check-deb.sh` opens the ar
+archive with tools that macOS and Ubuntu share, extracts its control and data
+archives, and refuses any extra path, link, mode, dependency or identity. This lets
+the Mac publisher inspect the Linux artifact without installing it.
+
 ## Go ideas used here
 
 - **Goroutines** — each turn reads its events in its own. More in
@@ -618,6 +634,9 @@ foot of the rail, and "Run setup again" in Settings, About opens Setup.
 ```sh
 go test ./internal/desktop/...      # runs anywhere, no cgo
 make desktop                        # builds bin/meru-desktop (macOS, needs Xcode tools)
+make desktop-package-test           # tests the Debian tree and inspector anywhere
+make desktop-deb VERSION=v0.5.0     # builds the app and .deb on Ubuntu 24.04 x86-64
+./bin/meru-desktop --version        # prints the stamped build without opening a window
 ./bin/meru-desktop                  # with merud running
 ```
 

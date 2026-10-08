@@ -175,6 +175,23 @@ test_checksum_failure_writes_no_binary() {
   rm -rf "$dir"
 }
 
+# test_manifest_names_every_download rejects an asset that the checksum file omits.
+test_manifest_names_every_download() {
+  local dir fake_bin log
+  dir=$(mktemp -d); fake_bin="$dir/fake"; log="$dir/log"
+  printf 'cli\n' >"$dir/meru-v1.2.3-linux-amd64.tar.gz"
+  printf 'desktop\n' >"$dir/Meru-v1.2.3-linux-amd64.deb"
+  printf '%064d  meru-v1.2.3-linux-amd64.tar.gz\n' 0 >"$dir/SHA256SUMS"
+  make_command_stub "$fake_bin" sha256sum
+  load_installer
+  if COMMAND_LOG="$log" PATH="$fake_bin:$PATH" verify_downloads Linux "$dir" >/dev/null 2>&1; then
+    rm -rf "$dir"
+    test_fail "checksum verification accepted an unlisted desktop package"
+    return
+  fi
+  rm -rf "$dir"
+}
+
 # test_linux_uses_sha256sum checks the GNU checksum command and arguments.
 test_linux_uses_sha256sum() {
   local dir fake_bin log output
@@ -327,9 +344,130 @@ test_meru_yes_banner_names_sudo_steps() {
   output=$(linux_banner v0.0.0)
   assert_contains "$output" "Ollama"
   assert_contains "$output" "SearXNG"
+  assert_contains "$output" "desktop package"
+  assert_contains "$output" "apt-get"
+  assert_contains "$output" "GTK4"
   assert_contains "$output" "sudo"
   assert_contains "$output" "loginctl enable-linger"
   assert_contains "$output" "accepts every step"
+}
+
+# test_desktop_package_decline_keeps_core_install leaves the optional app alone.
+test_desktop_package_decline_keeps_core_install() {
+  local dir log output
+  dir=$(mktemp -d); log="$dir/log"
+  printf 'package\n' >"$dir/Meru-v1.2.3-linux-amd64.deb"
+  load_installer
+  all=0
+  has_tty() { return 0; }
+  ask() { return 1; }
+  sudo() { printf 'sudo %s\n' "$*" >>"$log"; }
+  output=$(install_desktop_deb "$dir/Meru-v1.2.3-linux-amd64.deb")
+  [ ! -s "$log" ] || test_fail "declined desktop package ran sudo"
+  assert_contains "$output" "Command-line Meru is ready"
+  rm -rf "$dir"
+}
+
+# test_desktop_package_accepts_exact_apt_argv keeps the checked path one argument.
+test_desktop_package_accepts_exact_apt_argv() {
+  local dir log output arg
+  dir=$(mktemp -d); log="$dir/log"
+  printf 'package\n' >"$dir/Meru package.deb"
+  load_installer
+  all=0
+  has_tty() { return 0; }
+  ask() { return 0; }
+  sudo() { for arg in "$@"; do printf '<%s>' "$arg" >>"$log"; done; printf '\n' >>"$log"; }
+  install_desktop_deb "$dir/Meru package.deb"
+  output=$(cat "$log")
+  assert_equal "<apt-get><install><--yes><--><$dir/Meru package.deb>" "$output"
+  rm -rf "$dir"
+}
+
+# test_meru_yes_installs_desktop_without_prompt applies the banner's consent.
+test_meru_yes_installs_desktop_without_prompt() {
+  local dir log
+  dir=$(mktemp -d); log="$dir/log"
+  printf 'package\n' >"$dir/Meru-v1.2.3-linux-amd64.deb"
+  load_installer
+  all=1
+  has_tty() { return 1; }
+  ask() { test_fail "MERU_YES asked again"; }
+  sudo() { printf 'sudo %s\n' "$*" >>"$log"; }
+  install_desktop_deb "$dir/Meru-v1.2.3-linux-amd64.deb"
+  assert_contains "$(cat "$log")" 'apt-get install --yes --'
+  rm -rf "$dir"
+}
+
+# test_headless_desktop_keeps_checked_package_for_later runs no privileged command.
+test_headless_desktop_keeps_checked_package_for_later() {
+  local dir log old_home output cached
+  dir=$(mktemp -d); log="$dir/log"; old_home=$HOME
+  HOME="$dir/home with spaces"
+  printf 'package\n' >"$dir/Meru-v1.2.3-linux-amd64.deb"
+  load_installer
+  all=0
+  has_tty() { return 1; }
+  sudo() { printf 'sudo %s\n' "$*" >>"$log"; }
+  output=$(install_desktop_deb "$dir/Meru-v1.2.3-linux-amd64.deb")
+  cached="$HOME/.cache/meru/Meru-v1.2.3-linux-amd64.deb"
+  cmp "$dir/Meru-v1.2.3-linux-amd64.deb" "$cached"
+  [ ! -s "$log" ] || test_fail "headless desktop install ran sudo"
+  assert_contains "$output" "sudo apt-get install --yes -- '$cached'"
+  HOME=$old_home
+  rm -rf "$dir"
+}
+
+# test_bad_checksum_stops_before_desktop_sudo verifies both downloads precede trust.
+test_bad_checksum_stops_before_desktop_sudo() {
+  local dir log old_home output status
+  dir=$(mktemp -d); log="$dir/log"; old_home=$HOME
+  HOME="$dir/home"; bin_dir="$HOME/.local/bin"
+  load_installer
+  all=1
+  linux_banner() { :; }
+  curl() {
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = -o ]; then shift; printf 'download\n' >"$1"; return 0; fi
+      shift
+    done
+  }
+  verify_downloads() {
+    [ -f "$2/meru-v1.2.3-linux-amd64.tar.gz" ] || test_fail "CLI archive was not downloaded"
+    [ -f "$2/Meru-v1.2.3-linux-amd64.deb" ] || test_fail "desktop package was not downloaded"
+    return 1
+  }
+  sudo() { printf 'sudo %s\n' "$*" >>"$log"; }
+  set +e
+  output=$(install_linux v1.2.3 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || test_fail "bad checksum returned success"
+  [ ! -s "$log" ] || test_fail "checksum failure reached sudo"
+  assert_contains "$output" "nothing was installed"
+  HOME=$old_home
+  rm -rf "$dir"
+}
+
+# test_desktop_rerun_changes_no_core_path confines both runs to apt.
+test_desktop_rerun_changes_no_core_path() {
+  local dir log before after
+  dir=$(mktemp -d); log="$dir/log"
+  mkdir -p "$dir/core/.meru" "$dir/core/.local/bin" "$dir/core/.config/systemd/user"
+  printf 'config\n' >"$dir/core/.meru/config.toml"
+  printf 'meru\n' >"$dir/core/.local/bin/meru"
+  printf 'service\n' >"$dir/core/.config/systemd/user/merud.service"
+  printf 'package\n' >"$dir/Meru-v1.2.3-linux-amd64.deb"
+  before=$(find "$dir/core" -type f -exec cksum {} \; | LC_ALL=C sort)
+  load_installer
+  all=1
+  sudo() { printf 'sudo %s\n' "$*" >>"$log"; }
+  install_desktop_deb "$dir/Meru-v1.2.3-linux-amd64.deb"
+  install_desktop_deb "$dir/Meru-v1.2.3-linux-amd64.deb"
+  after=$(find "$dir/core" -type f -exec cksum {} \; | LC_ALL=C sort)
+  assert_equal "$before" "$after"
+  assert_equal 2 "$(grep -Fc 'sudo apt-get install --yes --' "$log")"
+  rm -rf "$dir"
 }
 
 # test_linux_banner_does_not_require_user_env supports sparse service environments.
@@ -896,6 +1034,7 @@ for test_name in \
   test_source_does_not_run_main \
   test_direct_and_pipe_execution_reach_main \
   test_checksum_failure_writes_no_binary \
+  test_manifest_names_every_download \
   test_linux_uses_sha256sum \
   test_macos_uses_shasum \
   test_install_cli_sets_mode_0755 \
@@ -906,6 +1045,12 @@ for test_name in \
   test_declined_ollama_runs_nothing \
   test_no_tty_runs_no_privileged_or_optional_command \
   test_meru_yes_banner_names_sudo_steps \
+  test_desktop_package_decline_keeps_core_install \
+  test_desktop_package_accepts_exact_apt_argv \
+  test_meru_yes_installs_desktop_without_prompt \
+  test_headless_desktop_keeps_checked_package_for_later \
+  test_bad_checksum_stops_before_desktop_sudo \
+  test_desktop_rerun_changes_no_core_path \
   test_linux_banner_does_not_require_user_env \
   test_linux_setup_uses_no_main_override \
   test_linux_configures_web_before_setup \

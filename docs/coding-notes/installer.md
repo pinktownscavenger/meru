@@ -19,9 +19,10 @@ this note powers the Mac installer window.
 ### The release script on Ubuntu
 
 The script detects Ubuntu from `/etc/os-release` without executing that file. It
-downloads the Linux archive and `SHA256SUMS`, then checks the archive with
-`sha256sum`. The archive holds both binaries, the systemd user unit and the
-Podman Quadlet. The script copies or runs none of them before the check passes.
+downloads the Linux archive, the optional desktop package and `SHA256SUMS`, then
+checks both downloads with `sha256sum`. The archive holds both binaries, the
+systemd user unit and the Podman Quadlet. The script copies or runs nothing
+before both checks pass.
 A new setup uses the `lite` profile because the script leaves model choice with
 `meru setup` instead of putting model names in the installer.
 
@@ -43,10 +44,17 @@ waits for `meru ping`, and then offers the user profile. A headless server can
 keep the user services alive after logout with lingering. The script shows the
 exact `sudo loginctl` command and runs it only after consent.
 
+The last optional step installs the checked `.deb` through the exact command
+`sudo apt-get install --yes -- <path>`. Apt installs the app's GTK and WebKit
+libraries. Declining that step leaves the command-line install ready. With no
+terminal, the script copies the checked package to `~/.cache/meru/`, prints the
+same apt command with that stable path, and does not run `sudo`.
+
 The flow is safe to rerun. It replaces verified binaries and service files,
 restarts the services, keeps an existing SearXNG settings file, and leaves Meru's
-config and data in place. With no terminal it cannot answer setup questions, so
-it prints the commands that remain instead of starting `merud` without a config.
+config and data in place. The desktop package owns none of those core paths.
+With no terminal the script also cannot answer setup questions, so it prints the
+commands that remain instead of starting `merud` without a config.
 `scripts/install_test.sh` sources the functions, replaces commands with fakes and
 checks the order, consent gates, runtime choice and recovery text. It also runs
 `scripts/release-archive.sh` with fake binaries and checks that both Linux

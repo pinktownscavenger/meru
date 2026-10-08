@@ -1,5 +1,5 @@
 # CI: format, vet, lint, module hygiene, tests with coverage on Linux and
-# macOS, a cross-compile for every release platform, the desktop app on macOS,
+# macOS, a cross-compile for every release platform, both desktop builds,
 # and the end-to-end tests. docs/ci.md explains each check and how to run it
 # locally; most steps call a Makefile target so local runs and CI stay the same.
 
@@ -96,8 +96,7 @@ jobs:
         run: go build -trimpath -o "bin/${GOOS}-${GOARCH}/" ./cmd/...
 
   # The desktop app uses Wails v3, which needs cgo and the system WebView,
-  # so it builds on the machine that runs it, and only on macOS for now.
-  # Linux (WebKitGTK) and Windows (WebView2) get jobs of their own later.
+  # so each supported system builds it with its own native libraries.
   desktop:
     name: desktop app (macOS)
     runs-on: macos-latest
@@ -114,6 +113,37 @@ jobs:
         run: make installer
       - name: vet, staticcheck and govulncheck with the desktop tags
         run: make desktop-check
+
+  desktop-ubuntu:
+    name: desktop app (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: install desktop build libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential desktop-file-utils libgtk-4-dev libwebkitgtk-6.0-dev pkg-config
+      - name: test the desktop command
+        run: go test -tags 'desktop production' ./cmd/meru-desktop
+      - name: build the Ubuntu desktop app
+        run: make desktop-linux
+      - name: build and inspect the app-only package
+        env:
+          COMMIT: ${{ github.sha }}
+        run: |
+          make desktop-deb VERSION=v0.0.0 COMMIT="$COMMIT"
+          bash scripts/check-deb.sh v0.0.0 "$COMMIT" dist/Meru-v0.0.0-linux-amd64.deb
+      - name: check desktop entry and shared libraries
+        run: |
+          desktop-file-validate deploy/linux/com.meru.desktop.desktop
+          ldd bin/linux-amd64/meru-desktop > "$RUNNER_TEMP/meru-desktop-ldd.txt"
+          ! grep -F 'not found' "$RUNNER_TEMP/meru-desktop-ldd.txt"
 
   installer:
     name: Ubuntu installer

@@ -7,6 +7,7 @@ Files that run Meru as a service and show what it is doing:
 | `launchd/com.meru.merud.plist` | starts `merud` at login on macOS and restarts it if it exits |
 | `systemd/merud.service` | the same on Linux, as a systemd user unit |
 | `systemd/meru-searxng.container` | runs SearXNG with rootless Podman and exposes it on loopback only |
+| `linux/com.meru.desktop.desktop` | adds the optional Ubuntu app to the desktop menu |
 | `observability/compose.yaml` | a local Grafana stack that receives `merud`'s metrics and traces |
 | `observability/dashboards/meru.json` | the Meru dashboard that stack loads |
 | `observability/dashboards/meru-usage.json` | the Meru usage dashboard: totals for the chosen range, then one bar per hour over the last 24 hours |
@@ -19,6 +20,12 @@ release form of the Mac commands below. Run it with:
 ```sh
 curl -fsSL https://github.com/aarora79/meru/releases/latest/download/install.sh | bash
 ```
+
+The same installer offers `Meru-vX.Y.Z-linux-amd64.deb` after it sets up the
+command-line programs. That package holds only `meru-desktop`, its menu entry,
+icon and licence. Apt supplies GTK 4, WebKitGTK and `xdg-utils`. Removing it with
+`sudo apt-get remove --yes meru-desktop` leaves `meru`, `merud`, the user service,
+config and data in place.
 
 If you build from source with `go install ./cmd/merud`, the binary goes in
 `~/go/bin`. Keep that source-build edit separate from the canonical release

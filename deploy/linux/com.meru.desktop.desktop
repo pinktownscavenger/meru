@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Meru
+Comment=A personal AI assistant that runs on your own computer
+Exec=meru-desktop
+Icon=com.meru.desktop
+Terminal=false
+Categories=Utility;
+StartupWMClass=com.meru.desktop

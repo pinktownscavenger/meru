@@ -8,22 +8,25 @@ command:
 make release VERSION=v0.4.1
 ```
 
-This page covers what the command does, why it runs on a Mac and not in CI, and
-what people who download a release need to know.
+This page covers what the command does, why one Mac owns the release, how GitHub
+Actions supplies the Ubuntu app, and what people who download a release need to
+know.
 [running.md](running.md#install-from-a-release) shows how to install one, and
 the `meru-install` skill in `.claude/skills/` walks a user through it.
 
-## Why it builds on a Mac
+## Why one Mac publishes the release
 
 `Meru.app` uses Wails, which needs cgo and the Mac's own WebView, so it builds
 only on a Mac, for that Mac's kind of chip. The owner's Mac has Apple silicon,
 so the release carries the app for Apple silicon only. `meru` and `merud` need
 no cgo and cross-compile for five platforms from any machine.
 
-CI could build the command-line programs, but a second path for the app would
-mean two places that pack a release. One script on one machine keeps one path,
-and the owner sees each file before it goes out. CI still runs every check on
-the commit first, and the script runs `make check` again before it builds.
+The Ubuntu app needs Linux's GTK and WebKit libraries, so a manually dispatched
+GitHub Actions job builds its `.deb` from the exact release commit. That job
+uploads an artifact but cannot tag or publish a release. The Mac script waits
+for the exact run, checks the package, and adds it to `dist/`. One script still
+packs and publishes the release, and the owner sees each file before it goes
+out. CI also checks the commit first, and the script runs `make check` again.
 
 ## Before you start
 
@@ -54,7 +57,13 @@ fails:
    installer, with `meru`, `merud` and `Meru.app` inside it, and packs the
    installer in a disk image with `hdiutil`. The Makefile sets both apps'
    `Info.plist` version to `0.4.1`, so Finder's Get Info shows it.
-4. **Packing.** Into `dist/`, which git ignores:
+4. **Builds the Ubuntu app.** The script dispatches
+   `linux-desktop-release.yml` with the version and full commit. The Ubuntu
+   24.04 job checks out that commit, builds the app-only `.deb`, checks its
+   contents and runs the binary's `--version` path. The Mac script finds the
+   one run named for that version and commit, waits by run ID, downloads its
+   one artifact and checks the package again.
+5. **Packing.** Into `dist/`, which git ignores:
 
    `scripts/release-archive.sh` packs each command-line archive. Keeping this
    step separate lets the installer tests inspect both Linux archives.
@@ -68,16 +77,17 @@ fails:
    | `Meru-v0.4.1-macos-arm64.zip` | `Meru.app`, for Apple silicon only |
    | `Meru-v0.4.1-macos-arm64.dmg` | the Mac installer, "Install Meru.app", with `meru`, `merud` and `Meru.app` inside, and "Read me first.txt"; about 60 MB |
    | `Meru-macos-arm64.dmg` | the same disk image under a name with no version, so the README and the landing page can link to the newest one |
+   | `Meru-v0.4.1-linux-amd64.deb` | the Ubuntu 24.04 x86-64 desktop app only; it owns no daemon, command-line program, service, config or user data |
    | `SHA256SUMS` | the SHA-256 of each file above |
 
-   Each archive opens to one folder named after the archive.
-5. **Publishing.** It makes an annotated tag, pushes it, and runs
+   Each command-line archive opens to one folder named after the archive.
+6. **Publishing.** It makes an annotated tag, pushes it, and runs
    `gh release create` with the files and `docs/release-notes/v0.4.1.md` as
    the release's text.
 
 ### Try it first
 
-`DRY_RUN=1` runs steps 1 to 4 and stops before the tag:
+`DRY_RUN=1` runs steps 1 to 5 and stops before the tag:
 
 ```sh
 make release VERSION=v0.4.1 DRY_RUN=1
@@ -85,8 +95,8 @@ ls -l dist
 ```
 
 In a dry run the branch, clean-tree and up-to-date checks warn and carry on,
-so you can try the script on a branch. The version and tag checks, and
-`make check`, still stop it.
+so you can try the script on a branch. The version and tag checks, GitHub login,
+Ubuntu package handoff and `make check` still stop it when they fail.
 
 ## How the version gets into the programs
 
@@ -120,7 +130,7 @@ strings bin/darwin-arm64/merud | grep -x v0.4.1
   ```sh
   gh release create v0.4.1 --repo aarora79/meru --title "Meru v0.4.1" \
     --verify-tag --notes-file docs/release-notes/v0.4.1.md \
-    dist/*.tar.gz dist/*.zip dist/*.dmg dist/SHA256SUMS scripts/install.sh
+    dist/*.tar.gz dist/*.zip dist/*.dmg dist/*.deb dist/SHA256SUMS scripts/install.sh
   ```
 
   To start over instead, delete the tag in both places with
