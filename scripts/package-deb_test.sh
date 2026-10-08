@@ -141,12 +141,67 @@ test_builder_rejects_bad_inputs() {
   rm -rf "$dir"
 }
 
+# test_linux_build_rejects_an_arm_host stops before an amd64 cgo cross-build.
+test_linux_build_rejects_an_arm_host() {
+  local dir fake log output status
+  dir=$(mktemp -d); fake="$dir/fake"; log="$dir/log"
+  mkdir -p "$fake"
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'case "$1" in -s) echo Linux ;; -m) echo aarch64 ;; esac' >"$fake/uname"
+  printf '#!/bin/sh\nprintf "pkg-config\n" >>"$COMMAND_LOG"\n' >"$fake/pkg-config"
+  printf '#!/bin/sh\nprintf "go %%s\n" "$*" >>"$COMMAND_LOG"\n' >"$fake/go"
+  chmod 0755 "$fake/uname" "$fake/pkg-config" "$fake/go"
+  set +e
+  output=$(COMMAND_LOG="$log" PATH="$fake:$PATH" make -s -C "$root_dir" desktop-linux 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || { rm -rf "$dir"; test_fail "ARM host reached the desktop build"; return; }
+  assert_contains "$output" "Linux x86-64"
+  ! grep -Fq 'pkg-config' "$log" || { rm -rf "$dir"; test_fail "ARM host reached pkg-config"; return; }
+  ! grep -Fq 'go build' "$log" || { rm -rf "$dir"; test_fail "ARM host reached go build"; return; }
+  rm -rf "$dir"
+}
+
+# test_workflows_require_ldd_success keeps a failed ldd from passing through !.
+test_workflows_require_ldd_success() {
+  local workflow text
+  for workflow in \
+    "$root_dir/.github/workflows/ci.yml" \
+    "$root_dir/.github/workflows/linux-desktop-release.yml"
+  do
+    text=$(cat "$workflow")
+    case "$text" in
+      *'! ldd '*) test_fail "$workflow negates ldd itself"; return ;;
+    esac
+    assert_contains "$text" 'ldd bin/linux-amd64/meru-desktop > "$RUNNER_TEMP/meru-desktop-ldd.txt"'
+    assert_contains "$text" '! grep -F '\''not found'\'' "$RUNNER_TEMP/meru-desktop-ldd.txt"'
+  done
+}
+
 # test_checker_accepts_valid_package exercises the inspector's macOS-compatible path.
 test_checker_accepts_valid_package() {
   local dir package
   dir=$(mktemp -d); package="$dir/Meru-v1.2.3-linux-amd64.deb"
   make_deb "$package"
   "$checker" v1.2.3 "$commit" "$package"
+  rm -rf "$dir"
+}
+
+# test_checker_consumes_the_strings_stream prevents grep from closing a real,
+# large Go binary's strings pipe early and turning SIGPIPE into a false failure.
+test_checker_consumes_the_strings_stream() {
+  local dir package fake
+  dir=$(mktemp -d); package="$dir/Meru-v1.2.3-linux-amd64.deb"; fake="$dir/fake"
+  make_deb "$package"
+  mkdir -p "$fake"
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'printf "v1.2.3\n"' \
+    "awk 'BEGIN { for (i = 0; i < 200000; i++) print \"more binary text\" }'" \
+    >"$fake/strings"
+  chmod 0755 "$fake/strings"
+  PATH="$fake:$PATH" "$checker" v1.2.3 "$commit" "$package"
   rm -rf "$dir"
 }
 
@@ -197,7 +252,10 @@ run_test() {
 for test_name in \
   test_builder_writes_app_only_tree \
   test_builder_rejects_bad_inputs \
+  test_linux_build_rejects_an_arm_host \
+  test_workflows_require_ldd_success \
   test_checker_accepts_valid_package \
+  test_checker_consumes_the_strings_stream \
   test_checker_rejects_identity_drift \
   test_checker_rejects_package_scope_drift
 do

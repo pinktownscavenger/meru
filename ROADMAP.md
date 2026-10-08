@@ -122,7 +122,7 @@ from a later milestone.
   `attach_file` copies it to `~/meru-output/uploads/`; images go to a vision model
 - [x] The chat list, in both clients: delete a chat for good, chat folders, tags
   that recall searches, and incognito chats that leave no transcript
-- [ ] Linux (WebKitGTK) build and app-only Debian package in CI
+- [x] Linux (WebKitGTK) build and app-only Debian package in CI
 - [ ] Windows (WebView2) build in CI
 
 **Done when:** you open the app, ask a question that uses a tool, approve it in

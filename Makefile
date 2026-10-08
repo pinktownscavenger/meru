@@ -145,7 +145,7 @@ desktop: ## Build the desktop app for this machine into bin/meru-desktop (needs 
 # Linux builds need the native GTK4 and WebKitGTK 6.0 headers. This target
 # refuses a cross-build before cgo prints a long compiler error.
 desktop-linux: ## Build the Ubuntu 24.04 x86-64 desktop app (needs GTK4 and WebKitGTK 6.0)
-	@[ "$$(uname -s)" = Linux ] || { echo "make desktop-linux runs on Linux"; exit 1; }
+	@[ "$$(uname -s)" = Linux ] && [ "$$(uname -m)" = x86_64 ] || { echo "make desktop-linux runs on Linux x86-64"; exit 1; }
 	@pkg-config --exists gtk4 || { echo "make desktop-linux needs the GTK4 development package"; exit 1; }
 	@pkg-config --exists webkitgtk-6.0 || { echo "make desktop-linux needs the WebKitGTK 6.0 development package"; exit 1; }
 	@mkdir -p bin/linux-amd64

@@ -175,6 +175,23 @@ test_checksum_failure_writes_no_binary() {
   rm -rf "$dir"
 }
 
+# test_manifest_names_every_download rejects an asset that the checksum file omits.
+test_manifest_names_every_download() {
+  local dir fake_bin log
+  dir=$(mktemp -d); fake_bin="$dir/fake"; log="$dir/log"
+  printf 'cli\n' >"$dir/meru-v1.2.3-linux-amd64.tar.gz"
+  printf 'desktop\n' >"$dir/Meru-v1.2.3-linux-amd64.deb"
+  printf '%064d  meru-v1.2.3-linux-amd64.tar.gz\n' 0 >"$dir/SHA256SUMS"
+  make_command_stub "$fake_bin" sha256sum
+  load_installer
+  if COMMAND_LOG="$log" PATH="$fake_bin:$PATH" verify_downloads Linux "$dir" >/dev/null 2>&1; then
+    rm -rf "$dir"
+    test_fail "checksum verification accepted an unlisted desktop package"
+    return
+  fi
+  rm -rf "$dir"
+}
+
 # test_linux_uses_sha256sum checks the GNU checksum command and arguments.
 test_linux_uses_sha256sum() {
   local dir fake_bin log output
@@ -1017,6 +1034,7 @@ for test_name in \
   test_source_does_not_run_main \
   test_direct_and_pipe_execution_reach_main \
   test_checksum_failure_writes_no_binary \
+  test_manifest_names_every_download \
   test_linux_uses_sha256sum \
   test_macos_uses_shasum \
   test_install_cli_sets_mode_0755 \

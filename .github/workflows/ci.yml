@@ -142,7 +142,8 @@ jobs:
       - name: check desktop entry and shared libraries
         run: |
           desktop-file-validate deploy/linux/com.meru.desktop.desktop
-          ! ldd bin/linux-amd64/meru-desktop | grep -F 'not found'
+          ldd bin/linux-amd64/meru-desktop > "$RUNNER_TEMP/meru-desktop-ldd.txt"
+          ! grep -F 'not found' "$RUNNER_TEMP/meru-desktop-ldd.txt"
 
   installer:
     name: Ubuntu installer

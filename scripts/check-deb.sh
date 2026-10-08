@@ -90,6 +90,8 @@ for file in \
 do
   [ "$(mode_of "$file")" = 644 ] || fail "$(basename "$file") mode is not 0644"
 done
-strings "$work/data/usr/bin/meru-desktop" | grep -Fq "$version" || fail "desktop binary does not contain version $version"
+# grep reads the whole stream instead of stopping at the first match. With
+# pipefail, an early exit could give strings SIGPIPE and reject a valid binary.
+strings "$work/data/usr/bin/meru-desktop" | grep -F "$version" >/dev/null || fail "desktop binary does not contain version $version"
 
 printf 'check-deb: %s is the checked %s package from %s\n' "$(basename "$package")" "$version" "$commit"

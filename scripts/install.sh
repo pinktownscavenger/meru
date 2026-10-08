@@ -90,9 +90,23 @@ platform_for() {
   esac
 }
 
-# verify_downloads checks files in a download directory with the platform tool.
+# verify_downloads requires one manifest entry for every downloaded asset, then
+# checks those entries with the platform tool. --ignore-missing lets one release
+# manifest cover each platform without trusting a file that the manifest omits.
 verify_downloads() {
-  local os=$1 directory=$2
+  local os=$1 directory=$2 path name
+  for path in "$directory"/*; do
+    [ -f "$path" ] || continue
+    name=${path##*/}
+    [ "$name" = SHA256SUMS ] && continue
+    awk -v want="$name" '
+      { entry = $2; sub(/^\*/, "", entry); if (entry == want) found = 1 }
+      END { exit !found }
+    ' "$directory/SHA256SUMS" || {
+      printf 'install.sh: SHA256SUMS has no entry for %s\n' "$name" >&2
+      return 1
+    }
+  done
   case "$os" in
     Linux) (cd "$directory" && sha256sum -c --ignore-missing SHA256SUMS) ;;
     Darwin) (cd "$directory" && shasum -a 256 -c --ignore-missing SHA256SUMS) ;;
