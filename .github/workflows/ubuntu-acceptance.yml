@@ -137,12 +137,16 @@ jobs:
         run: |
           # The single edit: download from the package job's files.
           # $RELEASE_DIR stays literal here; install.sh expands it.
+          # shellcheck disable=SC2016
           sed 's|^  base="https://github.com/\$repo/releases/download/\$version"$|  base="file://$RELEASE_DIR"|' \
             "$RELEASE_DIR/install.sh" > "$RUNNER_TEMP/install.sh"
+          # shellcheck disable=SC2016
           grep -F 'base="file://$RELEASE_DIR"' "$RUNNER_TEMP/install.sh"
 
       - name: first install, piped to bash with no terminal
         run: |
+          # The pipe copies how users run it: curl ... | bash.
+          # shellcheck disable=SC2002
           cat "$RUNNER_TEMP/install.sh" | MERU_YES=1 bash 2>&1 | tee "$RUNNER_TEMP/install-1.log"
           # With no terminal the installer can't run meru setup, so it
           # stops before the service and says what to run.
@@ -167,6 +171,7 @@ jobs:
       - name: second install, which starts merud
         run: |
           sha256sum "$HOME/.meru/config.toml" "$HOME/.meru/searxng/settings.yml" > "$RUNNER_TEMP/before.sha"
+          # shellcheck disable=SC2002
           cat "$RUNNER_TEMP/install.sh" | MERU_YES=1 bash 2>&1 | tee "$RUNNER_TEMP/install-2.log"
           # The rerun keeps the config and the SearXNG secret.
           sha256sum -c "$RUNNER_TEMP/before.sha"
@@ -178,6 +183,8 @@ jobs:
           systemctl --user show merud -p ExecStart --value | grep -F "$HOME/.local/bin/merud"
           meru ping
           test "$(loginctl show-user "$USER" -p Linger --value)" = yes
+          # The installer writes this line with a literal $HOME and $PATH.
+          # shellcheck disable=SC2016
           test "$(grep -Fxc 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.profile")" = 1
 
       - name: check SearXNG under Podman
