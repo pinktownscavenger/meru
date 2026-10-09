@@ -55,5 +55,7 @@ chmod 0755 "$stage/DEBIAN"
 chmod 0644 "$stage/DEBIAN/control"
 
 output="$output_dir/Meru-$version-linux-amd64.deb"
-dpkg-deb --root-owner-group --build "$stage" "$output"
+# -Zxz fixes the compression. dpkg-deb on Ubuntu 24.04 picks zstd by default,
+# which check-deb.sh couldn't read, and xz reads with tar -J on Ubuntu and macOS.
+dpkg-deb --root-owner-group -Zxz --build "$stage" "$output"
 printf '%s\n' "$output"

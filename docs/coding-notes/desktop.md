@@ -602,11 +602,14 @@ that path without a display. The Mac release host cannot run a Linux program, so
 checker reads the same stamped text from the binary with `strings`.
 
 `scripts/package-deb.sh` makes one fixed Debian tree. It installs the binary,
-desktop entry, 512-pixel icon and licence copy, then gives that tree to `dpkg-deb`.
+desktop entry, 512-pixel icon and licence copy, then gives that tree to `dpkg-deb`
+with `-Zxz`. Without that flag, `dpkg-deb` on Ubuntu 24.04 compresses with zstd.
 The control file holds the release version, `amd64`, the three runtime packages and
 the source commit. It has no maintainer script. `scripts/check-deb.sh` opens the ar
-archive with tools that macOS and Ubuntu share, extracts its control and data
-archives, and refuses any extra path, link, mode, dependency or identity. This lets
+archive with tools that macOS and Ubuntu share, extracts its xz control and data
+archives with `tar -J`, and refuses any extra path, link, mode, dependency, identity
+or other compression. It names the compression because GNU tar can't detect it
+when it reads from a pipe. This lets
 the Mac publisher inspect the Linux artifact without installing it.
 
 ## Go ideas used here
