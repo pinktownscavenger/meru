@@ -1,0 +1,281 @@
+# Ubuntu acceptance: issue #84's install checks on a clean GitHub runner.
+#
+# The package job builds the release files for this commit as v0.0.0: the
+# Linux archive, the desktop .deb and SHA256SUMS. The install job then runs
+# the real scripts/install.sh on a second, clean Ubuntu 24.04 x86-64 runner,
+# once with rootless Podman and once with Docker. The only change to the
+# script is its download address, which points at those files instead of a
+# GitHub release, so the run needs no published release.
+#
+# Each install job follows a headless user through the runbook in
+# docs/running.md: install, run `meru setup`, run the installer again, then
+# ask a normal question and a question about an indexed file with
+# `meru check`. It checks that a rerun keeps the config, the SearXNG secret,
+# one PATH line and one container, and that removing the desktop package
+# leaves command-line Meru working.
+#
+# It can't stand in for every row of the acceptance records in
+# .scratchpad/issue-84: a runner can't reboot, nobody clicks through the
+# desktop app, and the runner image comes with tools a fresh machine lacks.
+# Those rows still need a real machine.
+#
+# GitHub runs a workflow_dispatch workflow only from the default branch, so
+# a push to the ubuntu-acceptance branch starts it too.
+
+name: Ubuntu acceptance
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ubuntu-acceptance]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ubuntu-acceptance-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MERU_VERSION: v0.0.0
+
+jobs:
+  package:
+    name: build the release files
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: install desktop build libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential libgtk-4-dev libwebkitgtk-6.0-dev pkg-config
+      - name: build and inspect the desktop package
+        env:
+          COMMIT: ${{ github.sha }}
+        run: make desktop-deb VERSION="$MERU_VERSION" COMMIT="$COMMIT"
+      - name: build meru and merud
+        run: |
+          # The same version stamp scripts/release.sh gives a release.
+          module="$(go list -m)"
+          ldflags="-X $module/internal/obs.releaseVersion=$MERU_VERSION -X $module/internal/about.releaseVersion=$MERU_VERSION"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$ldflags" \
+            -o bin/linux-amd64/ ./cmd/meru ./cmd/merud
+      - name: pack the archive and SHA256SUMS
+        run: |
+          mkdir -p dist/stage
+          bash scripts/release-archive.sh linux-amd64 "meru-$MERU_VERSION-linux-amd64" ""
+          rm -rf dist/stage
+          (cd dist && sha256sum -- *.tar.gz *.deb > SHA256SUMS)
+          cp scripts/install.sh dist/
+          ls -l dist
+          cat dist/SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release
+          path: dist/
+          if-no-files-found: error
+
+  install:
+    name: install with ${{ matrix.runtime }}
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [podman, docker]
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release
+          path: ${{ runner.temp }}/release
+
+      - name: start a systemd user manager
+        run: |
+          # A desktop login starts the user's systemd manager. A runner has
+          # no login, so lingering starts it here. The installer asks for
+          # lingering later and checks that it reports yes.
+          sudo loginctl enable-linger "$USER"
+          uid="$(id -u)"
+          for _ in $(seq 30); do
+            [ -S "/run/user/$uid/bus" ] && break
+            sleep 1
+          done
+          test -S "/run/user/$uid/bus"
+          {
+            echo "XDG_RUNTIME_DIR=/run/user/$uid"
+            echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus"
+            echo "RELEASE_DIR=$RUNNER_TEMP/release"
+          } >> "$GITHUB_ENV"
+
+      - name: keep Podman, the runtime the installer prefers
+        if: matrix.runtime == 'podman'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes podman
+          podman info > /dev/null
+      - name: remove Podman, so the installer falls back to Docker
+        if: matrix.runtime == 'docker'
+        run: |
+          if command -v podman > /dev/null; then sudo apt-get remove --yes podman; fi
+          # bash -e ignores a failed `! cmd`, so each negative check uses if.
+          if command -v podman > /dev/null; then exit 1; fi
+          docker info > /dev/null
+
+      - name: write a notes folder with one unique fact
+        run: |
+          mkdir -p "$HOME/meru-acceptance-notes"
+          printf '%s\n' '# Acceptance notes' '' \
+            'The Meru acceptance code word is quillmarsh.' \
+            > "$HOME/meru-acceptance-notes/acceptance-fact.md"
+
+      - name: point the installer at this run's release files
+        run: |
+          # The single edit: download from the package job's files.
+          # $RELEASE_DIR stays literal here; install.sh expands it.
+          sed 's|^  base="https://github.com/\$repo/releases/download/\$version"$|  base="file://$RELEASE_DIR"|' \
+            "$RELEASE_DIR/install.sh" > "$RUNNER_TEMP/install.sh"
+          grep -F 'base="file://$RELEASE_DIR"' "$RUNNER_TEMP/install.sh"
+
+      - name: first install, piped to bash with no terminal
+        run: |
+          cat "$RUNNER_TEMP/install.sh" | MERU_YES=1 bash 2>&1 | tee "$RUNNER_TEMP/install-1.log"
+          # With no terminal the installer can't run meru setup, so it
+          # stops before the service and says what to run.
+          test -x "$HOME/.local/bin/meru"
+          test -x "$HOME/.local/bin/merud"
+          test ! -f "$HOME/.meru/config.toml"
+          grep -F "Run 'meru setup'" "$RUNNER_TEMP/install-1.log"
+          curl --noproxy '*' -fsS http://127.0.0.1:11434/api/version
+          # The installer writes PATH to ~/.profile, which steps don't read.
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: run meru setup, taking each default
+        run: |
+          # Answers, in order: Enter for the lite profile, Enter to pull
+          # its models, the notes folder, and s to skip web search if
+          # SearXNG isn't up yet.
+          printf '\n\n%s\ns\n' "$HOME/meru-acceptance-notes" \
+            | meru setup 2>&1 | tee "$RUNNER_TEMP/setup.log"
+          grep -Fx 'profile = "lite"' "$HOME/.meru/config.toml"
+          grep -F 'meru-acceptance-notes' "$HOME/.meru/config.toml"
+
+      - name: second install, which starts merud
+        run: |
+          sha256sum "$HOME/.meru/config.toml" "$HOME/.meru/searxng/settings.yml" > "$RUNNER_TEMP/before.sha"
+          cat "$RUNNER_TEMP/install.sh" | MERU_YES=1 bash 2>&1 | tee "$RUNNER_TEMP/install-2.log"
+          # The rerun keeps the config and the SearXNG secret.
+          sha256sum -c "$RUNNER_TEMP/before.sha"
+
+      - name: check merud, lingering and the PATH line
+        run: |
+          systemctl --user is-enabled merud
+          systemctl --user is-active merud
+          systemctl --user show merud -p ExecStart --value | grep -F "$HOME/.local/bin/merud"
+          meru ping
+          test "$(loginctl show-user "$USER" -p Linger --value)" = yes
+          test "$(grep -Fxc 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.profile")" = 1
+
+      - name: check SearXNG under Podman
+        if: matrix.runtime == 'podman'
+        run: |
+          curl --noproxy '*' -fsS 'http://127.0.0.1:8888/search?q=test&format=json' | grep -F '"results"'
+          systemctl --user is-active meru-searxng
+          test "$(podman ps -a --filter name=meru-searxng --format '{{.Names}}' | wc -l)" = 1
+          podman port meru-searxng | grep -Fx '8080/tcp -> 127.0.0.1:8888'
+          if docker inspect meru-searxng > /dev/null 2>&1; then exit 1; fi
+      - name: check SearXNG under Docker
+        if: matrix.runtime == 'docker'
+        run: |
+          curl --noproxy '*' -fsS 'http://127.0.0.1:8888/search?q=test&format=json' | grep -F '"results"'
+          test "$(docker ps -a --filter name=meru-searxng --format '{{.Names}}' | wc -l)" = 1
+          test "$(docker inspect -f '{{(index (index .HostConfig.PortBindings "8080/tcp") 0).HostIp}}' meru-searxng)" = 127.0.0.1
+          test "$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' meru-searxng)" = unless-stopped
+
+      - name: wait for merud to index the notes
+        run: |
+          for _ in $(seq 60); do
+            status="$(meru index -status)"
+            if grep -Eq 'Index: +[1-9][0-9]* files?,' <<< "$status" && ! grep -q 'still need a vector' <<< "$status"; then
+              echo "$status"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "$status"
+          exit 1
+
+      - name: ask a normal question and an indexed-file question
+        run: |
+          cat > "$RUNNER_TEMP/checks.jsonl" << 'EOF'
+          {"id": "normal", "category": "t0-direct", "question": "In one sentence, what can you help me with?", "want": {}}
+          {"id": "indexed", "category": "t1-retrieval", "question": "What is the Meru acceptance code word in my notes?", "want": {"sources_any": ["acceptance-fact"], "answer_any": ["quillmarsh"]}}
+          EOF
+          # MiniCPM5-2B passed 68% of the owner's benchmark and doesn't give
+          # the same answer each time, so allow three tries. Every try
+          # stays in the log.
+          for try in 1 2 3; do
+            meru check --json "$RUNNER_TEMP/checks.jsonl" > "$RUNNER_TEMP/check-$try.jsonl" || true
+            jq -c '{id, pass, model, route, sources, seconds, reasons, answer}' "$RUNNER_TEMP/check-$try.jsonl"
+            if jq -e -s 'length == 2 and all(.pass and (.model | contains("MiniCPM5-2B")) and (.answer | length > 0))' \
+                "$RUNNER_TEMP/check-$try.jsonl" > /dev/null; then
+              echo "passed on try $try"
+              exit 0
+            fi
+          done
+          exit 1
+
+      - name: check the desktop package
+        run: |
+          test "$(dpkg-query -W -f='${Status}' meru-desktop)" = 'install ok installed'
+          for dep in libgtk-4-1 libwebkitgtk-6.0-4 xdg-utils; do
+            test "$(dpkg-query -W -f='${Status}' "$dep")" = 'install ok installed'
+          done
+          test "$(meru-desktop --version)" = "$MERU_VERSION"
+          test -f /usr/share/applications/com.meru.desktop.desktop
+      - name: open the desktop app on a virtual display
+        # A smoke test only: the window must stay up for 30 seconds.
+        # Nobody clicks, and GTK under Xvfb can fail for reasons a real
+        # desktop wouldn't, so a failure here warns and doesn't stop the run.
+        continue-on-error: true
+        run: |
+          sudo apt-get install --yes xvfb
+          set +e
+          timeout 30 xvfb-run -a meru-desktop
+          code=$?
+          set -e
+          test "$code" = 124
+
+      - name: remove the desktop package and keep command-line Meru
+        run: |
+          sudo apt-get remove --yes meru-desktop
+          if command -v meru-desktop > /dev/null; then exit 1; fi
+          test ! -e /usr/share/applications/com.meru.desktop.desktop
+          test -x "$HOME/.local/bin/meru"
+          test -x "$HOME/.local/bin/merud"
+          test -f "$HOME/.meru/config.toml"
+          test -f "$HOME/.config/systemd/user/merud.service"
+          systemctl --user is-active merud
+          meru ping
+
+      - name: print diagnostics
+        if: failure()
+        run: |
+          systemctl --user status merud --no-pager || true
+          journalctl --user -u merud -n 200 --no-pager || true
+          systemctl --user status meru-searxng --no-pager || true
+          journalctl --user -u meru-searxng -n 100 --no-pager || true
+          sudo journalctl -u ollama -n 100 --no-pager || true
+          meru index -status || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: logs-${{ matrix.runtime }}
+          path: |
+            ${{ runner.temp }}/*.log
+            ${{ runner.temp }}/check-*.jsonl
+          if-no-files-found: ignore
