@@ -40,21 +40,18 @@ trap 'rm -rf "$work"' EXIT
 members=$(ar t "$package")
 control_member=$(printf '%s\n' "$members" | sed -n '/^control\.tar\./p')
 data_member=$(printf '%s\n' "$members" | sed -n '/^data\.tar\./p')
-expected_members=$(printf 'control.tar.gz\ndata.tar.gz\ndebian-binary\n' | LC_ALL=C sort)
+# package-deb.sh builds with xz, so a member with any other compression means
+# some other tool built this package.
+expected_members=$(printf 'control.tar.xz\ndata.tar.xz\ndebian-binary\n' | LC_ALL=C sort)
 actual_members=$(printf '%s\n' "$members" | LC_ALL=C sort)
-if [ "$actual_members" != "$expected_members" ]; then
-  case "$actual_members" in
-    *control.tar.xz*|*control.tar.zst*) ;;
-    *) fail "package has unexpected ar members" ;;
-  esac
-  [ "$(printf '%s\n' "$members" | wc -l | tr -d ' ')" -eq 3 ] || fail "package has unexpected ar members"
-fi
-[ -n "$control_member" ] && [ -n "$data_member" ] || fail "package lacks control or data archive"
+[ "$actual_members" = "$expected_members" ] || fail "package has unexpected ar members"
 [ "$(ar p "$package" debian-binary)" = 2.0 ] || fail "package has the wrong Debian format version"
 
 mkdir -p "$work/control" "$work/data"
-ar p "$package" "$control_member" | tar -xf - -C "$work/control"
-ar p "$package" "$data_member" | tar -xf - -C "$work/data"
+# -J names the xz compression. GNU tar on Ubuntu can't detect compression
+# when it reads a pipe; the Mac's tar can, but takes the flag as well.
+ar p "$package" "$control_member" | tar -xJf - -C "$work/control"
+ar p "$package" "$data_member" | tar -xJf - -C "$work/data"
 [ -f "$work/control/control" ] || fail "package has no control file"
 [ -z "$(find "$work/control" -mindepth 1 ! -type d ! -path "$work/control/control" -print)" ] || fail "package has a maintainer script or extra control file"
 control="$work/control/control"

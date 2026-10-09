@@ -47,6 +47,7 @@ make_binary() {
 }
 
 # make_fake_dpkg records the package root and creates the requested output file.
+# It requires -Zxz, the compression the checker reads on Ubuntu and macOS.
 make_fake_dpkg() {
   local bin_dir=$1
   mkdir -p "$bin_dir"
@@ -54,6 +55,8 @@ make_fake_dpkg() {
     '#!/bin/sh' \
     'set -eu' \
     '[ "$1" = --root-owner-group ] && shift' \
+    '[ "$1" = -Zxz ] || exit 3' \
+    'shift' \
     '[ "$1" = --build ] || exit 2' \
     'root=$2' \
     'output=$3' \
@@ -63,7 +66,8 @@ make_fake_dpkg() {
   chmod 0755 "$bin_dir/dpkg-deb"
 }
 
-# make_deb writes a small Debian ar archive for the real checker.
+# make_deb writes a small Debian ar archive for the real checker, compressed
+# with xz as package-deb.sh builds it; the gzip mutation uses gzip instead.
 make_deb() {
   local output=$1 version=${2:-v1.2.3} package_commit=${3:-$commit}
   local architecture=${4:-amd64} deps=${5:-$dependencies} mutation=${6:-valid}
@@ -94,10 +98,12 @@ make_deb() {
     wrong-binary) make_binary "$data/usr/bin/meru-desktop" v9.9.9 ;;
   esac
   printf '2.0\n' >"$dir/debian-binary"
-  tar -czf "$dir/control.tar.gz" -C "$control" .
-  tar -czf "$dir/data.tar.gz" -C "$data" .
+  local ext=xz flag=-J
+  [ "$mutation" = gzip ] && { ext=gz; flag=-z; }
+  tar "$flag" -cf "$dir/control.tar.$ext" -C "$control" .
+  tar "$flag" -cf "$dir/data.tar.$ext" -C "$data" .
   rm -f "$output"
-  (cd "$dir" && ar -qSc "$output" debian-binary control.tar.gz data.tar.gz)
+  (cd "$dir" && ar -qSc "$output" debian-binary "control.tar.$ext" "data.tar.$ext")
   rm -rf "$dir"
 }
 
@@ -227,7 +233,7 @@ test_checker_rejects_identity_drift() {
 test_checker_rejects_package_scope_drift() {
   local dir package mutation
   dir=$(mktemp -d); package="$dir/Meru-v1.2.3-linux-amd64.deb"
-  for mutation in extra symlink script wrong-mode wrong-binary; do
+  for mutation in extra symlink script wrong-mode wrong-binary gzip; do
     make_deb "$package" v1.2.3 "$commit" amd64 "$dependencies" "$mutation"
     if "$checker" v1.2.3 "$commit" "$package" >/dev/null 2>&1; then
       test_fail "checker accepted $mutation package"
