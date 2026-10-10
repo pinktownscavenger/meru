@@ -32,6 +32,12 @@ on:
 permissions:
   contents: read
 
+# Naming bash turns on pipefail, so an installer that fails while piped
+# into tee fails its step. GitHub's default shell runs bash -e without it.
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: ubuntu-acceptance-${{ github.ref }}
   cancel-in-progress: true
@@ -93,6 +99,14 @@ jobs:
         with:
           name: release
           path: ${{ runner.temp }}/release
+
+      - name: wait for systemd to finish starting
+        run: |
+          # Ollama's installer starts its service only when systemd reports
+          # running or degraded, as on a machine that has finished booting.
+          state="$(systemctl is-system-running --wait || true)"
+          echo "systemd: $state"
+          case "$state" in running|degraded) ;; *) exit 1 ;; esac
 
       - name: start a systemd user manager
         run: |
