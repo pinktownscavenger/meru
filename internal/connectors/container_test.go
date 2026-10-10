@@ -264,7 +264,7 @@ func TestContainerStartsMeruContainer(t *testing.T) {
 	for _, want := range []string{
 		"--name meru-searxng", "--label meru.connector=searxng", "--restart no",
 		"--publish 127.0.0.1:8888:8080", "/meru/searxng:/etc/searxng",
-		"--env SEARXNG_BASE_URL=http://127.0.0.1:8888/", m.Install.Image,
+		"--env SEARXNG_BASE_URL=http://127.0.0.1:8888/", "--env FORCE_OWNERSHIP=false", m.Install.Image,
 	} {
 		if !strings.Contains(run, want) {
 			t.Errorf("docker run lacks %q:\n%s", want, run)

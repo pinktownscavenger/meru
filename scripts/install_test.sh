@@ -380,7 +380,7 @@ test_desktop_package_accepts_exact_apt_argv() {
   sudo() { for arg in "$@"; do printf '<%s>' "$arg" >>"$log"; done; printf '\n' >>"$log"; }
   install_desktop_deb "$dir/Meru package.deb"
   output=$(cat "$log")
-  assert_equal "<apt-get><install><--yes><--><$dir/Meru package.deb>" "$output"
+  assert_equal "<apt-get><update>"$'\n'"<apt-get><install><--yes><--><$dir/Meru package.deb>" "$output"
   rm -rf "$dir"
 }
 
@@ -413,6 +413,25 @@ test_headless_desktop_keeps_checked_package_for_later() {
   cached="$HOME/.cache/meru/Meru-v1.2.3-linux-amd64.deb"
   cmp "$dir/Meru-v1.2.3-linux-amd64.deb" "$cached"
   [ ! -s "$log" ] || test_fail "headless desktop install ran sudo"
+  assert_contains "$output" "sudo apt-get update"
+  assert_contains "$output" "sudo apt-get install --yes -- '$cached'"
+  HOME=$old_home
+  rm -rf "$dir"
+}
+
+# test_desktop_failure_keeps_core_install finishes the install when apt fails.
+test_desktop_failure_keeps_core_install() {
+  local dir old_home output cached
+  dir=$(mktemp -d); old_home=$HOME
+  HOME="$dir/home"
+  printf 'package\n' >"$dir/Meru-v1.2.3-linux-amd64.deb"
+  load_installer
+  all=1
+  sudo() { [ "$2" = update ]; }
+  output=$(install_desktop_deb "$dir/Meru-v1.2.3-linux-amd64.deb") || test_fail "a failed desktop install stopped the installer"
+  cached="$HOME/.cache/meru/Meru-v1.2.3-linux-amd64.deb"
+  cmp "$dir/Meru-v1.2.3-linux-amd64.deb" "$cached"
+  assert_contains "$output" "The desktop app was not installed"
   assert_contains "$output" "sudo apt-get install --yes -- '$cached'"
   HOME=$old_home
   rm -rf "$dir"
@@ -705,6 +724,7 @@ test_podman_quadlet_binds_loopback_and_uses_percent_h() {
   grep -Fqx 'PublishPort=127.0.0.1:8888:8080' "$unit"
   grep -Fqx 'Volume=%h/.meru/searxng:/etc/searxng' "$unit"
   grep -Fqx 'Environment=SEARXNG_BASE_URL=http://127.0.0.1:8888/' "$unit"
+  grep -Fqx 'Environment=FORCE_OWNERSHIP=false' "$unit"
   grep -Fqx 'Restart=on-failure' "$unit"
   grep -Fqx 'TimeoutStartSec=900' "$unit"
   grep -Fqx 'WantedBy=default.target' "$unit"
@@ -780,6 +800,7 @@ test_docker_argv_binds_loopback_and_restarts() {
   assert_contains "$output" '<--restart><unless-stopped>'
   assert_contains "$output" '<--publish><127.0.0.1:8888:8080>'
   assert_contains "$output" "<$dir/home with spaces/.meru/searxng:/etc/searxng>"
+  assert_contains "$output" '<--env><FORCE_OWNERSHIP=false>'
   assert_contains "$output" '<registry.test/searxng:test@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>'
   rm -rf "$dir"
 }
@@ -1049,6 +1070,7 @@ for test_name in \
   test_desktop_package_accepts_exact_apt_argv \
   test_meru_yes_installs_desktop_without_prompt \
   test_headless_desktop_keeps_checked_package_for_later \
+  test_desktop_failure_keeps_core_install \
   test_bad_checksum_stops_before_desktop_sudo \
   test_desktop_rerun_changes_no_core_path \
   test_linux_banner_does_not_require_user_env \

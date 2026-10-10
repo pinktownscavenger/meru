@@ -220,8 +220,10 @@ The script names every download and privileged step before it starts. It then:
 8. after `meru ping` works, offers `meru setup user`; and
 9. offers `sudo loginctl enable-linger "$USER"` for a server that should keep
    running after logout;
-10. offers the checked desktop package through `sudo apt-get install`; apt may
-    download GTK 4, WebKitGTK and `xdg-utils` for the app.
+10. offers the checked desktop package: it runs `sudo apt-get update`, then
+    `sudo apt-get install`, and apt may download GTK 4, WebKitGTK and
+    `xdg-utils` for the app. If apt fails, the script keeps the package and
+    prints the two commands to try later; command-line Meru is ready either way.
 
 Each optional or privileged step asks first. Choose `s` at the first prompt to
 accept one step at a time. `MERU_YES=1` accepts every step, including Ollama's
@@ -235,8 +237,8 @@ curl -fsSL https://github.com/aarora79/meru/releases/latest/download/install.sh 
 
 With no terminal, the script installs and checks the binaries but cannot answer
 `meru setup` or consent to `sudo`. It keeps the checked desktop package at
-`~/.cache/meru/Meru-vX.Y.Z-linux-amd64.deb`, prints the exact apt command and
-does not run it. It also prints the setup commands and does not start `merud`
+`~/.cache/meru/Meru-vX.Y.Z-linux-amd64.deb`, prints the exact apt commands and
+does not run them. It also prints the setup commands and does not start `merud`
 without a config. Run `meru setup`, then run the installer again from a terminal.
 
 Check the install:
