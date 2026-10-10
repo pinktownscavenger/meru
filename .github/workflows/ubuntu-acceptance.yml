@@ -300,3 +300,48 @@ jobs:
             ${{ runner.temp }}/*.log
             ${{ runner.temp }}/check-*.jsonl
           if-no-files-found: ignore
+
+  # A diagnostic for the desktop crash: does Ubuntu's AppArmor limit on
+  # unprivileged user namespaces stop WebKitGTK's bubblewrap sandbox? It
+  # opens the app with the limit on, then with it lifted on this runner only.
+  desktop-sandbox:
+    name: desktop app and the user-namespace limit
+    needs: package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release
+          path: ${{ runner.temp }}/release
+      - name: install the desktop package and Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes xvfb "$RUNNER_TEMP/release/Meru-$MERU_VERSION-linux-amd64.deb"
+      - name: show the limit
+        run: |
+          echo "apparmor_restrict_unprivileged_userns=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
+          if unshare --user --map-root-user true; then echo "unshare: allowed"; else echo "unshare: refused"; fi
+      - name: open the app with the limit on
+        run: |
+          set +e
+          timeout 30 xvfb-run -a meru-desktop > "$RUNNER_TEMP/limit-on.log" 2>&1
+          code=$?
+          set -e
+          grep -E 'bwrap|dbus-proxy|ERROR' "$RUNNER_TEMP/limit-on.log" || true
+          echo "exit code $code (124 means the app stayed up for 30 seconds)"
+      - name: open the app with the limit lifted
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          set +e
+          timeout 30 xvfb-run -a meru-desktop > "$RUNNER_TEMP/limit-off.log" 2>&1
+          code=$?
+          set -e
+          grep -E 'bwrap|dbus-proxy|ERROR' "$RUNNER_TEMP/limit-off.log" || true
+          echo "exit code $code (124 means the app stayed up for 30 seconds)"
+          test "$code" = 124
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: logs-desktop-sandbox
+          path: ${{ runner.temp }}/limit-*.log
+          if-no-files-found: ignore
