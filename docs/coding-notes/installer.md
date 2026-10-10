@@ -44,11 +44,21 @@ waits for `meru ping`, and then offers the user profile. A headless server can
 keep the user services alive after logout with lingering. The script shows the
 exact `sudo loginctl` command and runs it only after consent.
 
-The last optional step installs the checked `.deb` through the exact command
-`sudo apt-get install --yes -- <path>`. Apt installs the app's GTK and WebKit
-libraries. Declining that step leaves the command-line install ready. With no
-terminal, the script copies the checked package to `~/.cache/meru/`, prints the
-same apt command with that stable path, and does not run `sudo`.
+The last optional step runs `sudo apt-get update`, then installs the checked
+`.deb` through the exact command `sudo apt-get install --yes -- <path>`. The
+update comes first because a fresh or idle machine's package lists can name
+library versions the mirror has dropped, and apt then fails with 404. Apt
+installs the app's GTK and WebKit libraries. Declining that step leaves the
+command-line install ready, and so does a failed apt run: `keep_desktop_deb`
+copies the checked package to `~/.cache/meru/`, prints both apt commands with
+that stable path, and the script returns 0. With no terminal, the script does
+the same without running `sudo`.
+
+Both SearXNG containers, the Podman Quadlet and the Docker one, set
+`FORCE_OWNERSHIP=false`. Without it, SearXNG's start script runs `chown` on
+`~/.meru/searxng` when it starts as root. Under rootless Podman that hands the
+folder to a subordinate user ID; under Docker, to uid 977. Either way the user
+can no longer read their own `settings.yml`, and a rerun fails on its `chmod`.
 
 The flow is safe to rerun. It replaces verified binaries and service files,
 restarts the services, keeps an existing SearXNG settings file, and leaves Meru's

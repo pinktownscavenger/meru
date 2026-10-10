@@ -3795,7 +3795,11 @@ In run mode, one pass goes:
 
 `docker run` gets `--name meru-searxng`, `--label meru.connector=searxng`,
 `--restart no`, `--publish 127.0.0.1:8888:8080`, the settings volume
-`~/.meru/searxng:/etc/searxng` and `SEARXNG_BASE_URL`. Before the first run,
+`~/.meru/searxng:/etc/searxng`, `SEARXNG_BASE_URL` and `FORCE_OWNERSHIP=false`.
+The last stops SearXNG's start script from running `chown` on the settings
+folder, which on Linux would hand it to the container's user and lock the Meru
+user out of it. The Ubuntu installer's Podman and Docker containers set it too.
+Before the first run,
 `merud` writes `settings.yml` there, with JSON on and a random secret key,
 unless the file exists; an older Mac installer wrote the same file, from
 `catalog.WriteSearXNGSettings`. The supervisor alone restarts the container,

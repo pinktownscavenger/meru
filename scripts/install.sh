@@ -209,17 +209,27 @@ linux_banner() {
   echo
 }
 
-# install_desktop_deb offers the already checked app package. On a headless
-# run it keeps that package in the user's cache, because tmp disappears on exit.
-install_desktop_deb() {
+# keep_desktop_deb copies the checked app package into the user's cache, because
+# tmp disappears on exit, and prints the commands that install it later.
+keep_desktop_deb() {
   local package=$1 cached
+  cached="$HOME/.cache/meru/$(basename "$package")"
+  mkdir -p "$(dirname "$cached")"
+  install -m 0644 "$package" "$cached"
+  echo "To add the desktop app later, run:"
+  echo "  sudo apt-get update"
+  printf "  sudo apt-get install --yes -- '%s'\n" "$cached"
+}
+
+# install_desktop_deb offers the already checked app package. The app is
+# optional, so a failed apt step keeps the package for later and returns 0:
+# command-line Meru is ready by then.
+install_desktop_deb() {
+  local package=$1
   if [ "$all" != 1 ]; then
     if ! has_tty; then
-      cached="$HOME/.cache/meru/$(basename "$package")"
-      mkdir -p "$(dirname "$cached")"
-      install -m 0644 "$package" "$cached"
-      echo "Command-line Meru is ready. To add the desktop app later, run:"
-      printf "  sudo apt-get install --yes -- '%s'\n" "$cached"
+      echo "Command-line Meru is ready."
+      keep_desktop_deb "$package"
       return 0
     fi
     if ! ask "Install the optional Meru desktop app?"; then
@@ -228,7 +238,13 @@ install_desktop_deb() {
     fi
   fi
   say "Installing the Meru desktop app"
-  sudo apt-get install --yes -- "$package"
+  # Package lists on a fresh or idle machine can name versions the mirror has
+  # dropped, and apt then fails with 404, so refresh them first.
+  if sudo apt-get update && sudo apt-get install --yes -- "$package"; then
+    return 0
+  fi
+  echo "The desktop app was not installed. Command-line Meru is ready."
+  keep_desktop_deb "$package"
 }
 
 # searxng_ready accepts the JSON search response Meru's web tool needs.
@@ -342,6 +358,8 @@ searxng_image() {
 setup_searxng_docker() {
   local settings_dir=$1 container_ref
   container_ref=$(searxng_image) || return 1
+  # FORCE_OWNERSHIP=false stops SearXNG's start script from handing the
+  # settings folder to its own user, which locks the user out of it on Linux.
   local -a args=(
     run --detach
     --name meru-searxng
@@ -349,6 +367,7 @@ setup_searxng_docker() {
     --publish 127.0.0.1:8888:8080
     --volume "$settings_dir:/etc/searxng"
     --env SEARXNG_BASE_URL=http://127.0.0.1:8888/
+    --env FORCE_OWNERSHIP=false
     "$container_ref"
   )
   docker pull "$container_ref" || return 1

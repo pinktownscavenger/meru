@@ -26,7 +26,10 @@ image = "docker.io/searxng/searxng:2026.9.29-4e2c1ea7f@sha256:3284e8900e9b3e5df2
 url = "http://127.0.0.1:8888"
 port = 8080
 volumes = ["{meru_dir}/searxng:/etc/searxng"]
-env = { SEARXNG_BASE_URL = "http://127.0.0.1:8888/" }
+# FORCE_OWNERSHIP = "false" stops SearXNG's start script from running chown on
+# the settings folder. On Linux that hands the folder to the container's user
+# and locks the Meru user out of it; on a Mac, Docker Desktop hides owners.
+env = { SEARXNG_BASE_URL = "http://127.0.0.1:8888/", FORCE_OWNERSHIP = "false" }
 
 [health]
 # An empty search with format=json. SearXNG refuses it with 400 and

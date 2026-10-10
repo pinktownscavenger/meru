@@ -7,6 +7,9 @@ ContainerName=meru-searxng
 PublishPort=127.0.0.1:8888:8080
 Volume=%h/.meru/searxng:/etc/searxng
 Environment=SEARXNG_BASE_URL=http://127.0.0.1:8888/
+# SearXNG's start script runs chown on this folder unless this is false. Under
+# rootless Podman that hands it to a subordinate user ID, and the user loses it.
+Environment=FORCE_OWNERSHIP=false
 
 [Service]
 Restart=on-failure
