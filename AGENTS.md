@@ -66,7 +66,12 @@ Meru switches between named model sets at run time, searches the web first when 
 question needs it, warms the answer model in the background, and ships
 through `make release`, a one-line installer, and a Mac installer on a disk image
 (`cmd/meru-installer`), which sets up Ollama, web search, folders and `merud` in
-a window. Work goes milestone by milestone
+a window. For Ubuntu 24.04 x86-64 (#84, v0.5), the one-line installer
+checks the release, installs `meru`, `merud` and Ollama, runs SearXNG through
+rootless Podman or Docker and starts `merud` as a systemd user service. It then
+offers the desktop app as an app-only `.deb`. Neither half has passed its
+fresh-machine acceptance run, so the docs call Ubuntu a candidate. Work goes
+milestone by milestone
 ([ROADMAP.md](ROADMAP.md)). Don't build a later milestone's features (the
 scheduler) ahead of the milestone that owns them.
 [docs/running.md](docs/running.md) shows how to build and run Meru.
@@ -209,7 +214,8 @@ cmd/
                      `check` and `check report` (check.go, checkfile.go, checkreport.go), `run --json`
                      (run.go), the approval prompt (approve.go) and the terminal styles (look.go)
   meru-desktop/      the desktop app's window (Wails v3, build tag `desktop`, needs cgo), with
-                     Info.plist and Meru.icns for Meru.app
+                     Info.plist and Meru.icns for Meru.app; on Linux it runs as
+                     com.meru.desktop, and `--version` prints the version without a window
   meru-installer/    the Mac installer's window, "Install Meru.app" (Wails v3, build tag
                      `desktop`), with its Info.plist
   fakeollama/        a fake Ollama server for end-to-end tests
@@ -276,11 +282,17 @@ internal/
                      testdata/, allowed URLs in allowed_urls.txt
   testutil/fakeollama/  the fake Ollama used by unit and e2e tests
 test/e2e/            end-to-end tests: real binaries against the fake Ollama and fake MCP
-deploy/              launchd/ and systemd/ service files; observability/ holds the local
-                     Grafana stack (compose.yaml), its provisioning and the dashboards
-scripts/             release.sh, which `make release` runs; install.sh, the one-line
-                     installer; dmg-readme.txt, the read-me on the installer's disk image;
-                     bench.sh, which `make bench` runs
+deploy/              launchd/ and systemd/ service files (systemd/ also holds
+                     meru-searxng.container, the Podman Quadlet for SearXNG on Ubuntu);
+                     linux/ holds the desktop entry the .deb installs; observability/ holds
+                     the local Grafana stack (compose.yaml), its provisioning and the dashboards
+scripts/             release.sh, which `make release` runs; release-archive.sh, which packs
+                     one platform's archive; release-linux-desktop.sh, which has the Ubuntu
+                     workflow build the .deb from the release commit and checks what it gets
+                     back; package-deb.sh and check-deb.sh, which build and inspect the .deb;
+                     install.sh, the one-line installer for macOS and Ubuntu;
+                     dmg-readme.txt, the read-me on the installer's disk image; bench.sh,
+                     which `make bench` runs; each *_test.sh tests the script it names
 dist/                git-ignored; `make release` packs a release here
 bench/               git-ignored; the private benchmark: tasks.jsonl, results/ and home/
 docs/
@@ -307,7 +319,8 @@ docs/
   index.html         the landing page GitHub Pages serves at aarora79.github.io/meru
 .claude/skills/      writing, explainer, poster-making, new-feature-design, pr-review,
                      meru-install, release-notes
-.github/             CI and security workflows, Dependabot, the pull-request template
+.github/             CI and security workflows, linux-desktop-release.yml (run by
+                     release.sh to build the Ubuntu .deb), Dependabot, the pull-request template
 .scratchpad/         git-ignored; the design and review skills write here
 ```
 
@@ -483,6 +496,9 @@ make cover            # tests with coverage, and the total
 make build            # binaries for five platforms in bin/
 make desktop          # the desktop app for this machine (cgo); make desktop-check vets it
 make desktop-app      # wrap the desktop app in bin/Meru.app (macOS)
+make desktop-linux    # the desktop app on Ubuntu 24.04 x86-64 (needs GTK4 and WebKitGTK 6.0)
+make desktop-deb VERSION=v0.0.0  # pack that app in the app-only .deb in dist/ and check it
+make install-script-test  # test install.sh; desktop-package-test and release-linux-desktop-test test the .deb scripts
 make installer-app    # the Mac installer, with its payload, in "bin/Install Meru.app"
 make dmg              # pack the installer in dist/Meru-dev-macos-arm64.dmg (Apple silicon)
 make release VERSION=v0.4.1 DRY_RUN=1  # build and pack a release in dist/; drop DRY_RUN to publish
