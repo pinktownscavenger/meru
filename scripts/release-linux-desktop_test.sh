@@ -105,11 +105,12 @@ make_package() {
     "$data/usr/share/icons/hicolor/512x512/apps/com.meru.desktop.png" \
     "$data/usr/share/doc/meru-desktop/copyright"
   printf '2.0\n' > "$package_stage/debian-binary"
-  tar -czf "$package_stage/control.tar.gz" -C "$control" .
-  tar -czf "$package_stage/data.tar.gz" -C "$data" .
+  # xz, as scripts/package-deb.sh builds it; check-deb.sh refuses gzip.
+  tar -cJf "$package_stage/control.tar.xz" -C "$control" .
+  tar -cJf "$package_stage/data.tar.xz" -C "$data" .
   (cd "$package_stage" && ar -qSc \
     "$package_dir/Meru-$version-linux-amd64.deb" \
-    debian-binary control.tar.gz data.tar.gz)
+    debian-binary control.tar.xz data.tar.xz)
 }
 
 pass() {
