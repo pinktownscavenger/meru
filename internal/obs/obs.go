@@ -14,6 +14,8 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/aarora79/meru/internal/config"
@@ -25,6 +27,10 @@ type state struct {
 	inst *instruments
 	// captureContent mirrors config's capture_content.
 	captureContent bool
+	// manual is the reader /metrics collects through, nil when
+	// [observability] prometheus is off; res is the resource it reports.
+	manual *sdkmetric.ManualReader
+	res    *resource.Resource
 }
 
 // current holds the live state. AGENTS.md rules out package-level mutable
@@ -46,10 +52,11 @@ func load() *instruments {
 	return s.inst
 }
 
-// Setup starts metric and trace export to cfg.OTLPEndpoint. With no endpoint
-// it leaves OpenTelemetry's no-op providers in place. It refuses a
-// non-loopback endpoint. Call the returned shutdown function before exiting,
-// so the last batch of data is sent.
+// Setup starts metric and trace export to cfg.OTLPEndpoint, and the reader
+// MetricsHandler serves when cfg.Prometheus is set. With neither it leaves
+// OpenTelemetry's no-op providers in place. It refuses a non-loopback
+// endpoint. Call the returned shutdown function before exiting, so the last
+// batch of data is sent.
 //
 // The body lives in setup.go.
 func Setup(ctx context.Context, cfg config.Observability) (shutdown func(context.Context) error, err error) {
@@ -140,7 +147,7 @@ func RecordModelCall(ctx context.Context, c ModelCall) {
 type Turn struct {
 	Route      string // one of the four routes
 	Source     string // "cli", "tui", "job" or "desktop"
-	Outcome    string // "ok", "error", "cancelled", "timeout", "cut_off", "gave_up" or "bad_output"
+	Outcome    string // "ok", "error", "cancelled", "timeout", "cut_off", "window_full", "gave_up" or "bad_output"
 	Duration   time.Duration
 	Iterations int
 }
@@ -202,8 +209,30 @@ func RecordRender(ctx context.Context, outcome string, d time.Duration) {
 		metric.WithAttributes(attr(keyOutcome, bounded(outcome, renderOutcomes...))))
 }
 
+// speechOutcomes are the outcomes RecordSpeech keeps; any other becomes
+// "other".
+var speechOutcomes = []string{"ok", "error", "empty", "too_long", "cancelled"}
+
+// speechModels are the models RecordSpeech names, the whisper connector's
+// two files; any other becomes "other", so the attribute stays a small
+// set.
+var speechModels = []string{"ggml-base.en.bin", "ggml-large-v3-turbo-q5_0.bin"}
+
+// RecordSpeech records meru.speech.duration for one recording turned into
+// text, with the model and the outcome: "ok", "error", "empty" (nothing
+// heard), "too_long" or "cancelled".
+func RecordSpeech(ctx context.Context, model, outcome string, d time.Duration) {
+	in := load()
+	if in == nil {
+		return
+	}
+	in.speechDuration.Record(ctx, d.Seconds(), metric.WithAttributes(
+		attr(keyModel, bounded(model, speechModels...)),
+		attr(keyOutcome, bounded(outcome, speechOutcomes...))))
+}
+
 // RecordRetrieval records meru.retrieval.duration for one retrieval stage:
-// "vector", "fts", "fusion", "memories" or "sessions". Any other stage
+// "vector", "fts", "fusion", "memories", "sessions" or "images". Any other stage
 // becomes "other".
 func RecordRetrieval(ctx context.Context, stage string, d time.Duration) {
 	in := load()
@@ -326,4 +355,20 @@ func ActiveStreams(ctx context.Context, delta int64) {
 func CaptureContent() bool {
 	s := current.Load()
 	return s != nil && s.captureContent
+}
+
+// RecordJobRun records one scheduled job's run: meru.scheduler.job_runs
+// with the job and the outcome, one of the turn outcomes, and, for a run
+// the schedule started, meru.scheduler.lateness. A run started by hand
+// passes manual, and its lateness isn't recorded.
+func RecordJobRun(ctx context.Context, job, outcome string, late time.Duration, manual bool) {
+	in := load()
+	if in == nil {
+		return
+	}
+	in.jobRuns.Add(ctx, 1, metric.WithAttributes(
+		attr(keyJob, job), attr(keyOutcome, bounded(outcome, turnOutcomes...))))
+	if !manual {
+		in.jobLateness.Record(ctx, late.Seconds(), metric.WithAttributes(attr(keyJob, job)))
+	}
 }

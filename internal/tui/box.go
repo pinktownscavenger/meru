@@ -34,7 +34,7 @@ const (
 func (m *Model) boxOpen() bool {
 	return m.usageBox != nil || m.meBox != nil || m.mcpBox != nil || m.modelBox != nil ||
 		m.chatsBox != nil || m.usedBox != nil || m.foldersBox != nil || m.skillsBox != nil ||
-		m.logBox != nil || m.aboutBox != nil || m.helpBox != nil
+		m.sitesBox != nil || m.jobsBox != nil || m.logBox != nil || m.aboutBox != nil || m.helpBox != nil
 }
 
 // dropBoxes closes every box without giving the input its cursor back,
@@ -42,6 +42,7 @@ func (m *Model) boxOpen() bool {
 func (m *Model) dropBoxes() {
 	m.usageBox, m.meBox, m.mcpBox, m.modelBox = nil, nil, nil, nil
 	m.chatsBox, m.usedBox, m.foldersBox, m.skillsBox, m.logBox = nil, nil, nil, nil, nil
+	m.sitesBox, m.jobsBox = nil, nil
 	m.aboutBox, m.helpBox = nil, nil
 }
 
@@ -67,10 +68,15 @@ func (m *Model) openBox() {
 // a change sent to merud. Update handles Ctrl-C and Ctrl-D before this, as
 // it does for the approval box.
 func (m *Model) boxKey(msg tea.KeyMsg) tea.Cmd {
-	typing := m.mcpBox != nil && (m.mcpBox.keyFor != nil || m.mcpBox.walk != nil)
+	jobForm := m.jobsBox != nil && m.jobsBox.walk != nil
+	typing := jobForm || (m.mcpBox != nil && (m.mcpBox.keyFor != nil || m.mcpBox.walk != nil))
 	if msg.Type == tea.KeyEsc && typing {
-		// Esc leaves the key field or the connector form, not the box.
-		m.mcpBox.keyFor, m.mcpBox.walk = nil, nil
+		// Esc leaves the key field or the form, not the box.
+		if jobForm {
+			m.jobsBox.walk = nil
+		} else {
+			m.mcpBox.keyFor, m.mcpBox.walk = nil, nil
+		}
 		return nil
 	}
 	if msg.Type == tea.KeyEsc || (!typing && msg.Type == tea.KeyRunes && string(msg.Runes) == "q") {
@@ -90,6 +96,10 @@ func (m *Model) boxKey(msg tea.KeyMsg) tea.Cmd {
 		return m.foldersKey(msg)
 	case m.skillsBox != nil:
 		return m.skillsKey(msg)
+	case m.sitesBox != nil:
+		return m.sitesKey(msg)
+	case m.jobsBox != nil:
+		return m.jobsKey(msg)
 	case m.logBox != nil:
 		m.logBox.at = moveMark(msg, m.logBox.at, len(m.logBox.rows))
 	case m.helpBox != nil:
@@ -127,6 +137,13 @@ func (m *Model) boxKeys() keyList {
 		k = keyList{move, bind("enter", "add"), bind("d", "remove")}
 	case m.skillsBox != nil:
 		k = keyList{move, bind("enter", "on/off")}
+	case m.sitesBox != nil:
+		k = keyList{move, bind("d", "remove")}
+	case m.jobsBox != nil && m.jobsBox.walk != nil:
+		return keyList{bind("enter", "next"), bind("esc", "cancel")}
+	case m.jobsBox != nil:
+		k = keyList{move, bind("enter", "run now"), bind("c", "stop"), bind("o", "last run"), bind("p", "pause"),
+			bind("e", "edit"), bind("a", "add"), bind("d", "remove")}
 	case m.logBox != nil:
 		k = keyList{move}
 	case m.helpBox != nil, m.aboutBox != nil:
@@ -262,18 +279,21 @@ type replyMsg struct {
 // The requests a replyMsg can answer. Each file that sends one handles
 // its reply in applyReply.
 const (
-	tagSessions  = "sessions"   // /chats: the list
-	tagTurns     = "turns"      // /chats: one session's turns
-	tagAttach    = "attach"     // /attach <path>
-	tagForget    = "forget"     // d in the /me or /used box
-	tagMemoryAdd = "memory_add" // /me add and /me prefer
-	tagConns     = "connections"
-	tagPolicy    = "policy"     // ←/→ in the /mcp box
-	tagMCPAdd    = "mcp_add"    // enter in the /mcp box
-	tagMCPRemove = "mcp_remove" // d d in the /mcp box
-	tagFolders   = "folders"
-	tagSkills    = "skills"
-	tagLog       = "log"
+	tagSessions   = "sessions"   // /chats: the list
+	tagTurns      = "turns"      // /chats: one session's turns
+	tagAttach     = "attach"     // /attach <path>
+	tagForget     = "forget"     // d in the /me or /used box
+	tagMemoryAdd  = "memory_add" // /me add and /me prefer
+	tagConns      = "connections"
+	tagPolicy     = "policy"     // ←/→ in the /mcp box
+	tagMCPAdd     = "mcp_add"    // enter in the /mcp box
+	tagMCPRemove  = "mcp_remove" // d d in the /mcp box
+	tagFolders    = "folders"
+	tagSkills     = "skills"
+	tagSites      = "sites"
+	tagJobs       = "jobs"
+	tagJobRunChat = "job_run_chat" // o in the /jobs box
+	tagLog        = "log"
 	// The /mcp box's connector rows (connectors.go).
 	tagConnectors   = "connectors"
 	tagConnectorSet = "connector_set" // o, and the end of the f form
@@ -333,6 +353,12 @@ func (m *Model) applyReply(msg replyMsg) tea.Cmd {
 		m.applyFolders(msg)
 	case tagSkills:
 		m.applySkills(msg)
+	case tagSites:
+		m.applySites(msg)
+	case tagJobs:
+		m.applyJobs(msg)
+	case tagJobRunChat:
+		return m.applyJobRunChat(msg)
 	case tagLog:
 		m.applyLog(msg)
 	}

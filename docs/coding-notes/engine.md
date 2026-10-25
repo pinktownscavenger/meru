@@ -1,6 +1,6 @@
 # engine
 
-**Code:** `internal/engine/` (`engine.go`, `ollama.go`, `ollama_wire.go`, `version.go`,
+**Code:** `internal/engine/` (`engine.go`, `ollama.go`, `ollama_wire.go`,
 `observe_test.go`, `images_test.go`), and the loopback check in `internal/loopback/loopback.go`
 **Milestone:** v0.1; `Options.NoThink` in v0.4; `Message.Images` and
 `Capabilities` with the desktop app's image attachments; `Details` with the
@@ -22,7 +22,7 @@ flowchart LR
     router["router.Decide"] -->|Generate, 1 token| E
     agent["agent loop"] -->|Stream| E
     retrieval["retrieval (v0.2)"] -->|Embed| E
-    merud["merud startup"] -->|Info, CheckVersion| E
+    merud["merud startup"] -->|Info| E
     E["OllamaEngine"] -->|POST /api/chat| O["Ollama on 127.0.0.1:11434"]
     E -->|POST /api/embed| O
     E -->|GET /api/version, /api/ps| O
@@ -41,6 +41,13 @@ names the one it needs to take a list of tools; Ollama refuses tools to a model
 without it, such as `gemma3:12b`. A
 Go *interface* is a list of method signatures; any type with those methods counts
 as that interface. See [go-basics/interfaces.md](go-basics/interfaces.md).
+
+`Input` is one thing for `Embed` to turn into a vector: `Text`, `Image` bytes, or
+both, with `Title` for a document's heading and `Query` for a search query.
+`Texts("a", "b")` wraps plain strings for a caller that has nothing more, such
+as the warm-up. `Prompts` holds an embedding model's task prefixes, with
+`{query}`, `{title}` and `{text}` where the input goes; its zero value adds
+nothing.
 
 ### The loopback check
 
@@ -75,8 +82,26 @@ nil means no lines.
 build an engine didn't change. `merud` sets it once, from
 `[ollama] context_length`, before the first call. When it is above 0, every
 chat call sends it as `num_ctx` in `options`, so each model loads with room for
-Meru's prompts of about 20,000 tokens whatever Ollama's own default is. Every
-call sends the same value, since Ollama reloads a model when `num_ctx` changes.
+Meru's prompts of about 25,000 tokens whatever Ollama's own default is. Every
+call to one model sends the same value, since Ollama reloads a model when
+`num_ctx` changes.
+
+**Windows per model (window.go).** `SetWindow(model, n)` gives one model a
+window of its own, and `Window(model)` returns what a chat call sends: that
+window, or `ContextLength`. The map sits beside `shown`, under the same `mu`.
+`merud` sets the answer model's window from `FitWindow(details, budget,
+fallback)`, which takes the model's most tokens, cuts them to what fits in
+`budget` bytes of cache, rounds down to a multiple of 1,024, and never returns
+less than `fallback`. A model with no known cache size gets `fallback`.
+
+`details` works the cache size out in `kvBytesPerToken`. Each layer caches a
+key and a value per head, `key_length` and `value_length` numbers wide, at 2
+bytes each. `head_count_kv` comes as one number for every layer, which the code
+multiplies by `block_count`, or as a list with one per layer. A hybrid model
+such as qwen3.6 lists 0 for the three layers in four that keep no cache. The
+code tries `json.Unmarshal` into an `int64` first and a `[]int64` second; the
+one that succeeds says which shape came. A model without `key_length` uses
+`embedding_length / head_count`, the usual width of a head.
 
 ```go
 if n, err := strconv.Atoi(s); err == nil {
@@ -155,7 +180,8 @@ status outside 200–299 it reads Ollama's `{"error": "..."}` body and returns a
 `Details(ctx, model)` sends `POST /api/show` with `{"model": ...}` and
 returns a `ModelDetails`: the `capabilities` list, such as
 `["completion", "vision", "tools", "thinking"]`, the parameter size (`36.0B`),
-the quantization (`Q4_K_M`) and the context length. Ollama files the context
+the quantization (`Q4_K_M`), the context length, and `KVBytesPerToken`, the
+cache a token takes (see "Windows per model"). Ollama files the context
 length under the model's architecture, as `qwen35moe.context_length`, so
 `showResponse.details` finds the key by its ending. The reply also holds the
 license and the list of tensors, over 100 KB for a large model; the decoder
@@ -212,16 +238,28 @@ name and arguments inside a `function` object, and a tool spec inside
 Ollama reports durations in nanoseconds. `time.Duration` also counts
 nanoseconds, so `time.Duration(r.LoadDuration)` converts one to the other.
 
+`embedItem` is one entry of an embed request's `input`, and it has its own
+`MarshalJSON`, so it can come out in two shapes:
+
+```text
+"sow tomatoes in April"                       text alone: a plain string, as always
+{"image": "iVBORw0KGgo..."}                    an image: an object, bytes in base64
+{"text": "a cat", "image": "iVBORw0KGgo..."}   both together
+```
+
+Two other shapes look right, and Ollama answers both with a valid vector that
+has nothing to do with the picture: an `images` list beside `input`, and a
+`"data:image/png;base64,..."` string, which it embeds as text. That is why the
+integration test compares two different images and checks their vectors
+differ. `Prompts.apply` builds the text: the query prefix for a query, the
+document prefix with `none` for a missing title, or, with no prefix, the title,
+a blank line and the text, the form the indexer always sent. `embedOptions`
+carries `num_ctx`, which `Embed` sends on every call from `EmbedContext`.
+
 `chatMessage.Images` is a `[][]byte` with the JSON key `images`. Ollama wants
 each image as a base64 string, and `encoding/json` writes any `[]byte` as
 base64, so the conversion needs no code. `showRequest` and `showResponse` are
 the two shapes of `/api/show`; Meru reads only `capabilities` from the reply.
-
-### version.go
-
-`CheckVersion` reads `/api/version` and fails below `MinOllamaVersion` (0.12.11,
-the first release with log probabilities). The error names both versions, so the
-user knows what they have and what to install.
 
 ## Go ideas used here
 
@@ -235,10 +273,11 @@ user knows what they have and what to install.
   `encoding/json` which key to use; `omitempty` drops empty fields.
 - **`json.RawMessage`** — bytes of JSON passed through untouched. Tool arguments
   and `keep_alive` use it.
-- **Arrays** — `[3]int` has a fixed length that is part of its type;
-  `parseVersion` returns one, and two arrays compare with `==`.
 - **`[]byte` in JSON** — `encoding/json` writes a byte slice as a base64
   string and reads one back the same way. `Message.Images` relies on it.
+- **`MarshalJSON`** — a type with this method decides its own JSON, so
+  `embedItem` is a string or an object. More in
+  [go-basics/json-marshaler.md](go-basics/json-marshaler.md).
 - **`sync.Mutex`** — `mu.Lock()` lets one goroutine at a time into the
   capabilities map. More in [go-basics/goroutines.md](go-basics/goroutines.md).
 

@@ -214,9 +214,10 @@ response array across. It converts nothing else; the router owns the arithmetic.
 
 ### Ollama version
 
-Log probabilities arrived in Ollama v0.12.11. `merud` reads `/api/version` at startup
-and refuses to start below it, with a message naming the version it found and the one
-it needs. No compatibility branch, no fallback path — one way to do each thing.
+Log probabilities arrived in Ollama v0.12.11. Meru now needs v0.40.5 or later for
+its embedding model, which covers the router too. `merud` reads `/api/version` at
+startup and answers no question below it, with a message naming the version it found
+and where to update. No compatibility branch, no fallback path — one way to do each thing.
 
 ## The router package
 
@@ -317,15 +318,18 @@ spend tokens rather than guess.
 `make router-eval` scores the router against the local Ollama. It needs the fast
 model pulled, and skips otherwise.
 
-**The labelled set.** `internal/router/testdata/routes.jsonl` holds 153 questions
-written the way a user types them, 33 to 43 per route, each with its route and a
-reason. The last 18 carry `"tag": "connected"`: they ask for mail, the calendar,
+**The labelled set.** `internal/router/testdata/routes.jsonl` holds 162 questions
+written the way a user types them, 34 to 48 per route, each with its route and a
+reason. 18 carry `"tag": "connected"`: they ask for mail, the calendar,
 Drive, the Obsidian vault, a local git command or the clock. Some are follow-ups that carry a `history` of earlier turns. The harness
 gives every row the same folders, `~/notes`, `~/repos/meru` and
 `~/repos/blog` (`evalFolders`), so a row can ask about "meru" by name the way
 a user asks about their own project. A fixed rule splits the set: of every ten rows
-with the same route, the 3rd, 6th and 9th go to a held-out set of 46 rows, and the
-other 107 form the fit set. New rows go at the end of the file, so the rows already
+with the same route, the 3rd, 6th and 9th go to a held-out set of 48 rows, and the
+other 114 form the fit set. The last 9 carry `"tag": "images"`: they ask about
+pictures in the folders, such as a receipt to read, and route `search`, where
+`view_image` rides with the other file tools; one asks about pictures in
+general and routes `direct`. The measurements below ran on the first 153 rows. New rows go at the end of the file, so the rows already
 there keep their side of the split. Tune on the fit set and
 report the held-out numbers.
 
@@ -340,7 +344,7 @@ a fallback never misses) and latency at p50 and p95.
 
 **Temperature.** A sweep from 0.5 to 5 picks the value with the lowest ECE over all
 rows. Temperature never changes the top pick, so fitting it on every row leaks
-nothing into the accuracy numbers. The held-out set alone, at 46 rows, gives an ECE
+nothing into the accuracy numbers. The held-out set alone, at 46 to 48 rows, gives an ECE
 too jumpy to fit on.
 
 **Threshold.** A sweep of `min_confidence` shows the fallback rate, accuracy and
@@ -491,8 +495,8 @@ Standard `testing`, table-driven, no assertion library.
   `num_predict: 1`. No test needs a real model.
 - **Outcomes.** Each of `ok`, `low_confidence` and `degraded` reached by a fixture,
   with the fallback route returned for the last two.
-- **Version gate.** A fake `/api/version` below v0.12.11 makes startup fail with a
-  message naming both versions.
+- **Version gate.** A fake `/api/version` below v0.40.5 makes `merud` answer no
+  question, with a message naming the version and where to update.
 
 `go test -race ./...` must pass.
 

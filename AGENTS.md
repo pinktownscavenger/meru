@@ -27,7 +27,7 @@ easier to review.
   `make figures` to redraw them.
   If code and this doc disagree, one of them has a bug. Say which one; don't pick
   without saying so.
-- [ROADMAP.md](ROADMAP.md) — milestones v0.1 → v0.5, shipped in order. Each has a
+- [ROADMAP.md](ROADMAP.md) — milestones v0.1 → v0.6, shipped in order. Each has a
   "Done when" line that serves as its acceptance test.
 - [docs/lld.md](docs/lld.md) — the low-level design: packages, the interfaces between
   them, and one question traced function by function. Start here before reading code.
@@ -35,8 +35,8 @@ easier to review.
 
 ## Status
 
-Pre-alpha, with releases up to **v0.4.11**. ROADMAP.md ticks every item from v0.1
-to v0.4:
+Pre-alpha, with releases up to **v0.5.0**. ROADMAP.md ticks every item from v0.1
+to v0.5:
 
 - **v0.1:** `merud` and `meru` answer with local models, stream the answer, keep
   JSONL session transcripts and route each question with the one-token router.
@@ -49,6 +49,10 @@ to v0.4:
 - **v0.4:** memories, with your profile in every prompt and recall on each turn,
   session summaries, skills with progressive disclosure, `write_file` into
   `~/meru-output/`, and a context budget for the prompt.
+- **v0.5:** scheduled jobs: a prompt, a skill or a declared command on a cron
+  schedule, with every N weeks and catch-up after sleep, each run a chat in the
+  Jobs folder; managed in both clients and by asking through `schedule_job`
+  (#167). Web answers list their pages as sources (#174).
 
 The desktop app, `meru-desktop` (Wails v3, macOS first), came ahead of v0.5 at the
 owner's request. It has the chat screen, Settings and the Setup screen, takes
@@ -61,26 +65,40 @@ v0.4.10 `merud` runs connectors: it installs, starts and restarts the Obsidian
 server and SearXNG from pinned manifests, and waits for Ollama when it's down.
 Since v0.4.11 it runs Google too, the clients and the installer set up, fix and
 adopt connectors through `merud`, and `web_fetch` reads pages that need
-JavaScript through a headless Chrome (#101). Outside the milestones,
+JavaScript through a headless Chrome (#101). Since v0.4.12 both clients chart
+use on a Usage screen from `meru.db`, `merud` serves `/metrics` for a Prometheus
+the user runs, and the Grafana stack is gone (#107). Since v0.4.13 Meru indexes
+the images in its folders and finds them by words or like an attached picture,
+with `embeddinggemma-2:440m` as the search model on both profiles (#118, #119).
+Since v0.4.14 an answer model with vision reads those pictures through
+`view_image` (#124). Since v0.4.17 Meru reads Apple Notes, live and
+read-only, through three built-in tools (#140). Since v0.4.18 Meru.app has a
+microphone: the whisper connector runs whisper.cpp's server on loopback, and
+the transcribe op turns a recording into text the user checks (#143 to #148).
+Since v0.4.19 `merud` sizes the answer model's context window from what
+Ollama reports, a turn keeps its tool rounds inside it, an answer that stopped
+short can Continue, and `web_fetch` can trust a website (#155 to #160).
+Outside the milestones,
 Meru switches between named model sets at run time, searches the web first when a
 question needs it, warms the answer model in the background, and ships
 through `make release`, a one-line installer, and a Mac installer on a disk image
 (`cmd/meru-installer`), which sets up Ollama, web search, folders and `merud` in
-a window. For Ubuntu 24.04 x86-64 (#84, v0.5), the one-line installer
+a window. For Ubuntu 24.04 x86-64 (#84, v0.6), the one-line installer
 checks the release, installs `meru`, `merud` and Ollama, runs SearXNG through
 rootless Podman or Docker and starts `merud` as a systemd user service. It then
 offers the desktop app as an app-only `.deb`. Neither half has passed its
 fresh-machine acceptance run, so the docs call Ubuntu a candidate. Work goes
-milestone by milestone
-([ROADMAP.md](ROADMAP.md)). Don't build a later milestone's features (the
-scheduler) ahead of the milestone that owns them.
+milestone by milestone ([ROADMAP.md](ROADMAP.md)). Don't build a later
+milestone's features (digests, notifications, `meru brief`) ahead of the
+milestone that owns them.
 [docs/running.md](docs/running.md) shows how to build and run Meru.
 
 Decided (details in ARCHITECTURE.md):
 
 - **Agent loop:** hand-written. No agent framework.
-- **Models:** Ollama on loopback. `lite` profile by default (MiniCPM5-2B +
-  `nomic-embed-text`); `full` profile uses `qwen3.6:35b-a3b-mxfp8` + `qwen3-embedding:0.6b`.
+- **Models:** Ollama 0.40.5 or later, on loopback. `lite` profile by default
+  (MiniCPM5-2B + `embeddinggemma-2:440m`); `full` profile uses
+  `qwen3.6:35b-a3b-mxfp8` + `embeddinggemma-2:440m`.
 - **Storage:** JSONL session transcripts are the source of truth; SQLite via
   `ncruces/go-sqlite3` (no cgo) is the rebuildable index. Vectors sit in a plain
   table and vec1, bundled with the driver, supplies the distance function.
@@ -205,14 +223,18 @@ cmd/
                      replays transcripts and runs the summarizer;
                      backends.go joins the MCP pool to dispatch; ollama.go watches Ollama and
                      gates requests until merud is ready; runtime.go warms the models;
-                     machine.go describes the computer for the system prompt
+                     machine.go describes the computer for the system prompt; jobs.go runs [[jobs]]
+                     through the agent and answers the job ops; window.go sizes the
+                     answer model's context window; metrics.go serves
+                     /metrics; speech.go answers the transcribe op
   meru/              the thin client, one file per subcommand: one question and `chat`
                      (main.go), `ping`, `index [-status]`, `tools`, `log`, `usage`, `setup`,
                      `setup user` (user.go), `config template`, `memory list|add|forget`,
                      `skills list|show|reset`, `mcp list|status|add|remove` (mcp.go, probe.go),
                      `mcp adopt|unadopt` (adopt.go),
                      `check` and `check report` (check.go, checkfile.go, checkreport.go), `run --json`
-                     (run.go), the approval prompt (approve.go) and the terminal styles (look.go)
+                     (run.go), `transcribe` (transcribe.go), the approval prompt (approve.go) and
+                     the terminal styles (look.go)
   meru-desktop/      the desktop app's window (Wails v3, build tag `desktop`, needs cgo), with
                      Info.plist and Meru.icns for Meru.app; on Linux it runs as
                      com.meru.desktop, and `--version` prints the version without a window
@@ -235,30 +257,43 @@ internal/
   mcp/               the MCP client pool: stdio and Streamable HTTP, allowlists, the probe
                      `meru mcp add` runs before it saves a server
   a2a/               the A2A client: agent cards, skills as tools, streaming calls
-  builtin/           the eleven tools inside merud: `configure`, `datetime`, `about_meru`,
+  builtin/           the seventeen tools inside merud: `configure`, `datetime`, `about_meru`,
                      `remember`, `write_file`, the read-only `read_file`, `list_folder`,
-                     `grep` and `search_files`, and `web_search` and `web_fetch` (web.go,
-                     webguard.go, webdownload.go); chats.go lets the first three read
-                     the past chats in ~/.meru/sessions
+                     `grep`, `search_files`, `search_images` (searchimages.go) and
+                     `view_image` (viewimage.go), `web_search` and `web_fetch`
+                     (web.go, webguard.go, webdownload.go), and the Apple Notes tools
+                     `search_notes`, `list_notes` and `read_note` (notes.go), and
+                     `schedule_job` (schedulejob.go); chats.go lets the first three read the past chats in ~/.meru/sessions
+  applenotes/        reads the Notes app's NoteStore.sqlite, live and read-only, for the
+                     Apple Notes tools: schema found at run time, note text decoded from
+                     its gzipped protobuf
+  speech/            speech to text for the transcribe op: checks a WAV recording, posts it to
+                     the whisper connector's whisper-server, and cleans Whisper's markers
+  jobs/              scheduled jobs (v0.5): five-field cron schedules with every_weeks, the
+                     next run and the words for it, catch-up after sleep, and the loop that
+                     runs each job one at a time and stops one on request
   render/            web_fetch's page reader: a fresh headless Chrome per page that needs
                      JavaScript, driven over two pipes (cdp.go), behind a proxy that applies
                      web_fetch's address check (proxy.go)
   commands/          the [[commands]] entries: local programs run with no shell, typed parameters
   catalog/           the starter MCP servers and SearXNG, the safe append to config.toml, and
-                     one-list edits and removals in it; Adopt's edit and its undo (adopt.go)
+                     one-list edits and removals in it; Adopt's edit and its undo (adopt.go);
+                     adding, replacing and removing one [[jobs]] entry (jobs.go)
   secrets/           ~/.meru/secrets.toml: secret:<name> references and redaction
   skills/            loads SKILL.md folders; builtin/ ships writing, explainer, web-research and
                      file-research
   memory/            one Markdown file per memory under memory/<kind>/; the profile kinds go in every prompt
   summarize/         session summaries: the fast model summarizes quiet sessions, for recall by episode
   agent/             one turn: route, build the prompt within the budget (budget.go), pick a
-                     skill, recall memories and earlier chats, run tool rounds, stream the answer
+                     skill, recall memories and earlier chats, find images like an attached
+                     one (similar.go), run tool rounds, stream the answer
   transcript/        append-only JSONL session files, and listing them; meta lines for a
                      chat's folder and tags, folders.json, deleting a chat, and incognito
                      sessions held in memory
   rpc/               newline-delimited JSON over the Unix socket: client, server, and the types
                      of every op and event
-  obs/               OpenTelemetry metrics and traces, loopback only, and the slog handler
+  obs/               OpenTelemetry metrics and traces, loopback only, the /metrics page
+                     for Prometheus (prometheus.go), and the slog handler
   loopback/          the one rule for "this address is on this machine"
   tui/               the Bubble Tea UI behind `meru chat`, with the desktop app's features as
                      slash commands and boxes
@@ -267,7 +302,7 @@ internal/
                      web/ (index.html, app.css, js/, vendored marked and DOMPurify in vendor/,
                      fonts/)
   opener/            opens a clicked http, https or file link with the system opener, no shell
-  installer/         the Mac installer minus the window: its ten steps, the Bridge, the
+  installer/         the Mac installer minus the window: its eleven steps, the Bridge, the
                      allowlist of programs it runs (run.go), and the page in web/
   connectors/        the connector manifests (manifests/*.toml, compiled in) with pinned
                      versions, and the checks on them; the pinned Node, uv and
@@ -284,8 +319,7 @@ internal/
 test/e2e/            end-to-end tests: real binaries against the fake Ollama and fake MCP
 deploy/              launchd/ and systemd/ service files (systemd/ also holds
                      meru-searxng.container, the Podman Quadlet for SearXNG on Ubuntu);
-                     linux/ holds the desktop entry the .deb installs; observability/ holds
-                     the local Grafana stack (compose.yaml), its provisioning and the dashboards
+                     linux/ holds the desktop entry the .deb installs
 scripts/             release.sh, which `make release` runs; release-archive.sh, which packs
                      one platform's archive; release-linux-desktop.sh, which has the Ubuntu
                      workflow build the .deb from the release commit and checks what it gets
@@ -297,6 +331,7 @@ dist/                git-ignored; `make release` packs a release here
 bench/               git-ignored; the private benchmark: tasks.jsonl, results/ and home/
 docs/
   architecture/      100.md, 200.md and the HTML pages 100.html, 200.html and 300.html;
+                     harness.md, one turn through the agent harness at level 300;
                      index.html sends old links to 100.html; img/ holds the figures
                      as PNG files and render.sh, which draws them
   coding-notes/      one note per package, and go-basics/ for Go concepts
@@ -305,7 +340,7 @@ docs/
   faq/               one page per "how do I…" question, listed in index.md
   benchmarks/        the benchmark: README.md (how it works, how to build your own dataset) and
                      results.md, which `make bench-report` writes; the dataset stays in bench/
-  observability.md   the local Grafana stack: setup, dashboards, command-line queries
+  observability.md   reading the metrics: the Usage page, /metrics for Prometheus, traces
   ci.md              what each check in CI does
   fast-router.md     how the one-token router works
   google-setup.md    setting up Gmail, Calendar and Drive for the `google` server
@@ -316,6 +351,8 @@ docs/
                      agent that drives `meru run --json`
   img/               the logo and the social preview image
   posters/           the one-page poster: HTML, PNGs and PDF
+  slides/            two decks, each HTML and PDF: an overview for anyone, with a part for
+                     organizations, and one for developers
   index.html         the landing page GitHub Pages serves at aarora79.github.io/meru
 .claude/skills/      writing, explainer, poster-making, new-feature-design, pr-review,
                      meru-install, release-notes
@@ -328,7 +365,7 @@ docs/
 `about` and `loopback`, plus `catalog` and `secrets`, which `meru setup` and `meru mcp add`
 use to write `config.toml` and `secrets.toml`. It never imports `engine`,
 `transcript`, `agent`, `store`, `retrieve`, `index`, `memory`, `summarize`, `mcp`,
-`dispatch`, `a2a`, `builtin`, `commands`, `connectors`, `render` or anything else that talks to a model, stores data
+`dispatch`, `a2a`, `builtin`, `commands`, `connectors`, `render`, `applenotes`, `speech` or anything else that talks to a model, stores data
 or runs a program.
 The desktop app (`cmd/meru-desktop` and `internal/desktop`) is thinner still: it
 may import `rpc`, `config`, `loopback`, `opener` and `about`, plus Wails in the command,
@@ -336,7 +373,7 @@ and neither `catalog`, `secrets` nor `tui`; it never touches Wails' updater.
 The Mac installer (`cmd/meru-installer` and `internal/installer`) runs before
 `merud` exists, so it may write config through `catalog`, the profile through
 `memory` and ask `merud` over `rpc`; it never imports `engine`, `agent`, `store`,
-`index`, `dispatch`, `mcp`, `a2a`, `builtin`, `commands`, `connectors` or `render`. It starts programs
+`index`, `dispatch`, `mcp`, `a2a`, `builtin`, `commands`, `connectors`, `render`, `applenotes` or `speech`. It starts programs
 only in `internal/installer/run.go`, from a fixed allowlist of absolute paths,
 with no shell.
 `internal/policy` fails the build if any of this changes, directly or through

@@ -16,10 +16,28 @@ model for the Mac's memory; a new Ubuntu install starts with the `lite` profile.
 [![Download the Mac installer](https://img.shields.io/badge/Download-Mac%20installer-2F6B4F?logo=apple&style=for-the-badge)](https://github.com/aarora79/meru/releases/latest/download/Meru-macos-arm64.dmg)
 [![Latest release](https://img.shields.io/github/v/release/aarora79/meru?label=latest%20release)](https://github.com/aarora79/meru/releases/latest)
 
-> **Status: pre-alpha, v0.4.11.** Answers from local models, your own files and
-> tools you allow, with every tool call logged. Meru installs, runs and restarts
-> Google, Obsidian and SearXNG for you, set up from Settings, and reads pages
-> that need JavaScript. Scheduled jobs come in v0.5.
+**Website:** [aarora79.github.io/meru](https://aarora79.github.io/meru/) ·
+**Slides:** [Meru, an overview](https://aarora79.github.io/meru/slides/meru-overview.html)
+([PDF](docs/slides/meru-overview.pdf)) ·
+[Meru for developers](https://aarora79.github.io/meru/slides/meru-developers.html)
+([PDF](docs/slides/meru-developers.pdf)) ·
+[Meru for organizations](https://aarora79.github.io/meru/slides/meru-organizations.html)
+([PDF](docs/slides/meru-organizations.pdf)) ·
+[Meru for individuals](https://aarora79.github.io/meru/slides/meru-individuals.html)
+([PDF](docs/slides/meru-individuals.pdf))
+
+> **Status: pre-alpha, v0.5.0.** Answers from local models, your own files and
+> tools you allow, with every tool call logged, and a scope you pick limits the
+> tools a turn can run. Meru finds the pictures in your
+> folders, by words or like one you attach, and a model that can see reads them.
+> On a Mac it searches and reads your Apple Notes, and turns what you say into
+> text with Whisper, on your Mac. It installs, runs and restarts
+> Google, Obsidian and SearXNG for you, set up from Settings, reads pages that
+> need JavaScript, and charts your use on its Usage screen. A question can read
+> dozens of web pages, and an answer that stops short can Continue. It runs jobs on a
+> schedule, such as a morning brief at 7 on weekdays, each run a chat in a Jobs
+> folder, and you set them up in Settings, in `meru chat` or by asking. A web answer
+> lists the pages it came from.
 > [ROADMAP.md](ROADMAP.md) · [release notes](docs/release-notes/README.md)
 
 <p align="center"><img src="docs/img/desktop-app.png" width="760" alt="Meru.app: a rail with New chat, Incognito chat, New folder, chat search, folders and the chats of today and yesterday, and a status box saying Meru runs on this Mac with the qwen3.6:35b answer model; the main pane asks what to ask Meru, with three example questions and a switch between Auto, My files, Mail and calendar, Web and Just talk."></p>
@@ -53,8 +71,8 @@ rates by kind of task, and charts of accuracy against speed.
 Apple silicon, open it, and open "Install Meru.app". Apple hasn't checked Meru,
 so the first time macOS refuses: click Done, then Open Anyway in System
 Settings, Privacy & Security.
-It walks you through ten steps: Meru, Ollama and the models, the folders Meru
-reads, web search in Docker, your Obsidian notes, skills and commands, Gmail
+It walks you through eleven steps: Meru, Ollama and the models, the folders Meru
+reads, web search in Docker, your Obsidian notes, your Apple Notes, skills and commands, Gmail
 and Calendar, your name, and starting `merud`, which then installs the servers
 behind web search, Obsidian and Google. Each step says what it downloads before it starts, and you
 can skip any but your name. [The Mac installer](docs/running.md#the-mac-installer)
@@ -100,14 +118,15 @@ headless servers, updates, recovery and removal.
 | Capability | What it means |
 | --- | --- |
 | **Local models** | Ollama runs the models on your machine, and `merud` keeps them loaded. |
+| **Voice** | Press the microphone in Meru.app, speak, and press it again: Whisper, run by whisper.cpp on your Mac, turns your words into text in the question box, and you check them before you press Send. The sound never leaves your Mac and Meru keeps no recording. Turn it on in Settings, Connections; `meru transcribe recording.wav` does the same from a terminal. Macs with Apple silicon, for now. |
 | **Search over your files** | Meru searches your notes, docs, PDFs and repos by keyword (BM25) and by meaning, and names the file behind each answer. |
 | **Web search** | The built-in `web_search` tool searches through SearXNG, which you run in Podman or Docker; no account or API key. The built-in `web_fetch` tool reads a whole public page, answers a question from it with the fast model, or downloads a file; it asks you before it opens an address no search or question of yours gave. Taking it out of `[builtin] tools` turns it off. [docs/running.md](docs/running.md#web-search) shows the setup. |
 | **MCP tools** | `meru setup` offers two servers: `google` for Gmail, Calendar and Drive, and `obsidian` for notes. It adds each one for you or shows you what to paste, and `meru mcp` shows which ones are connected. |
 | **Other agents** | Meru hands tasks to agents you have allowed, over A2A. |
 | **Memory** | Meru saves what it learns about you as small Markdown files you can edit or delete. |
 | **Skills** | A skill is a Markdown file of instructions that Meru loads when a question needs it. Meru ships with `writing`, `explainer`, `web-research` and `file-research`; `[skills] disabled` turns one off. |
-| **Scheduled jobs** (v0.5) | Meru will run briefs and other jobs on a schedule, so it can tell you things before you ask. |
-| **Observability** | Meru records the tokens, time and tool calls of every question as OpenTelemetry metrics and traces, and shows them in Grafana on your machine. |
+| **Scheduled jobs** | Meru asks a question, runs a skill or runs a command you declared on a schedule, such as every weekday at 7 or every other Tuesday, so it can tell you things before you ask. Each run is a chat in the Jobs folder. Add jobs in Settings, with `/jobs` in `meru chat`, or by asking ("every weekday at 7, brief me on my calendar"), which shows the schedule in words before you approve it. |
+| **Observability** | Meru records the tokens, time and tool calls of every question as OpenTelemetry metrics and traces. The Usage page charts them with nothing to install, and a Prometheus you run can read them from `merud` on your machine. |
 
 ## Why your own machine
 
@@ -197,10 +216,10 @@ Meru runs wherever Ollama and Go do:
 
 Two model profiles ship with it (see [ARCHITECTURE.md](ARCHITECTURE.md#model-tiers)):
 
-- **`lite` (default):** MiniCPM5-2B and `nomic-embed-text`, about 2 GB of downloads.
+- **`lite` (default):** MiniCPM5-2B and `embeddinggemma-2:440m`, about 2.3 GB of downloads.
   Needs 16 GB of RAM and runs on a CPU, faster with a GPU or Apple silicon.
 - **`full`:** `qwen3.6:35b-a3b-mxfp8`, a 38 GB mixture of experts, and
-  `qwen3-embedding:0.6b`. Needs Apple silicon with 64 GB or more.
+  `embeddinggemma-2:440m`. Needs Apple silicon with 64 GB or more.
 
 [How good are the local models?](#how-good-are-the-local-models) gives the
 answer model each installer picks for your Mac's memory, with its benchmark
@@ -225,7 +244,7 @@ call.
 - [docs/posters/](docs/posters/) — the Meru poster
 - [docs/running.md](docs/running.md) — install, run and troubleshoot Meru
 - [docs/faq/](docs/faq/index.md) — short answers to "how do I…" questions, one page each
-- [docs/observability.md](docs/observability.md) — watch Meru on a local Grafana dashboard
+- [docs/observability.md](docs/observability.md) — read Meru's metrics: the Usage page, Prometheus and traces
 - [docs/releasing.md](docs/releasing.md) — how a release gets built and published
 - [docs/lld.md](docs/lld.md) — how the code fits together, for readers new to Go
 - [ROADMAP.md](ROADMAP.md) — milestones, in shipping order

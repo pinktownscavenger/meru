@@ -51,12 +51,12 @@ func TestLoadProfilesAndOverrides(t *testing.T) {
 		{"full", `profile = "full"`, Models{
 			Fast:  "hf.co/openbmb/MiniCPM5-2B-GGUF:Q4_K_M",
 			Main:  "qwen3.6:35b-a3b-mxfp8",
-			Embed: "qwen3-embedding:0.6b",
+			Embed: "embeddinggemma-2:440m",
 		}},
 		{"full with main override", "profile = \"full\"\n[models]\nmain = \"my-model\"", Models{
 			Fast:  "hf.co/openbmb/MiniCPM5-2B-GGUF:Q4_K_M",
 			Main:  "my-model",
-			Embed: "qwen3-embedding:0.6b",
+			Embed: "embeddinggemma-2:440m",
 		}},
 	}
 	for _, tt := range tests {
@@ -171,10 +171,11 @@ remote  = false
 			ChunkTokens:   300,
 			OverlapTokens: 0,
 			Watch:         false,
+			Images:        true,
 			Retrieval:     RetrievalAgentic,
 		},
 		Builtin: Builtin{Tools: []string{"configure", "grep", "search_files"}, Confirm: []string{"configure"}},
-		Web:     Web{SearXNGURL: "http://localhost:8889", MaxResults: 5, Render: RenderOff},
+		Web:     Web{SearXNGURL: "http://localhost:8889", MaxResults: 5, Render: RenderOff, TrustedSites: []string{}},
 		Chat:    Chat{MouseCopy: false}, // false in the file beats the default, true
 		MCP: MCP{Servers: []MCPServer{
 			{
@@ -232,6 +233,12 @@ func TestLoadErrors(t *testing.T) {
 		{"tools_threshold nan", "[router]\ntools_threshold = nan", "router.tools_threshold"},
 		{"otlp not loopback", "[observability]\notlp_endpoint = \"http://collector.example.com:4318\"", "observability.otlp_endpoint"},
 		{"otlp all interfaces", "[observability]\notlp_endpoint = \"http://0.0.0.0:4318\"", "observability.otlp_endpoint"},
+		{"prometheus all interfaces", "[observability]\nprometheus = \"0.0.0.0:9464\"", "observability.prometheus"},
+		{"prometheus lan", "[observability]\nprometheus = \"192.168.1.5:9464\"", "observability.prometheus"},
+		{"prometheus hostname", "[observability]\nprometheus = \"example.com:9464\"", "observability.prometheus"},
+		{"prometheus no port", "[observability]\nprometheus = \"127.0.0.1\"", "host:port"},
+		{"prometheus big port", "[observability]\nprometheus = \"127.0.0.1:70000\"", "1 to 65535"},
+		{"prometheus no host", "[observability]\nprometheus = \":9464\"", "name the host"},
 		{"interval bad", "[observability]\nmetrics_interval = \"often\"", "observability.metrics_interval"},
 		{"interval zero", "[observability]\nmetrics_interval = \"0s\"", "observability.metrics_interval"},
 		{"log level unknown", "[log]\nlevel = \"loud\"", `log.level "loud" is unknown`},
@@ -314,8 +321,8 @@ func TestBuiltinToolsDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if !reflect.DeepEqual(cfg.Builtin.Tools, builtinTools) || len(builtinTools) != 11 {
-		t.Errorf("default builtin.tools = %q, want all eleven: %q", cfg.Builtin.Tools, builtinTools)
+	if !reflect.DeepEqual(cfg.Builtin.Tools, builtinTools) || len(builtinTools) != 17 {
+		t.Errorf("default builtin.tools = %q, want all seventeen: %q", cfg.Builtin.Tools, builtinTools)
 	}
 	cfg, err = Load(writeConfig(t, "[builtin]\ntools = []\nconfirm = []"))
 	if err != nil {
@@ -338,16 +345,16 @@ func TestWebDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	want := Web{SearXNGURL: "http://127.0.0.1:8888", MaxResults: 8, Render: RenderAuto}
-	if cfg.Web != want {
+	want := Web{SearXNGURL: "http://127.0.0.1:8888", MaxResults: 8, Render: RenderAuto, TrustedSites: []string{}}
+	if !reflect.DeepEqual(cfg.Web, want) {
 		t.Errorf("default web = %+v, want %+v", cfg.Web, want)
 	}
 	cfg, err = Load(writeConfig(t, "[web]\nsearxng_url = \"\"\nmax_results = 20"))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	want = Web{SearXNGURL: "", MaxResults: 20, Render: RenderAuto}
-	if cfg.Web != want {
+	want = Web{SearXNGURL: "", MaxResults: 20, Render: RenderAuto, TrustedSites: []string{}}
+	if !reflect.DeepEqual(cfg.Web, want) {
 		t.Errorf("web = %+v, want %+v", cfg.Web, want)
 	}
 }
@@ -464,8 +471,8 @@ func TestTemplateCommentedBlocks(t *testing.T) {
 		t.Errorf("samples hold %d servers, %d agents, %d commands and %d model sets, want 3, 1, 29 and 3",
 			len(cfg.MCP.Servers), len(cfg.A2A.Agents), len(cfg.Commands), len(cfg.Models.Sets))
 	}
-	if len(cfg.Connectors) != 3 {
-		t.Errorf("samples hold %d connector tables, want 3, searxng, obsidian and google", len(cfg.Connectors))
+	if len(cfg.Connectors) != 4 {
+		t.Errorf("samples hold %d connector tables, want 4, searxng, obsidian, google and whisper", len(cfg.Connectors))
 	}
 }
 
@@ -627,5 +634,55 @@ func TestRetrievalDefault(t *testing.T) {
 	}
 	if cfg.Index.Retrieval != RetrievalAuto {
 		t.Errorf("index.retrieval = %q, want %q", cfg.Index.Retrieval, RetrievalAuto)
+	}
+}
+
+// TestPrometheusKey checks the loopback addresses [observability]
+// prometheus takes; TestLoadErrors has the ones it refuses.
+func TestPrometheusKey(t *testing.T) {
+	for _, addr := range []string{"", "127.0.0.1:9464", "[::1]:9464", "localhost:9464"} {
+		cfg, err := Load(writeConfig(t, "[observability]\nprometheus = \""+addr+"\""))
+		if err != nil {
+			t.Errorf("prometheus = %q: %v", addr, err)
+			continue
+		}
+		if cfg.Observability.Prometheus != addr {
+			t.Errorf("prometheus = %q loaded as %q", addr, cfg.Observability.Prometheus)
+		}
+	}
+}
+
+// TestTemplatePrometheusLine checks that the template's commented-out
+// prometheus line loads once a user takes away its "# ", and turns /metrics
+// on at the address the comment above it names.
+func TestTemplatePrometheusLine(t *testing.T) {
+	const line = `# prometheus       = "127.0.0.1:9464"`
+	if !strings.Contains(Template(), line) {
+		t.Fatalf("the template lacks the line %q", line)
+	}
+	on := strings.Replace(Template(), line, strings.TrimPrefix(line, "# "), 1)
+	cfg, err := Load(writeConfig(t, on))
+	if err != nil {
+		t.Fatalf("Load with the line uncommented: %v", err)
+	}
+	if cfg.Observability.Prometheus != "127.0.0.1:9464" {
+		t.Errorf("prometheus = %q, want 127.0.0.1:9464", cfg.Observability.Prometheus)
+	}
+}
+
+// TestCheckTrustedSite checks the [web] trusted_sites rule: bare host
+// names pass; anything with a scheme, path, port, wildcard or capital
+// letter fails, and so do addresses and names for this machine.
+func TestCheckTrustedSite(t *testing.T) {
+	for _, ok := range []string{"raw.githubusercontent.com", "arxiv.org", "docs.python-guide.org", "a.b.c.example"} {
+		if err := CheckTrustedSite(ok); err != nil {
+			t.Errorf("CheckTrustedSite(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "github", "https://github.com", "github.com/x", "github.com:443", "*.github.com",
+		"GitHub.com", "1.2.3.4", "printer.local", "app.localhost", "-x.com", "x..com"} {
+		if err := CheckTrustedSite(bad); err == nil {
+			t.Errorf("CheckTrustedSite(%q) = nil, want an error", bad)
+		}
 	}
 }

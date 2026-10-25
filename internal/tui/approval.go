@@ -8,6 +8,7 @@ package tui
 import (
 	"slices"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
@@ -58,6 +59,10 @@ func (m *Model) closeApproval(choice rpc.Choice) {
 	// send never waits.
 	m.approval.reply <- choice
 	m.approval = nil
+	// The wait for the user isn't merud being quiet.
+	if len(m.turns) > 0 {
+		m.turns[len(m.turns)-1].lastNews = time.Now()
+	}
 	m.input.Focus()
 	m.refresh()
 }
@@ -120,22 +125,34 @@ func draftOf(a rpc.Approval) string {
 	return "Run " + a.Name + " with these arguments instead:\n\n" + strings.Join(args, "\n")
 }
 
-// choiceKey returns the key that picks c: the first letter of its name,
-// "o", "s" or "d".
+// choiceKey returns the key that picks c: "o" once, "s" this session,
+// "w" this website for the session, "a" always this website, "d" deny.
+// The two website choices can't take the first letter of their names,
+// which "session" already has.
 func choiceKey(c rpc.Choice) string {
-	if c == "" {
+	switch c {
+	case "":
 		return ""
+	case rpc.ChoiceSite:
+		return "w"
+	case rpc.ChoiceSiteAlways:
+		return "a"
 	}
 	return string(c)[:1]
 }
 
-// choiceLabel returns the words the box shows for c.
-func choiceLabel(c rpc.Choice) string {
+// choiceLabel returns the words the box shows for c. site is the host the
+// call reaches, which the two website choices name.
+func choiceLabel(c rpc.Choice, site string) string {
 	switch c {
 	case rpc.ChoiceOnce:
 		return "once"
 	case rpc.ChoiceSession:
 		return "this session"
+	case rpc.ChoiceSite:
+		return site + " this session"
+	case rpc.ChoiceSiteAlways:
+		return site + " always"
 	case rpc.ChoiceDeny:
 		return "deny"
 	}
@@ -171,7 +188,7 @@ func (m *Model) approvalBoxView(width int) string {
 
 	var choices []string
 	for i, c := range a.ask.Choices {
-		text := choiceKey(c) + " " + choiceLabel(c)
+		text := choiceKey(c) + " " + choiceLabel(c, a.ask.Site)
 		if i == a.selected {
 			choices = append(choices, m.style.choiceOn.Render("["+text+"]"))
 		} else {

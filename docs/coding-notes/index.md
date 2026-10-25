@@ -1,7 +1,7 @@
 # index
 
 **Code:** `internal/index/` (`doc.go`, `indexer.go`, `skip.go`, `ignore.go`,
-`chunk.go`, `markdown.go`, `code.go`, `html.go`, `pdf.go`, `watch.go`,
+`chunk.go`, `markdown.go`, `code.go`, `html.go`, `pdf.go`, `image.go`, `watch.go`,
 `memories.go`, `files.go`)
 **Milestone:** v0.2; the memory syncer and `files.go` v0.4
 **Architecture:** [Storage](../../ARCHITECTURE.md#storage), [Retrieval](../../ARCHITECTURE.md#retrieval)
@@ -102,8 +102,12 @@ never store two versions of one file in the wrong order:
 An empty file gets a document row and no chunks; the store accepts a
 `ReplaceDocument` with zero chunks, so the next scan sees it as unchanged.
 
-**Re-embedding.** `Reembed` is `Scan` with the "unchanged" check in step 3
-turned off: it chunks and embeds every file again. merud calls it in place of
+**Re-embedding.** `Reembed` is `Scan` with a stricter "unchanged" check in
+step 3: an unchanged file counts as unchanged only when every one of its
+chunks has a vector (`store.Document`'s `Vectored`). Every other file gets
+chunked and embedded again. A file the new model has done keeps its vectors,
+so a re-embed stopped by a restart goes on from where it stopped instead of
+redoing the files it finished. merud calls it in place of
 `Scan` when `store.NeedsReembed` says some chunks have no vector, which happens
 after the embedding model or its vector size changes. The `force` flag travels
 from `scan` through `scanTree` and `indexFile` to `indexFileLocked`;
@@ -113,9 +117,11 @@ A file that can't be read or parsed counts as `Failed` and the scan moves on.
 An error from the engine or the store stops the scan, because Ollama being down
 would fail every file after it too.
 
-Each embedded text starts with the chunk's heading path. The third chunk of a
-long "Garden > Spring" section doesn't repeat the heading line, and the path keeps
-its vector about spring planting.
+Each chunk goes to `Embed` as `engine.Input{Title: heading path, Text: text}`
+(`embedInput`). The third chunk of a long "Garden > Spring" section doesn't
+repeat the heading line, and the path keeps its vector about spring planting.
+The engine puts the title where the embedding model wants it: before the text
+with a blank line between, or in the model's document prefix.
 
 ### The folder list can change
 
@@ -213,6 +219,32 @@ the HTML reading in `readHTML`, which `chunkHTML` shares with `HTMLText`.
 in [builtin](builtin.md), so a page from the web reads the way a file on disk
 does. A PDF with no text layer (a scan) fails the same way. PDF quality is an open
 question for v0.2.
+
+### image.go
+
+With images on, `Indexer.kindOf` gives a `.png`, `.jpg`, `.jpeg`, `.gif` or
+`.webp` file the kind `image`; the package-level `kindOf` still calls it media.
+`merud` turns images on with `[index] images` only when the embedding model
+takes them, and passes the answer to `New` in `config.Index.Images`, so the
+indexer never looks the model up.
+
+`indexFileLocked` gives an image its own path:
+
+1. The cap is `MaxImageBytes`, 20 MiB, not `max_file_mb`, which is set for text.
+2. `IsImageData` asks `http.DetectContentType` about the first 512 bytes, so a
+   text file named `.png` fails. The NUL-byte test that keeps binaries out
+   skips images, which are binary by nature.
+3. `embedImage` sends the bytes as `engine.Input{Image: data}`, one image per
+   call. A 400 from Ollama comes back as `errImageRefused`, and that file
+   counts as failed; any other error stops the scan, as it would for text.
+4. `imageChunk` makes the one chunk: the file name as the heading, and "Image
+   shot.png in /Users/you/Documents/img" as the text, so keyword search can
+   find a picture by its name.
+
+`IsImageName`, `IsImageData` and `MaxImageBytes` are exported because
+`builtin` checks an attached image with the same rules. The file tools still
+see an image as media: `contentReason` says so before anything else, since
+`read_file` reads text.
 
 ### watch.go
 

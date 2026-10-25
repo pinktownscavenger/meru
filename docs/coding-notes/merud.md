@@ -1,6 +1,6 @@
 # merud and meru
 
-**Code:** `cmd/merud/` (`main.go`, `runtime.go`, `ollama.go`, `index.go`, `backends.go`, `tools.go`, `connectors.go`, `memory.go`, `skills.go`, `sessions.go`, `history.go`, `attach.go`, `about.go`), `cmd/meru/` (`main.go`, `index.go`, `approve.go`, `tools.go`, `log.go`, `usage.go`, `run.go`, `look.go`, `setup.go`, `mcp.go`, `adopt.go`, `connector.go`, `probe.go`, `user.go`, `memory.go`, `skills.go`, `check.go`, `checkfile.go`)
+**Code:** `cmd/merud/` (`main.go`, `metrics.go`, `runtime.go`, `ollama.go`, `index.go`, `backends.go`, `tools.go`, `connectors.go`, `memory.go`, `skills.go`, `sessions.go`, `history.go`, `attach.go`, `about.go`), `cmd/meru/` (`main.go`, `index.go`, `approve.go`, `tools.go`, `log.go`, `usage.go`, `run.go`, `look.go`, `setup.go`, `mcp.go`, `adopt.go`, `connector.go`, `probe.go`, `user.go`, `memory.go`, `skills.go`, `check.go`, `checkfile.go`)
 **Milestone:** v0.1; the store, the indexer and `meru index` in v0.2; the approval prompt, `meru tools`, `meru log`, `meru setup`, `meru mcp` and `meru usage` in v0.3; the memory folder and its ops, `meru setup user`, `meru memory`, memory recall, `meru skills`, the session replay and the summarizer in v0.4; `meru check` in v0.4
 **Architecture:** [The shape: daemon + thin client](../../ARCHITECTURE.md#the-shape-daemon--thin-client), [Model tiers](../../ARCHITECTURE.md#model-tiers)
 
@@ -24,11 +24,11 @@ flowchart TB
         L --> G["open merud.log at [log] level"]
         G --> O["obs.Setup"]
         O --> E["build engine"]
-        E --> V["check Ollama version ≥ 0.12.11"]
+        E --> V["check Ollama version ≥ 0.40.5"]
         V --> S["rpc.Listen: claim the socket"]
         S --> W["warm fast and embed"]
         W --> D["embed a probe text: vector size"]
-        D --> ST["store.Open(meru.db, embed model, size)"]
+        D --> ST["store.Open(meru.db, model, size, prefix fingerprint)"]
         ST --> RT["ReplayTurns: rebuild turns if empty"]
         RT --> IX["index.New"]
         IX --> MO["memory.Open(~/.meru/memory)"]
@@ -85,9 +85,12 @@ rpc server answers itself, succeeds as soon as the socket opens.
 
 After warming, `serve` opens the store with `openStore`. The store needs the
 embedding model's vector size, and `embedDims` learns it by embedding one
-short probe text, so config never holds a number that could go stale. When
-the model or the size changed since the last run, the store drops the old
-vectors (`store.NeedsReembed` then reports true).
+short probe text, so config never holds a number that could go stale. The
+configured query and document prefixes add a fingerprint to the store options.
+When the model, a prefix or the size changed since the last run, the store
+drops the old vectors (`store.NeedsReembed` then reports true). A legacy database
+without a prefix fingerprint keeps its vectors when the model and size match;
+the store records the current fingerprint.
 
 Then seven jobs run side by side in an **errgroup** from
 `golang.org/x/sync`, the server first and the rest once `merud` is ready:
@@ -131,6 +134,19 @@ Ollama never loads the answer model twice. See the agent's coding note,
 and `index_status` to the index service, `tools` and `log` to the tool service,
 the three memory ops to the memory service, the three skill ops to the skill
 service, and `usage` to `handleUsage`. The rpc server answers `ping` itself.
+`handleUsage` answers kind `detail` with one `usage_detail` event from
+`store.UsageDetail`, and fills in the `/metrics` address, which `services`
+keeps in its `metrics` field.
+
+**The `/metrics` page.** When `[observability] prometheus` is set, `serve`
+claims the port right after the socket, with `listenMetrics`, so a taken port
+stops `merud` at once with the key to change. `serveMetrics` (metrics.go) then
+adds two functions to the errgroup: one runs `http.Server.Serve`, and one waits
+for `gctx` to end and calls `Shutdown`, which makes `Serve` return
+`http.ErrServerClosed`. That error means "asked to stop", so the first
+function returns `nil`. `ReadHeaderTimeout` stops a client that sends its
+headers slowly from holding a connection. `obs.MetricsHandler` does the rest.
+More in [go-basics/http-servers.md](go-basics/http-servers.md).
 
 **Memory.** Before the tools, `serve` opens the memory folder with
 `memory.Open(<home>/memory)`, which creates the six default kind folders. One
@@ -181,11 +197,6 @@ and how many `[index]` folders it indexes.
 
 ### merud: runtime.go
 
-`versionAtLeast` compares versions number by number, so `0.12.11` beats
-`0.9.99`, which a plain string comparison gets wrong. `checkOllama` in
-`ollama.go` uses it to refuse an Ollama older than 0.12.11, the first release
-that reports log probabilities.
-
 `warm` sends a one-token request to the fast model and one embedding
 request, and logs `warmed` with the time each took. The router needs the
 first on every question, and `openStore` needs the second. At debug level the
@@ -217,8 +228,10 @@ Ollama").
 | `answer(req, emit)` | while Ollama fails: Ollama's row for `connectors`, no servers for `mcp_status`, and `notReady`'s error for the rest |
 
 `checkOllama` returns the version and a sentence: "Ollama isn't running at
-http://127.0.0.1:11434.", "Ollama 0.12.0 is too old; Meru needs 0.12.11 or
-later.", or "" when all is well. A down Ollama gives every request the error
+http://127.0.0.1:11434.", "Ollama 0.34.0 is too old for Meru's search model.
+Update it from ollama.com/download.", or "" when all is well. It compares the
+version with `config.OllamaAtLeast`, the same check `meru setup` and the Mac
+installer make, so all three say the same sentence (see the config note). A down Ollama gives every request the error
 "Ollama isn't running, so Meru can't answer yet."; any other failure gives
 "Meru can't answer yet: " and the sentence.
 
@@ -633,8 +646,8 @@ which cancels any render still running and waits for it to stop.
 
 This file joins the connector supervisors (see [connectors](connectors.md)) to
 the rest of `merud`. `connectorSet` holds one `*connectors.Supervisor` per MCP
-connector, Obsidian over stdio and Google over HTTP, in manifest order, and `web`, the `*connectors.Container` for
-SearXNG. `newConnectorSet` loads the manifests, makes an `Installer` over
+connector, Obsidian over stdio and Google over HTTP, in manifest order; `web`, the `*connectors.Container` for
+SearXNG; and `speech`, the `*connectors.Service` for whisper, speech to text. `newConnectorSet` loads the manifests, makes an `Installer` over
 `~/.meru` and the home folder, and builds each supervisor. It hands the
 container two functions: `checkSearXNG`, which wraps `catalog.CheckSearXNG`
 and turns a refused connection into `connectors.ErrNothingListens`, and a
@@ -646,7 +659,7 @@ for sessions.
 
 | Method | What it does |
 | --- | --- |
-| `configure(cfg, sec)` | hands each supervisor its `[connectors.<id>]` table and the secrets, with `byHand` true when `[[mcp.servers]]` has an entry of the same name, then calls `configureWeb` |
+| `configure(cfg, sec)` | hands each supervisor its `[connectors.<id>]` table and the secrets, with `byHand` true when `[[mcp.servers]]` has an entry of the same name, then calls `configureWeb`, then hands `speech` its table with `cfg.SpeechModel()` as the `model` default |
 | `configureWeb(cfg)` | hands the SearXNG container its table, `[web] searxng_url`, and whether `[builtin] tools` lists `web_search`; `reloadBuiltin` calls it too |
 | `webOK()` | whether web search works now, with the sentence; the built-in tools' `UseWebCheck` |
 | `serverConfigs()` | one managed pool entry per connector that isn't off or set up by hand: its ID as the name, its tool lists from the supervisor's `Lists` (the manifest's, or those its table sets), the supervisor as `Spawn` |
@@ -690,7 +703,7 @@ refused change leaves both files as they were.
 
 `handleConnectorFix` answers `connector_fix`. It reads the connector's row
 with `connectorSet.row`, which asks the right supervisor: the stdio or http
-one, the SearXNG `Container`, or `ollamaWatch`. A row that needs fields, or
+one, the SearXNG `Container`, the whisper `Service`, or `ollamaWatch`. A row that needs fields, or
 that is off or set up by hand, goes straight back: the client asks the user
 from it. Any other row gets `recheck`, which calls the supervisor's or the
 container's `Recheck`, or, for Ollama, `ollamaWatch.recheck`, which pokes the
@@ -777,6 +790,22 @@ writers never read the same file and each replace it with their own change.
 `reloadA2A` builds a new A2A client and swaps it in with `dispatcher.Replace`, as
 `reloadMCP` does for the pool; `started` now holds config as `merud` last loaded
 each part, and the router's list of what is connected follows every reload.
+
+### merud: sites.go
+
+The websites `web_fetch` reads without asking, `[web] trusted_sites`. At startup,
+tools.go hands the list to the built-ins with `UseTrustedSites`, and hands them
+`saveTrustedSite` with `UseSiteSaver`. When the user picks "Always this website",
+`dispatch` calls the built-ins' `TrustSite`, which calls `saveTrustedSite`. It
+checks the host, takes the config lock (`bt.EditConfig`), loads the file, skips a
+host already listed, and calls `writeTrustedSites`. That writes the list through
+`catalog.SetTableLists`, the checked edit every list change uses, which keeps the
+file's comments and replaces it only when the result loads with the new list.
+Then it gives the built-ins the new list.
+
+`handleTrustedSites` answers `trusted_sites` from `config.toml`, and
+`handleTrustedSiteRemove` takes one host out under the same lock. A session that
+trusted the host for itself keeps that trust until it ends.
 
 ### merud: folders.go
 
@@ -887,6 +916,13 @@ model set in use, the first `[[models.sets]]` entry whose models match the ones
 `handleModelSet` follows the same rule for a model picked in Settings. The service is a pointer, `*modelService`, because it holds a
 mutex and the name of the set in use, and a copy of either would be a bug.
 
+`visionSets` lists the sets, in config order, whose `main` model lists both
+`vision` and `tools` in Ollama's `/api/show` answer, which the engine caches.
+`run` passes it to the agent with `a.UseVisionSets(svc.models.visionSets)`, so an
+answer model that can't look at pictures can name one that can (see
+[agent](agent.md), "Looking at a picture in the folders"). A set whose model
+Ollama hasn't pulled has no capabilities and is never suggested.
+
 `modelService.handleModels`
 answers `models`, and `info` gathers the reply: the profile, the fast and embed
 models from config, and the answer model from the agent's `Main`, since a
@@ -967,6 +1003,16 @@ set names that Ollama doesn't list. It doesn't stop `merud`.
 
 `handler` takes one `services` value, which holds each service, in place of a
 long list of parameters, and sends each op to its service.
+
+### meru: image.go
+
+`-image <file>` sends a picture with one question, or with `run --json`.
+`attachImage` sends `attach_file` with the file's full path, as `meru chat`'s
+`/attach` does, so `merud` applies the same rules and copies the file into the
+uploads folder; it fails unless the reply's kind is `image`. `withImage` puts the
+copy's path in the request's `Images`. In `main.go`, `withAttached` runs the
+attach only on the two commands that send a question, so `meru -image x.png ping`
+copies nothing.
 
 ### meru: main.go
 
@@ -1063,6 +1109,10 @@ Meru wants to run mail.send (mcp) with:
 Run mail.send? [o]nce  [s]ession  [d]eny:
 ```
 
+For a `web_fetch` of an unknown URL, the menu names the host:
+`[o]nce  [w] go.dev this session  [a] go.dev always  [d]eny`. The website
+choices take `w` and `a`, since `s` already means the session.
+
 - It shows only the choices `merud` offers; the `configure` tool offers once and
   deny. A key (`o`) or the whole word (`once`), in any case, picks a choice. An
   empty or unknown answer asks again, and end of input denies.
@@ -1106,6 +1156,15 @@ from the row.
 so `meru chat` shows them the same way. `rpc.ArgvLine` joins an argv with spaces
 and quotes an element that holds a space or a quote, for display only.
 
+### meru: transcribe.go
+
+`meru transcribe recording.wav` sends the file through the `transcribe` op
+and prints the words, or "(Meru heard no words.)". It checks the file's size
+with `os.Stat` before reading it, and refuses one over 3 MiB, so a film
+picked by mistake isn't read into memory; `merud` checks the rest. `merud`'s
+side lives in `cmd/merud/speech.go`, which the [speech](speech.md) note
+covers.
+
 ### meru: usage.go
 
 `meru usage` sends `OpUsage` and prints what `merud` counted, one column per
@@ -1114,7 +1173,7 @@ window of time:
 ```text
                   1h   today     week   month     30d     all
 sessions           1       2        5      12      14      30
-questions          4       9       31      88      97     212
+tasks              4       9       31      88      97     212
 tokens in        18k     41k     150k    420k    468k    1.4M
 tokens out      2.1k    5.3k      19k     61k     66k    180k
 active time   2m 14s  5m 01s  20m 10s  1h 01m  1h 07m  3h 05m
@@ -1245,6 +1304,9 @@ type console struct {
   progress bar. More in [go-basics/os-exec.md](go-basics/os-exec.md).
 - `ollamaVersion` makes one `GET /api/version` with `net/http`. The client may
   not import the engine, and one plain call is all the check needs.
+  `waitForOllama` compares the answer with `config.OllamaAtLeast`; an Ollama
+  older than 0.40.5 gets `config.OllamaTooOld`'s sentence and a wait for Enter,
+  as a stopped Ollama does.
 - `answers` is `urlAnswers` from `probe.go`: does anything accept a TCP
   connection at a server's URL within a second?
 - `searxng` is `catalog.CheckSearXNG`: does SearXNG answer JSON at
@@ -1583,6 +1645,12 @@ web     0/1
   session ID lets questions with the same `"session"` value continue one
   session. The first of a group sends no session, and the `session` event
   gives the ID the rest send.
+- A question with an `"image"` sends a picture. `checkImage` turns a leading
+  `~/` into the home folder and asks `merud` to copy the file with
+  `attachImage`, the function behind `meru -image`. `askCheck` then puts the
+  copy's path on the request with `withImage`. When `merud` refuses the file, or
+  it isn't there, `runChecks` records that question as a FAIL with the reason
+  and goes on to the next, so one moved picture doesn't stop a long run.
 - Nobody watches a check, so the `ApproveFunc` given to `rpc.Do` denies every
   call and notes `approval denied: <tool>`. A refused call reaches the turn's
   `Tools` from its `tool_call` event but stays out of `Ran`, since its
@@ -1654,6 +1722,49 @@ web     0/1
   it. `bench/` is in `.gitignore`: the tasks quote the owner's own mail and
   files.
 
+### merud: jobs.go
+
+`newJobService` builds the scheduler from `[[jobs]]` and `store.LastJobRuns`, and
+`run` starts it in the errgroup beside the server. `jobService.run` runs one job:
+it makes sure the Jobs folder is in the chat folder list, under the history
+service's lock, opens a `meru.job` span, and runs the action.
+
+- `runPrompt` adds a line that says how late the run is when it is more than two
+  minutes late, and calls `agent.Handle` with source `job`, the job's name and
+  skill. It collects the answer's tokens for `output`, and reads the outcome
+  from the `done` event, or "cancelled" or "error".
+- `runCommand` runs no model. It opens a session in the Jobs folder with
+  `transcript.New`, writes a user line "Run cmd.<name>", dispatches the command
+  with caller `meru` and the job's `args` (`commandArgs` sends an `int`
+  parameter as a number), writes the output, cut to 4,000 characters, as the
+  answer, and writes the turns row the agent would.
+
+Both pass `allowFor(j)` as the approver: it says "once" to a call whose tool the
+job's `allow` names and "deny" to any other. `dispatch` asks it only about calls
+that ask once; one that asks every time stays declined in a job.
+
+`writeOutput` runs after an ok run with `output` set. It fills in `{date}`,
+`{time}` and `{job}` with `strings.NewReplacer`, and dispatches one `write_file`
+call in the run's session, with `overwrite` and an approver that says yes, since
+the user asked for the file when they set `output`. A write that fails turns the
+run's outcome to "error". The run then records `meru.scheduler.job_runs` and, for
+a scheduled run, `meru.scheduler.lateness`, and logs one `job ran` line with no
+prompt or answer text. `handleJobs`, `handleJobRun` and `handleJobCancel` answer
+the three ops; Run now waits up to a second for the run to show as running.
+
+`handleJobSet` and `handleJobRemove` change `config.toml`. Each runs under
+`editConfig`, the lock every `config.toml` write in `merud` takes, calls
+`catalog.SetJob` or `catalog.RemoveJob`, then `reload`, which loads the file
+again and hands the jobs to the scheduler, so a change takes effect without a
+restart. `jobOf` and `specOf` turn the socket's `JobSpec` into a `config.Job`
+and back. A dry run goes to `checkJob`, which puts the job into a copy of the
+loaded config, runs `config.CheckJobs` on it, and replies with the job's
+schedule in words and its next run. `chats.go` calls `jobsHold` before it
+renames or removes a chat folder: the Jobs folder stays while `config.toml`
+holds a job, since the job's next run would bring it back. `add` saves a new job
+the same way, for the built-in `schedule_job`; `main.go` hands it over with
+`tools.bt.UseJobs(jobSvc.add)` once the job service exists.
+
 ## Go ideas used here
 
 - **`signal.NotifyContext`** — a context that ends on a signal. More in
@@ -1685,8 +1796,9 @@ go run ./cmd/meru index -status
 
 `index_test.go` runs `merud` over a fake engine with a notes folder: a
 question gets its answer while the startup scan waits inside `Embed`, a new
-vector size makes the next start embed every file again, and the index ops
-answer, refuse a folder outside `[index]`, and explain an empty config.
+vector size or changed prefix makes the next start embed every file again, and
+the index ops answer, refuse a folder outside `[index]`, and explain an empty
+config.
 
 `memory_test.go` drives the memory ops over the socket: add, list, the counts
 in the index status, the profile and the recalled project in the next
@@ -1739,6 +1851,20 @@ and `expandHome`.
 - **Folders come from config only.** `meru index <folder>` rescans a folder
   you already listed; it can't add one. One place decides what `merud` may
   read.
+
+### merud: window.go
+
+`windowFitter` returns the function that sizes the answer model's context
+window. It asks the engine's `Details` for the model, passes the answer to
+`engine.FitWindow` with an eighth of the memory `memoryGB` reads
+(`windowMemoryShare`) and `[ollama] context_length` as the fallback, sets the
+result with `SetWindow`, and logs it at info as `answer model window`. `run`
+calls it for the answer model before `StartWarm`, so the model loads once with
+its window, and hands it to the model service, whose `switchMain` calls it
+before it loads a new answer model. It returns nil for an engine that isn't an
+`OllamaEngine`, and for `context_length = 0`, which leaves the windows to
+Ollama. `run` also gives the agent the engine's `Window`, so the agent's check
+on a turn's prompt uses the same number.
 
 ### merud: machine.go
 

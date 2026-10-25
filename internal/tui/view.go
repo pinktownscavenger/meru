@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/glamour"
@@ -20,6 +21,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/aarora79/meru/internal/about"
 	"github.com/aarora79/meru/internal/rpc"
 )
 
@@ -36,7 +38,7 @@ func (m Model) View() string {
 	helpLine := m.helpView(m.shortHelp())
 	switch {
 	case m.approval != nil:
-		helpLine = m.helpView(newApprovalKeys(m.approval.ask.Choices, !m.approval.save))
+		helpLine = m.helpView(newApprovalKeys(m.approval.ask.Choices, m.approval.ask.Site, !m.approval.save))
 	case m.boxOpen() && m.notice == "":
 		helpLine = m.helpView(m.boxKeys())
 	case m.notice != "":
@@ -65,6 +67,10 @@ func (m Model) View() string {
 		pane = m.foldersBoxView(m.width, h)
 	case m.skillsBox != nil:
 		pane = m.skillsBoxView(m.width, h)
+	case m.sitesBox != nil:
+		pane = m.sitesBoxView(m.width, h)
+	case m.jobsBox != nil:
+		pane = m.jobsBoxView(m.width, h)
 	case m.logBox != nil:
 		pane = m.logBoxView(m.width, h)
 	case m.aboutBox != nil:
@@ -169,6 +175,11 @@ func (m Model) header() string {
 			right = withUsage
 		}
 	}
+	// The website goes last on the right, and only when the full details
+	// still fit beside it: it is the first thing to go on a narrow terminal.
+	if withSite := right + "  " + m.siteLink(); fits(details, withSite) {
+		right = withSite
+	}
 	if !fits(details, right) {
 		details = m.details(false)
 	}
@@ -193,6 +204,22 @@ func (m Model) header() string {
 	}
 	gap := max(m.width-lipgloss.Width(left)-lipgloss.Width(right), 1)
 	return ansi.Truncate(left+strings.Repeat(" ", gap)+right, m.width, "")
+}
+
+// siteDisplay is how the header writes Meru's website: short, with no
+// scheme, as people say it.
+const siteDisplay = "aarora79.github.io/meru"
+
+// siteLink returns the website for the header, dim. When the terminal
+// draws links, it is an OSC 8 link to about.SiteURL, which a click opens:
+// the terminal opens it itself, or, with [chat] mouse_copy on, the chat
+// does (linkUnder).
+func (m Model) siteLink() string {
+	text := m.style.dim.Render(siteDisplay)
+	if m.look.links {
+		return rpc.Hyperlink(about.SiteURL, text)
+	}
+	return text
 }
 
 // details joins the header's setup details with " · ": profile, model, the
@@ -322,6 +349,9 @@ func (m *Model) renderTurn(t *exchange) string {
 		// would cost more than the model takes to write one.
 		text := ansi.Wrap(t.answer, width-1, "")
 		lines = append(lines, m.style.raw.Render(text+m.style.cursor.Render(streamCursor)))
+		if q := quietLine(t, time.Now()); q != "" && !asking {
+			lines = append(lines, m.style.raw.Render(m.spin.View()+m.style.dim.Render(ansi.Wrap(q, width-2, ""))))
+		}
 	case t.answer != "":
 		lines = append(lines, m.renderedAnswer(t))
 	}
@@ -337,6 +367,9 @@ func (m *Model) renderTurn(t *exchange) string {
 		if s := statsLine(t); s != "" {
 			lines = append(lines, m.style.raw.Render(m.style.dim.Render(ansi.Wrap(s, width, ""))))
 		}
+		if stoppedShort(t) && t == &m.turns[len(m.turns)-1] {
+			lines = append(lines, m.style.raw.Render(m.style.notice.Render(ansi.Wrap(continueHint, width, ""))))
+		}
 	case stateStopped:
 		lines = append(lines, m.style.raw.Render(m.style.dim.Render("stopped")))
 	case stateFailed:
@@ -346,6 +379,27 @@ func (m *Model) renderTurn(t *exchange) string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+// quietSeconds is how long merud may send nothing, once an answer has
+// started, before the turn says how long it has been quiet. Tokens arrive
+// many times a second, and a tool call rarely takes this long.
+const quietSeconds = 5
+
+// quietLine returns the line under a streaming answer once merud has sent
+// nothing for quietSeconds, such as "still working · 52 s; …", and ""
+// before. After the first words a model can go quiet for minutes writing a
+// long tool call, such as a whole page for write_file, which Ollama sends
+// only when it's done; without the line the screen looks stuck.
+func quietLine(t *exchange, now time.Time) string {
+	quiet := int(now.Sub(t.lastNews).Seconds())
+	if t.lastNews.IsZero() || quiet < quietSeconds {
+		return ""
+	}
+	return fmt.Sprintf("still working · %d s; a long tool call, such as a file, shows when it's done", quiet)
+}
+
+// continueHint follows the newest answer when it stopped short.
+const continueHint = "This answer stopped short. /continue picks up where it stopped."
 
 // toolText writes one tool call as the turn shows it:
 //
@@ -375,12 +429,12 @@ func millis(ms int64) string {
 	return seconds(ms)
 }
 
-// sourcesBlock draws the files a finished answer cites, dim, under the
-// answer: a "Sources" line, then one numbered line per file, as the answer
-// numbers them. It returns "" when there are none to show (see rpc.Cited).
+// sourcesBlock draws the files and web pages a finished answer cites, dim,
+// under the answer: a "Sources" line, then one numbered line per source, as
+// the answer numbers them. It returns "" when there are none to show (see rpc.Cited).
 // Each line wraps to width, so a long path can't push the screen out of
 // shape. When links are on, every screen line of a source links to its
-// file: wrapping first and linking each piece keeps a link from spanning a
+// file or page: wrapping first and linking each piece keeps a link from spanning a
 // line break, which some terminals draw badly.
 func (m *Model) sourcesBlock(t *exchange, width int) string {
 	cited := rpc.Cited(t.answer, t.sources)
@@ -390,7 +444,7 @@ func (m *Model) sourcesBlock(t *exchange, width int) string {
 	lines := []string{"Sources"}
 	for _, c := range cited {
 		wrapped := ansi.Wrap(c.String(), width, "")
-		if url := rpc.FileURL(c.Path, m.home); m.look.links && url != "" {
+		if url := c.Link(m.home); m.look.links && url != "" {
 			parts := strings.Split(wrapped, "\n")
 			for i, p := range parts {
 				parts[i] = rpc.Hyperlink(url, p)
@@ -613,7 +667,11 @@ func docCount(ix *rpc.IndexStatus, sizes bool) string {
 		}
 		s += " (" + inside + ")"
 	}
-	if ix.Scanning {
+	switch {
+	case ix.Scanning && ix.Vectors < ix.Chunks:
+		// After a change of embedding model, merud re-embeds every file.
+		s += fmt.Sprintf(" · re-indexing %s of %s", rpc.ShortCount(int64(ix.Vectors)), rpc.ShortCount(int64(ix.Chunks)))
+	case ix.Scanning:
 		s += " · indexing"
 	}
 	return s

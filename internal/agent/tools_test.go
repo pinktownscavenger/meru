@@ -169,8 +169,8 @@ func TestToolsOfferedByRoute(t *testing.T) {
 		{"search offers datetime and about_meru", "search", everyRoute, []string{"datetime", "about_meru", "read_file"}, toolsNote + " " + fileToolsNote},
 		{"search offers the file tools", "search", all, []string{"read_file", "list_folder", "grep"}, fileToolsNote},
 		{"search with no file tools", "search", noFiles, nil, ""},
-		{"search offers commands that don't ask", "search", cmds, []string{"read_file", "cmd.git-log", "grep"}, fileToolsNote + " " + commandsNote},
-		{"search with commands and no file tools", "search", onlyCmds, []string{"cmd.git-log"}, commandsNote},
+		{"search offers commands that don't ask", "search", cmds, []string{"read_file", "cmd.git-log", "grep"}, toolsNote + " " + fileToolsNote},
+		{"search with commands and no file tools", "search", onlyCmds, []string{"cmd.git-log"}, toolsNote},
 		{"tools offers every command", "tools", cmds, []string{"notes.search", "read_file", "cmd.git-log", "cmd.git-push", "grep"}, toolsNote + " " + fileToolsNote},
 		{"tools offers all", "tools", all, []string{"notes.search", "read_file", "remember", "list_folder", "grep"}, toolsNote + " " + fileToolsNote},
 		{"search+tools offers all", "search+tools", all, []string{"notes.search", "read_file", "remember", "list_folder", "grep"}, toolsNote + " " + fileToolsNote},
@@ -192,7 +192,7 @@ func TestToolsOfferedByRoute(t *testing.T) {
 				t.Errorf("tools offered = %v, want %v", got, tt.want)
 			}
 			system := c.msgs[0].Content
-			for _, note := range []string{toolsNote, fileToolsNote, commandsNote} {
+			for _, note := range []string{toolsNote, fileToolsNote} {
 				want := strings.Contains(tt.note, note)
 				if has := strings.Contains(system, note); has != want {
 					t.Errorf("system prompt holds %q = %v, want %v", note, has, want)
@@ -636,5 +636,30 @@ func TestTurnConnectsMissingServersOnce(t *testing.T) {
 				t.Errorf("offered %v, want %v", offered, tt.wantOffered)
 			}
 		})
+	}
+}
+
+// TestJobHidesMeruChanges checks that a job's run isn't offered configure
+// or schedule_job, which change Meru itself, while a typed question on the
+// same route is.
+func TestJobHidesMeruChanges(t *testing.T) {
+	offered := func(req rpc.Request) []string {
+		tools := &fakeTools{specs: []engine.ToolSpec{spec("configure"), spec("schedule_job"), spec("remember")}}
+		eng := &fakeEngine{pieces: []string{"ok"}}
+		if _, err := run(context.Background(), toolsAgent(t, "tools", eng, tools), req); err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+		var names []string
+		for _, s := range eng.calls[0].tools {
+			names = append(names, s.Name)
+		}
+		slices.Sort(names)
+		return names
+	}
+	if got := offered(rpc.Request{Text: "note it"}); !slices.Equal(got, []string{"configure", "remember", "schedule_job"}) {
+		t.Errorf("a typed question was offered %v", got)
+	}
+	if got := offered(rpc.Request{Text: "note it", Source: rpc.SourceJob, Job: "brief"}); !slices.Equal(got, []string{"remember"}) {
+		t.Errorf("a job's run was offered %v, want only remember", got)
 	}
 }

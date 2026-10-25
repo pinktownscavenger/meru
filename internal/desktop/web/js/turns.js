@@ -19,7 +19,8 @@ import { renderMarkdown } from "./markdown.js";
 // text streams, and "" before that, when the "Working…" chip says enough.
 // A turn that failed or was stopped before it did either gets "".
 export function workLabel(t) {
-  const files = t.sources.length > 0;
+  // A web source came from a tool call, which steps already counts.
+  const files = t.sources.some((s) => !isWebSource(s));
   const tools = t.steps.length > 0;
   if (files && tools) return "Searched your files and used tools";
   if (files) return "Searched your files";
@@ -126,6 +127,33 @@ export function drawAll(t, h) {
   drawFooter(t, h);
 }
 
+// QUIET_SECONDS is how long merud may send nothing before the Working chip
+// says how long it has been quiet. Tokens arrive many times a second, and
+// a tool call or a page read rarely takes this long.
+const QUIET_SECONDS = 5;
+
+// workingText returns the Working chip's words for turn t, and its title:
+// "Working…" while news keeps coming, and "Still working · 52 s" once merud
+// has been quiet for QUIET_SECONDS or more.
+export function workingText(t, now = Date.now()) {
+  const quiet = Math.floor((now - (t.lastNews || now)) / 1000);
+  if (quiet < QUIET_SECONDS) return { text: "Working…", title: "" };
+  return {
+    text: "Still working · " + quiet + " s",
+    title: "Nothing new for " + quiet + " s. The model may be writing something long, such as a file, which shows when it's done.",
+  };
+}
+
+// tickWorking brings the running turn's Working chip up to date, without
+// redrawing the strip. The page calls it once a second.
+export function tickWorking(t) {
+  const chip = t.el && t.el.working;
+  if (!chip || !chip.isConnected) return;
+  const { text, title } = workingText(t);
+  chip.textContent = text;
+  chip.title = title;
+}
+
 // drawStrip draws the one-line work strip: what the route did, each tool
 // call's friendly label, and the Show steps toggle over the raw detail.
 export function drawStrip(t, h) {
@@ -146,8 +174,13 @@ export function drawStrip(t, h) {
     const chip = el("span", "waiting");
     chip.append(icon("ask", 13), document.createTextNode(" Waiting for you"));
     strip.append(chip);
-  } else if (t.state === "active" && !t.answer) {
-    strip.append(el("span", "working", "Working…"));
+  } else if (t.state === "active") {
+    // The chip stays while the turn runs, text or no text: after the first
+    // words, a model can go quiet for minutes writing a tool call, such as
+    // a whole page for write_file, which Ollama sends only when it's done.
+    t.el.working = el("span", "working", "");
+    strip.append(t.el.working);
+    tickWorking(t);
   }
   if (t.route || t.steps.length > 0) {
     const toggle = button(t.showSteps ? "Hide steps" : "Show steps", { className: "text-button toggle" });
@@ -215,7 +248,9 @@ export function drawApproval(t, h) {
 // arguments laid out to read, and the answers. A mail card offers Send,
 // Edit first and Don't send; any other card Allow once and Don't allow,
 // with Edit first between. Allow for this chat comes when merud offers
-// it. onChoice gets "once", "session", "deny" or "edit". A save's card,
+// it, and so do the two website choices, whose labels from the Bridge
+// name the host. onChoice gets "once", "session", "site", "site_always",
+// "deny" or "edit". A save's card,
 // which sits above the composer, uses it too.
 export function approvalCard(v, titleId, onChoice) {
   const card = el("div", "approval");
@@ -246,6 +281,11 @@ export function approvalCard(v, titleId, onChoice) {
   };
   if (offered.has("once")) add(mail ? "Send" : "Allow once", "once", "button ask");
   if (offered.has("session")) add("Allow for this chat", "session", "button secondary");
+  // The website choices: for web_fetch on an address nobody gave. The
+  // labels come from the Bridge with the host in them.
+  for (const c of v.choices) {
+    if (c.choice === "site" || c.choice === "site_always") add(c.label, c.choice, "button secondary");
+  }
   if (v.draft) add("Edit first", "edit", "button secondary");
   add(mail ? "Don't send" : "Don't allow", "deny", "button secondary");
   card.append(choices);
@@ -259,6 +299,10 @@ function answeredText(choice, label) {
       return "You allowed this once: " + label + ".";
     case "session":
       return "You allowed this for the rest of this chat: " + label + ".";
+    case "site":
+      return "You allowed this website for the rest of this chat: " + label + ".";
+    case "site_always":
+      return "You allowed this website from now on: " + label + ". Settings, Connections lists it.";
     case "ended":
       return "The question ended before you answered: " + label + ".";
     case "edit":
@@ -308,9 +352,11 @@ export function appendToken(t, text) {
 function outcomeText(outcome) {
   switch (outcome) {
     case "timeout":
-      return "This answer ran out of time.";
+      return "This answer ran out of time. Continue picks up where it stopped.";
     case "cut_off":
-      return "This answer hit the length limit and stops short.";
+      return "This answer hit the length limit and stops short. Continue picks up where it stopped.";
+    case "window_full":
+      return "Meru stopped reading partway: the prompt filled the model's context window. Continue picks up where it stopped.";
     case "gave_up":
       return "Meru stopped after too many tool rounds.";
   }
@@ -332,6 +378,45 @@ export function drawNotice(t) {
 // line, "3 sources", whose button opens a chip for each; a chip's click
 // opens the file. An answer that cites nothing gets no line. The side
 // panel still lists every file the prompt held.
+// isImageSource reports whether source s is an image: merud says so in
+// its kind, and a past chat, whose transcript keeps paths only, is told
+// by the file's ending.
+export function isImageSource(s) {
+  if (s.kind === "web") return false; // a page's path is its URL
+  return s.kind === "image" || /\.(png|jpe?g|gif|webp)$/i.test(s.path || "");
+}
+
+// isWebSource reports whether s is a web page, from web_search or
+// web_fetch, rather than a file.
+export function isWebSource(s) {
+  return s.kind === "web" && !!s.url;
+}
+
+// sourceIcon names the icon for source s: a globe, a picture or a file.
+export function sourceIcon(s) {
+  if (isWebSource(s)) return "globe";
+  return isImageSource(s) ? "image" : "file";
+}
+
+// sourceName is the short name a chip shows for s: a web page's host, such
+// as "go.dev", or a file's name.
+export function sourceName(s) {
+  if (isWebSource(s)) {
+    try {
+      return new URL(s.url).host.replace(/^www\./, "");
+    } catch {
+      return s.url;
+    }
+  }
+  return baseName(s.path);
+}
+
+// openSource opens s: a web page in the browser, a file in its app.
+export function openSource(s, h) {
+  if (isWebSource(s)) h.onOpenURL(s.url);
+  else h.onOpenSource(s.path);
+}
+
 export function drawSources(t, h) {
   const line = t.el.sources;
   line.replaceChildren();
@@ -352,21 +437,35 @@ export function drawSources(t, h) {
   line.append(toggle, list);
   for (const s of t.cited) {
     const li = el("li");
-    const chip = button("", { className: "chip", onClick: () => h.onOpenSource(s.path) });
-    chip.append(icon("file", 14), el("span", "chip-n", "[" + s.n + "]"), el("span", "", baseName(s.path)));
-    chip.title = "Open " + s.path;
-    chip.setAttribute("aria-label", "Open source " + s.n + ", " + s.path);
+    const chip = button("", { className: "chip", onClick: () => openSource(s, h) });
+    const mark = icon(sourceIcon(s), 14);
+    chip.append(mark, el("span", "chip-n", "[" + s.n + "]"), el("span", "", sourceName(s)));
+    // An image source swaps its icon for a preview once the Bridge makes
+    // one; thumb accepts only a data: URL of an image type.
+    if (isImageSource(s) && h.sourceThumb) {
+      h.sourceThumb(s.path).then((url) => {
+        if (url) mark.replaceWith(thumb({ thumb: url, name: baseName(s.path) }, "source-thumb"));
+      }, () => {});
+    }
+    // A web page's title, when it has one, says more than its host.
+    const what = isWebSource(s) ? (s.heading ? s.heading + " — " + s.url : s.url) : s.path;
+    chip.title = "Open " + what;
+    chip.setAttribute("aria-label", "Open source " + s.n + ", " + what);
     li.append(chip);
     list.append(li);
   }
 }
 
-// drawFooter draws Copy, Try again and Details, and the dim stats line.
+// drawFooter draws Continue on an answer that stopped short, then Copy,
+// Try again and Details, and the dim stats line.
 export function drawFooter(t, h) {
   const f = t.el.footer;
   f.replaceChildren();
   if (t.state === "active") return;
   const actions = el("div", "actions");
+  if (h.canContinue(t)) {
+    actions.append(button("Continue", { iconName: "retry", className: "text-button continue", onClick: () => h.onContinue(t) }));
+  }
   if (t.answer) {
     actions.append(button("Copy", { iconName: "copy", onClick: (e) => h.onCopyAnswer(t, e.currentTarget) }));
     actions.append(button("Save to a note", { iconName: "note", onClick: () => h.onSaveNote(t) }));

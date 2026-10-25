@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aarora79/meru/internal/agent"
 	"github.com/aarora79/meru/internal/catalog"
 	"github.com/aarora79/meru/internal/config"
 	"github.com/aarora79/meru/internal/engine"
@@ -98,6 +99,9 @@ type modelService struct {
 	log  *slog.Logger
 	// wait and poll are evictWait and evictPoll; tests shorten them.
 	wait, poll time.Duration
+	// fitWindow sizes a model's context window before it loads as the
+	// answer model; nil keeps [ollama] context_length. See window.go.
+	fitWindow func(ctx context.Context, model string)
 
 	// switchMu lets one switch or save run at a time. A switch holds it
 	// while Ollama loads a model, which can take a minute; a second switch
@@ -391,6 +395,10 @@ func (m *modelService) switchMain(ctx context.Context, to string, noThink bool) 
 		}
 	}
 
+	// The window goes on before the load, so Ollama loads the model once.
+	if m.fitWindow != nil {
+		m.fitWindow(ctx, to)
+	}
 	hello := []engine.Message{{Role: engine.RoleUser, Content: "hi"}}
 	if _, err := m.eng.Generate(ctx, hello, nil, engine.Options{Model: to, MaxTokens: 1, NoThink: noThink}); err != nil {
 		return fmt.Errorf("switch to %s: step 3 of 3, load %s: %w; %s stays the answer model, and Ollama loads "+
@@ -546,6 +554,25 @@ func (m *modelService) capabilities(ctx context.Context, model string, fallback 
 		}
 	}
 	return fallback
+}
+
+// visionSets returns the model sets, in config order, whose answer model
+// can look at pictures and call tools, for the agent to suggest when the
+// answer model can't see (see agent.UseVisionSets). Both matter: a model
+// needs tools to call view_image. A model Ollama hasn't pulled has no
+// capabilities here, so it's never suggested. The engine caches each
+// model's /api/show answer, so after the first turn this asks Ollama
+// nothing.
+func (m *modelService) visionSets(ctx context.Context) []agent.VisionSet {
+	var out []agent.VisionSet
+	for _, s := range m.models.Sets {
+		caps := m.capabilities(ctx, s.Main, nil)
+		if slices.Contains(caps, engine.Vision) && slices.Contains(caps, engine.ToolUse) {
+			out = append(out, agent.VisionSet{Set: s.Name, Model: s.Main})
+		}
+	}
+	m.log.DebugContext(ctx, "vision sets", "count", len(out))
+	return out
 }
 
 // names returns the names of the models in pulled.

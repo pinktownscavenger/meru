@@ -1,6 +1,6 @@
 # desktop
 
-**Code:** `internal/desktop/` (`doc.go`, `bridge.go`, `views.go`, `history.go`, `status.go`, `settings.go`, `connectors.go`, `about.go`, `files.go`, `thumbs.go`, `commands.go`, `options.go`, `assets.go`, and the page in `web/`; tests include `attach_test.go` and `thumbs_test.go`), plus `cmd/meru-desktop/main.go`
+**Code:** `internal/desktop/` (`doc.go`, `bridge.go`, `views.go`, `history.go`, `status.go`, `settings.go`, `connectors.go`, `about.go`, `files.go`, `thumbs.go`, `speech.go`, `commands.go`, `options.go`, `assets.go`, and the page in `web/`; tests include `attach_test.go` and `thumbs_test.go`), plus `cmd/meru-desktop/main.go`
 **Milestone:** the desktop app, asked for ahead of v0.5
 **Architecture:** [Desktop app](../../ARCHITECTURE.md#desktop-app)
 
@@ -142,7 +142,8 @@ The `Update` struct is the one message type the page receives, on one Wails even
 
 `stepLabel` turns a tool call into words: `google.search_gmail_messages` becomes
 "Searched mail", `read_file` with `{"path":"~/Notes/lisbon.md"}` becomes "Read
-lisbon.md". It reads the tool's name for words such as "mail", "send" or "calendar",
+lisbon.md", and `view_image` with `{"path":"~/trips/amtrak.png"}` becomes "Looked
+at amtrak.png". It reads the tool's name for words such as "mail", "send" or "calendar",
 so it works for servers it has never seen, and falls back to "Used google list
 drive items".
 
@@ -158,6 +159,10 @@ names the server and tool, for the "Why Meru is asking" panel, and writes the
 fields, or "Run write_file with these arguments instead:" with the JSON.
 `approvalView` has a named result, `(v ApprovalView)`, so a deferred function can
 set `v.Draft` after the fields are in, whichever `return` runs.
+
+`choiceLabel` writes each button. The website choices name the host from
+`Approval.Site`: "Allow en.wikipedia.org for this chat" and "Always allow
+en.wikipedia.org". `Approve` accepts the five choices and nothing else.
 
 Edit first answers `deny` and puts the draft in the composer. `merud` runs a call
 with the arguments it asked about or not at all, so the edited text goes back as a
@@ -201,7 +206,9 @@ each MCP server `merud` holds a connection to, and each connector the pool
 runs that isn't `ok`, with its state in brackets: `obsidian (needs config)`.
 `rpc.ConnectorWords` writes the state, so the rail and `meru chat` say it the
 same way. A connector that is `ok` shows by name alone, like a connected
-server.
+server. Web search, a container, and speech to text, a service, aren't in
+the pool, so `Status` names them from the `connectors` op: by name when
+`ok`, with the state when on but not `ok`, and not at all when off.
 
 ### The chat list (history.go, web/js/organize.js)
 
@@ -229,7 +236,7 @@ Shift+F10 open the same menus from the keyboard.
 One method per thing Settings and Setup show or change, each a single request:
 `Connections`, `SetPolicy`, `AddConnection`, `AddCustomServer`, `RemoveConnection`, `SetSecret`,
 `Folders`, `AddFolder`, `RemoveFolder`, `Memories`, `AddMemory`, `ForgetMemory`,
-`Skills`, `SetSkill`, `Models`, `UseModel`, `Activity` and `Usage`. Each hands
+`Skills`, `SetSkill`, `Models`, `UseModel`, `Activity`, `Usage` and `UsageDetail`. Each hands
 back what `merud` sent, shaped for the page: a view struct such as
 `ConnectionsView`, with an empty list in place of `nil`, since `nil` reaches
 JavaScript as `null`.
@@ -247,6 +254,12 @@ answer model, and any client can switch it, so `models` keeps the name each
 models reply gives in the Bridge's `model` field.
 That field now sits under the Bridge's mutex, `mu`, since `Status` reads it
 while a call from Settings may write it.
+
+`UsageDetail` sends `usage` with `Kind` set to `rpc.UsageDetail` and returns
+the dashboard. `one` wraps `errNoReply` when `merud` answers with some other
+event, and an older `merud` answers this kind with the plain windows, so
+`UsageDetail` checks with `errors.Is` and returns `errOldMerud`, whose text
+tells the user to update. The page then shows the windows table alone.
 
 `AddConnection` saves the key first, with `secret_set`, then adds the server with
 `mcp_add`: `merud` refuses to add a catalog server whose key it lacks.
@@ -343,6 +356,16 @@ outside the uploads folder, and hands them to `send` with the composer's own
 attachments. Without it, Try again on a question about a photo would ask the
 model blind.
 
+Continue calls `Continue(session, scope, incognito)`, which sends "Continue"
+through the same `send` with `cont` set: the request carries `Continue: true`,
+and the composer's attachments stay for the next question. The page sets
+`t.outcome` from the `done` event, or from the past turn's `outcome` when a chat
+reopens. `drawFooter` shows the Continue button first, in the accent colour,
+when `canContinue(t)` holds: the turn ended `cut_off`, `window_full` or `timeout`, and it is
+the chat's newest turn. When a new turn starts, `onStart` redraws the footer of
+the turn before it, so an older answer loses its button. `/continue` in the
+composer does the same as the button.
+
 `Drop` is a plain function, `desktop.Drop(b, paths)`, not a method. Wails binds
 every exported method of the Bridge, so the page could call `Drop` with any path
 it liked; the page can't reach a plain function. Only a real drop, which Wails
@@ -350,6 +373,16 @@ reports to Go, gets there. `Drop` runs `attach` in a goroutine that `wg` counts,
 so the window's event loop never waits on `merud`.
 
 ### thumbs.go
+
+`SourceThumb(path)` gives an image source's chip its preview. The page calls it
+with a source's path, but the Bridge makes a preview only for a path in `cited`,
+the image sources `merud` sent in a `sources` event or the app read from a past
+chat (`allowThumbs`). Any other path gets `""`, so the page can't use it to read a
+file of its choosing. A past chat's transcript keeps paths alone, so there an
+image is told by its ending. `cited` has its own mutex, `citedMu`, because the
+event loop adds to it while it holds `mu`. `thumbFile` does the reading for both
+kinds of preview: `Lstat`, no link or special file, the 20 MiB cap, `SameFile`
+after the open, then `thumbFor`.
 
 `thumbnail` makes the preview an image chip and a question bubble show, as a
 `data:` URL, which the page's Content-Security-Policy allows for images. It
@@ -370,6 +403,64 @@ copies into; `inside` resolves symbolic links first, so a link can't pass.
 `SessionTurns` does the same for a reopened chat: `TurnInfo.Images` holds the
 copies' full paths, and each becomes an `Attachment` with its preview. A copy
 the user deleted keeps its name and loses its preview.
+
+### sites.go
+
+`TrustedSites` and `RemoveTrustedSite` ask `merud` for `[web] trusted_sites` and
+take one off. The Web search card in Settings lists the hosts with a Remove
+button, and `/sites remove <host>` in the composer calls the same Bridge method;
+`/sites` alone opens Settings at Connections. A host joins the list from an
+approval card's "Always allow" button, through `Approve`.
+
+### speech.go and web/js/voice.js: the microphone
+
+The microphone button turns speech into text in the question box. The page
+records and builds the file; the Bridge carries it to `merud`'s `transcribe`
+op (see [speech](speech.md)).
+
+`SpeechStatus` asks the `connectors` op for the whisper connector and
+returns a `SpeechState`: `Ready` when its state is ok, and its sentence. The
+page calls it on each press, before it records, so a connector that is off
+or still installing says so at once, in the connector's own words, instead
+of after a recording. A `merud` without the connector gives a sentence that
+says to update.
+
+`Transcribe(ctx, wavBase64)` takes the recording as base64, since a Wails call
+passes strings well, decodes it with `encoding/base64`, refuses an empty one
+or one over 3 MiB, and sends it with `one`. `one` gives the op
+`transcribeTimeout`, two minutes, since the speech server may have to start
+first. It returns the words, "" when there were none, and keeps no copy.
+
+`voice.js` holds the rest, in the page:
+
+1. A press checks `speechStatus`, then asks `navigator.mediaDevices
+   .getUserMedia` for the microphone, with the browser's echo and noise
+   cancelling on. `getUserMedia` fails with a named error; `MIC_ERRORS` turns
+   `NotFoundError` into "This Mac has no microphone. Connect one, such as
+   AirPods or a webcam.", and `NotAllowedError` into the System Settings
+   pane to visit.
+2. `MediaRecorder` records, AAC in the macOS WebView. A timer updates
+   "Listening… N s" every half second and stops the recording at 60.
+3. On stop, `release` stops the microphone's tracks, which puts out macOS's
+   recording indicator. `toWAV` decodes the recording with `decodeAudioData`
+   and renders it through an `OfflineAudioContext` of one channel at 16,000
+   samples a second, which mixes and resamples in one pass, faster than
+   real time. `pcmWAV` writes the 44-byte header with a `DataView` and each
+   sample as a 16-bit integer, lowest byte first.
+4. `toBase64` encodes the bytes in slices of 32 KiB, since spreading two
+   million bytes into one `String.fromCharCode` call would overflow the
+   stack. `bridge.transcribe` sends them.
+5. `insert` puts the words after any text in the box, moves the cursor to
+   the end, and fires an `input` event, so the box grows as if the user had
+   typed. Nothing sends: the user reads, fixes and presses Send.
+
+The button carries `aria-pressed` and a label that changes with what it
+does, and turns red with a pulse while it records, unless the user asked
+for reduced motion.
+
+`speech_test.go` checks `SpeechStatus` for a connector that is ready, off or
+installing, and a `merud` without it, and that `Transcribe` sends the bytes
+it got and refuses bad base64, an empty recording and one too large.
 
 ### commands.go
 
@@ -415,7 +506,10 @@ bundler.
 - `js/app.js` keeps the page's state and wires the rail, the composer, the queue and
   the side panel to the updates. It shows one of three screens in the middle
   column: the chat, Settings or Setup. The rail folds to a column of icons; its
-  logo and name are one button that opens About in Settings. A new chat shows
+  logo and name are one button that opens About in Settings. A globe at the
+  top right of the chat header opens Meru's website: the page takes its URL
+  from the `site` link `bridge.about()` returns, and opens it with `OpenURL`,
+  which checks the URL first; the globe stays hidden when there is none. A new chat shows
   the logo beside "Ask Meru", as an `<img>` with empty alt text, since the heading
   already says Meru. The side panel starts closed, and the header's button opens
   it; the page stores nothing, so the choice lasts until the window closes. It
@@ -443,9 +537,19 @@ bundler.
   option the arrow keys point at. `/copy N` counts the code blocks in the chat's
   finished answers in order, as `meru chat` does, and each block's header shows its
   number.
-- `js/settings.js` draws the eight sections of Settings: Connections, with an Off /
-  Ask / Allow switch per tool, Folders, About you, Skills, Models, Activity, Usage
-  and About. Under the catalog cards, "Add your own MCP server" opens a form: a
+- `js/settings.js` draws the seven sections of Settings: Connections, with an Off /
+  Ask / Allow switch per tool, Folders, About you, Skills, Models, Activity
+  and About. It also draws the Usage screen, which the Usage button at the foot
+  of the rail opens: two tabs, Charts and Prometheus queries, built with
+  `role="tab"` and arrow-key moves like Settings' own tabs. Charts holds four
+  bar charts, drawn as SVG elements one attribute at a time, so the page's
+  security policy, which allows no inline styles, still holds; colors come from
+  CSS classes that read the theme's variables. Every chart cell goes into the
+  grid before any chart measures its cell's `clientWidth`, so each chart draws at
+  its final width and its axis text shows at real size. `niceStep` picks round
+  y-axis ticks (1, 2 or 5 times a power of ten), and each bar carries a
+  `<title>` for hover and screen readers. A slowest-task row opens its chat
+  through `pages.openChat`, and one the rail doesn't list goes by its date. Under the catalog cards, "Add your own MCP server" opens a form: a
   name, then a program with its arguments and environment variables, or a URL with
   a tick for a server on another computer. Each argument gets a field of its own,
   so an argument with a space in it needs no quotes, and no quoting rule can cut
@@ -477,9 +581,14 @@ bundler.
   `pages.openSetup`.
 - `js/turns.js` draws one turn. Each part (work strip, approval card, body,
   sources line, footer) has its own draw function, so a token redraws only the
-  body. The strip's first chip comes from `workLabel`, which reads what the turn
+  body. A source chip shows an image icon for an image, which `isImageSource`
+  tells by the citation's `kind`, or, in a past chat whose transcript keeps
+  paths only, by the file's ending. A web source (`isWebSource`: `kind` "web"
+  with a `url`) shows a globe and the site's host, such as "go.dev", with the
+  page's title on hover, and `openSource` opens it through the Bridge's
+  `OpenURL` rather than `OpenSource`. The strip's first chip comes from `workLabel`, which reads what the turn
   did: "Used tools" once a `tool_call` event came, "Searched your files" once a
-  `sources` event came, both together, "Answered from the model" for a finished
+  `sources` event brought a file, not only web pages, both together, "Answered from the model" for a finished
   turn with neither, and "Answering" while text streams. It never reads the
   route: the router's pick says what the turn could do, and a `tools` turn
   whose model called no tool once said "Used tools". `app.js` redraws the strip
@@ -490,7 +599,15 @@ bundler.
   ends. The route and the
   router's confidence stay behind Show steps. `TestWorkLabelReadsWhatHappened`
   in `assets_test.go` reads `workLabel`'s source, since the page has no test
-  runner, and fails if it reads `t.route`. The sources line shows only the cited sources, closed, as "3 sources"
+  runner, and fails if it reads `t.route`. The strip's "Working…" chip stays for
+  as long as the turn runs, not only before the first word: after them, a model
+  writing a long tool call, such as a whole page for `write_file`, sends nothing
+  until it's done. `onEvent` sets `t.lastNews` on every event, and an approval
+  card's arrival and answer set it too. A one-second timer in `app.js` calls
+  `tickWorking`, which turns the chip into "Still working · 52 s", with a title
+  that says why, once `workingText` finds `QUIET_SECONDS` (5) without news.
+  `TestWorkingChipStays` reads the source so the chip can't go back to showing
+  only before the first word. The sources line shows only the cited sources, closed, as "3 sources"
   with a chevron; the button, with `aria-expanded`, opens a chip per source. An
   answer that cites nothing shows no line. `drawNotice` draws `merud`'s `notice`
   event, sent when the answer claims an action no tool performed, as an amber
@@ -523,7 +640,9 @@ bundler.
 `connectorCard(c, ctx, mark)` draws one connector from its status alone. It
 names no connector: `TestConnectorFormsFromSchema` fails if the file holds a
 connector's ID, a field's ID or a config key. The card has a pill from
-`PILLS`, the sentence, an on and off switch for any kind but `dependency`,
+`PILLS`, the sentence, the line under the title from `KINDS`, which says
+where each kind runs (a `service` "starts on this Mac when you use it"), an
+on and off switch for any kind but `dependency`,
 and, when the connector has fields, a form. `INPUTS` maps each field type
 to the function that draws it, and every entry returns the same three
 things: the element, the control to focus, and `read`, which returns what
@@ -573,6 +692,13 @@ Wails app with the Bridge as a service and `Assets` as its file server, and open
 1440 by 900 window that shrinks to 1000 by 640. The title bar reads
 `WindowTitle` and never changes; the chat's title shows in the page's header.
 
+The window's `Permissions` answer the page's `getUserMedia`: the microphone
+is allowed, so WebKit shows no prompt of its own on each launch, and the
+camera is denied. macOS still asks once before Meru.app may hear the
+microphone, with the sentence in `Info.plist`'s
+`NSMicrophoneUsageDescription`. Without that key, macOS refuses the
+microphone outright.
+
 The window sets `EnableFileDrop`. On macOS a view that Wails lays over the
 WebView takes the drop, reads the files' full paths, and asks the page's runtime
 which element sits under the pointer. When that element, or one around it,
@@ -611,6 +737,26 @@ archives with `tar -J`, and refuses any extra path, link, mode, dependency, iden
 or other compression. It names the compression because GNU tar can't detect it
 when it reads from a pipe. This lets
 the Mac publisher inspect the Linux artifact without installing it.
+
+### jobs.go and Settings, Jobs
+
+`Jobs`, `RunJob` and `CancelJob` ask `merud` for the scheduled jobs, run one
+now, or stop a run. `SaveJob` adds or edits a job, `CheckJob` asks for a dry
+run, and `RemoveJob` takes one out. Settings has a Jobs section: each job with
+its schedule in words, its next or running state and last run, Run now or Stop,
+Pause or Resume, Edit, Remove, which asks first, and "Open last run", which
+opens the chat. The list reloads every five seconds while it shows, so a run's
+start and end appear without a click. Add a job and Edit open a form above the
+list, outside the part that reloads, so a reload leaves what the user types
+alone. The form asks for the name, the schedule with a repeat choice (every
+week up to every 4 weeks, with a first day), the prompt and a skill, the tools
+it may use without asking, with a warning while that list names any, and an
+output file. A moment after each key, it calls `CheckJob` and shows the
+schedule in words and the next run, or what's wrong; an answer to an older
+check is dropped. A job that runs a command keeps its command and arguments,
+which the form shows and doesn't edit. The chat list shows the
+Jobs folder first, with a clock icon, and `/jobs` in the composer opens the
+section.
 
 ## Go ideas used here
 

@@ -106,6 +106,26 @@ type CallConfirmer interface {
 	ConfirmCall(c Call) (confirm Confirm, ok bool)
 }
 
+// SiteTruster is an extra method set a Backend may have, for a call that
+// reaches a website. When a call asks and CallSite names a host, dispatch
+// offers two more choices besides once and deny: trust that host for the
+// rest of the session, or always. TrustSite records the user's choice, so
+// the backend's ConfirmCall lets later calls to the host run unasked.
+//
+// The built-in tools are the one SiteTruster: web_fetch names the host of
+// a URL no search result or question gave, for a read and never for a
+// download (ARCHITECTURE.md, "Web search"). dispatch knows nothing of URLs.
+type SiteTruster interface {
+	// CallSite returns the host call c reaches, such as
+	// "raw.githubusercontent.com", or "" when the website choices don't
+	// apply to it.
+	CallSite(c Call) string
+	// TrustSite trusts host for c's session, and with always for every
+	// session after. It fails when always can't be saved; the session's
+	// trust holds all the same.
+	TrustSite(ctx context.Context, c Call, host string, always bool) error
+}
+
 // Refresher is an extra method a Backend may have. Refresh brings the
 // backend's tool list up to date: it asks each connected server for its
 // tools again, tries once to reach each server that isn't connected, and
@@ -129,6 +149,12 @@ type Result struct {
 	// turn's sources and the clients can list the ones the answer cites.
 	// search_files fills it; other tools leave it nil.
 	Sources []rpc.Citation
+	// Images holds pictures for the model to look at on its next round,
+	// each the raw bytes of a PNG, JPEG, GIF or WebP file. view_image fills
+	// it; other tools leave it nil. Dispatch never logs them: the
+	// tool_result line and the tool_calls row keep Text alone, so a picture
+	// never lands in the transcript or meru.db.
+	Images [][]byte
 }
 
 // Call is one tool call the model asked for.
@@ -168,6 +194,16 @@ type Call struct {
 	// the tools that skill uses. The call is still denied and recorded
 	// like any other.
 	Hint string
+	// Offered, when not nil, names the tools this call may reach: the
+	// tools the turn offered the model in this round. A call to any other
+	// tool is denied and recorded, even when config allows that tool. The
+	// agent sets it on a turn whose scope the user picked, such as "My
+	// files", because a scope promises what the turn may touch, and a
+	// model can name a tool it wasn't shown. nil, the zero value, fences
+	// nothing: any tool a backend offers may run, as on an auto turn.
+	// Go tells nil from an empty slice, so an empty, non-nil Offered
+	// denies every tool.
+	Offered []string
 	// Incognito is true for a call in an incognito chat. The call runs and
 	// is recorded as any other, but its tool_calls row keeps no arguments
 	// and no result, and its span carries neither even with

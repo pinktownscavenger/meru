@@ -69,7 +69,8 @@ We chose Go over Python, the usual language for AI tools, for these reasons:
    many more people than an interpreted one would. The models dominate the cost on a
    single laptop; across a rack of servers, Meru's own overhead adds up.
 4. **Concurrency built in.** A turn streams tokens, runs tool calls in parallel, keeps
-   MCP connections open, and shares the process with the scheduler and the indexer.
+   MCP connections open, and shares the process with the indexer, the connector
+   supervisors and, from v0.5, the scheduler.
    Goroutines and `context` cancellation handle that directly, without Python's
    global interpreter lock.
 5. **Fewer dependencies.** Go's standard library covers HTTP, JSON, Unix sockets,
@@ -85,14 +86,19 @@ We chose Go over Python, the usual language for AI tools, for these reasons:
    the A2A SDK, OpenTelemetry and Bubble Tea all have first-class Go libraries.
 
 The trade-off: Python has the stronger libraries for machine learning and PDF
-parsing. That is one reason models run in Ollama rather than inside Meru, and why PDF
-extraction is still an open question.
+parsing. That is one reason models run in Ollama rather than inside Meru. Meru
+reads PDFs with `ledongthuc/pdf`, a pure-Go library that reads each page's text
+and keeps no layout (see [Open questions](#open-questions)).
 
-Three things stay outside the binaries:
+These things stay outside the binaries:
 
 - **Ollama**, which runs the models (see [Engine layer](#engine-layer)).
-- **The observability stack**, which you can skip (see [Observability](#observability)).
+- **A Prometheus or OTLP collector**, if you want one, which you run yourself
+  (see [Observability](#observability)).
 - **MCP servers and A2A agents**, which run as their own processes.
+- **The runtimes `merud` downloads on first need** into `~/.meru/runtime`:
+  Node, uv and chrome-headless-shell, at pinned versions, and the SearXNG
+  container it can run (see [Connectors and the supervisor](#connectors-and-the-supervisor)).
 
 The store uses `ncruces/go-sqlite3`, a Go library that runs SQLite compiled to
 WebAssembly, with FTS5 and vec1, SQLite's own vector extension, built in. It needs no
@@ -110,8 +116,8 @@ OpenTelemetry stack.
 | --- | --- | --- |
 | macOS, Apple silicon | supported and tested; the development machine is a Mac Studio (M4 Max, 64 GB) | `launchd` |
 | Ubuntu 24.04, x86-64 (desktops, home servers, cloud virtual machines) | command-line clients, daemon and desktop package implemented; fresh-host acceptance pending | `systemd --user` |
-| Other Linux systems and Linux arm64 | should work; not tested at first | `systemd` |
-| Windows 10 and later | should work; not tested at first | a Windows service |
+| Other Linux systems, x86-64 or arm64 (home servers, cloud virtual machines) | supported, with no installer | `systemd` |
+| Windows 10 and later | should work; not tested at first | none yet; a Windows service is planned |
 
 Code must not assume one platform: build paths with `filepath`, find the home
 directory with `os.UserHomeDir`, and keep platform-specific code behind Go build tags
@@ -139,8 +145,8 @@ the `full` profile's main model is 38 GB at 8-bit and takes many seconds to load
 from disk. So Meru has two programs:
 
 - **`merud`** runs all the time. It keeps models loaded in Ollama, owns the store,
-  holds the MCP and A2A connections, runs the scheduler and the agent loop, and emits
-  metrics and traces.
+  holds the MCP and A2A connections, runs the connectors, the indexer and the agent
+  loop, and emits metrics and traces. From v0.5 the scheduler runs jobs through it.
 - **`meru`** is a thin client. It connects to `merud` over a Unix socket at
   `~/.meru/merud.sock`, starts in ~50 ms, streams the answer back and exits.
 
@@ -150,9 +156,9 @@ once, before `merud` exists, to set the Mac up (see [Installer](#installer)).
 A daemon that keeps models warm can also run scheduled jobs for almost no extra
 work. That is why we build `merud` first and add the scheduler to it later.
 
-![System diagram. Three short-lived clients, meru for one question, meru chat and meru-desktop, talk to merud over a Unix socket. Inside merud, the socket server and the scheduler feed the agent loop, which uses the skill registry, dispatch and the Engine. The Engine reaches Ollama and its fast, main and embed models over HTTP on 127.0.0.1:11434. Dispatch reaches MCP servers such as google and obsidian through the MCP client pool, other agents through the A2A client, and a SearXNG you run for web_search. The loop reads and writes the files under ~/.meru: session transcripts, memory files, skills, config.toml and meru.db, the index Meru can rebuild. The OTel SDK sends metrics and traces to an optional OTLP endpoint on 127.0.0.1:4318, which feeds Grafana, Prometheus and Tempo.](docs/architecture/img/300-overview.png)
+![System diagram. Three short-lived clients, meru for one question, meru chat and meru-desktop, talk to merud over a Unix socket. Inside merud, the socket server and the scheduler feed the agent loop. The loop uses the skill registry, dispatch and the Engine. The Engine reaches Ollama and its fast, main and embed models over HTTP on 127.0.0.1:11434. Dispatch reaches MCP servers such as google and obsidian through the MCP client pool, other agents through the A2A client, and a SearXNG you run for web_search. The loop reads and writes the files under ~/.meru: session transcripts, memory files, skills, config.toml and meru.db, the index Meru can rebuild. The OTel SDK serves metrics at an optional /metrics page on 127.0.0.1:9464 for a Prometheus you run, and can push metrics and traces to an optional OTLP endpoint on 127.0.0.1:4318.](docs/architecture/img/300-overview.png)
 
-*Figure 1. Arrows leave `merud` for programs it doesn't own from two places: the engine, to Ollama, and `dispatch`, to MCP servers, A2A agents and SearXNG. Each is one guarded entry point, which is where the privacy rules live.*
+*Figure 1. Arrows leave `merud` for programs it doesn't own from two places: the engine, to Ollama, and `dispatch`, to MCP servers, A2A agents and SearXNG. Each is one guarded entry point, which is where the privacy rules live. The scheduler, new in v0.5, runs jobs through the same loop.*
 
 ### Terminal UI
 
@@ -171,19 +177,24 @@ scrolling answer pane, and two more Charm libraries for its look:
   version (`v0.4.3`, or `dev` and the commit for a build between tags, from
   `internal/about`, as the desktop app's rail shows it), the profile, model, what the
   index holds (`2637 docs (11698 vectors, 84 MB)`, with `· indexing` while a
-  scan runs), the session, the last hour's use (`1h: 4 questions · 18k in ·
+  scan runs), the session, the last hour's use (`1h: 4 tasks · 18k in ·
   2.1k out`) and whether `merud` is reachable; "You" and "Meru" labels; a route badge on each
   answer, amber when the router fell back; and a stats line with time to first
   token, tokens per second and total time. Colors adapt to light and dark
   terminals, and `NO_COLOR` turns them off. The chat asks `merud` for the
   header's numbers every 5 seconds while a scan runs and every 30 seconds
-  otherwise. Typing `/usage` opens a table of sessions, questions, tokens in
-  and out, active time, files touched and tool calls for the last hour, today,
+  otherwise. Typing `/usage` opens a table of sessions, tasks, tokens in
+  and out, active time, docs touched and tool calls for the last hour, today,
   this week, this month, the last 30 days and all time; `meru usage` prints
   the same table, and `/usage by model` shows one row per answer model (see
-  [Model sets](#model-sets)). Typing `/model` opens a table of the model sets,
+  [Model sets](#model-sets)). Under the table, `/usage` draws tasks and
+  tokens in per day as bar lines, today's tokens and time to first token, the
+  five slowest tasks of the week, the tools whose calls failed, and where Prometheus can read the
+  metrics (see [Reading the metrics](#reading-the-metrics)). Typing `/model` opens a table of the model sets,
   `/model <name>` switches to one and `/model save` makes it the default; the
-  header names the set in use beside the usage. Typing `/new` starts a new
+  header names the set in use beside the usage, and ends with Meru's website,
+  `aarora79.github.io/meru`, as a link a click opens; it is the first thing
+  to go when the terminal is narrow. Typing `/new` starts a new
   session, so a conversation that went wrong stops shaping the answers after it. In both clients, each source
   line is a link (OSC 8) to its `file://` path, which terminals that support
   links open on a click.
@@ -367,11 +378,12 @@ the line as its tooltip.
   The status block shows the answer
   model, the file count and the connected MCP servers, or, when `merud` doesn't
   answer, that it isn't running and the command that starts it. A button folds
-  the rail to a column of icons: the logo, New chat, chats, Settings and a status
-  dot.
+  the rail to a column of icons: the logo, a button that unfolds the rail, New
+  chat, chats, Usage, Settings and a status dot.
 - **The conversation** shows each question as a bubble and each answer as a card.
-  The header holds the chat's title, **Share as file** and a button that shows
-  or hides the side panel. An incognito chat gets an **Incognito** badge beside
+  The header holds the chat's title, **Share as file**, a globe that opens
+  Meru's website in the browser, and a button that shows or hides the side
+  panel. An incognito chat gets an **Incognito** badge beside
   its title, a line under the header that says what it keeps, and no Share as
   file. A one-line work strip says what the turn did and lists
   each tool call by its label. Its first chip reads the turn's events, never
@@ -393,7 +405,8 @@ the line as its tooltip.
   Shift+Enter; while a turn
   runs, Enter queues, and the queue shows above the composer with a remove button
   on each question. Under the text box sit the **Where Meru looks** switch and
-  the attach button.
+  the attach button, and a microphone button that turns speech into text in
+  the box (see [Speech to text](#speech-to-text)).
 - **The side panel** starts closed; the header's button opens it, and the choice
   lasts until the window closes. "What this answer used" lists the selected
   answer's sources, every file the prompt held, its tool calls, and under
@@ -413,9 +426,12 @@ the line as its tooltip.
 
 **Where Meru looks.** The composer's switch sets the request's `scope`: Auto, My
 files, Mail and calendar, Web or Just talk. Auto runs the router as every other
-client does. Any other scope skips the router, the route rules that widen a route
+client does, except for a question with images, which takes the `direct` route
+because the router's model reads text alone. Any other scope skips the router, the route rules that widen a route
 and a picked skill's tools, because a scope is a promise about what the turn may
-touch:
+touch. `dispatch` keeps the promise: on a scoped turn, a call to a tool the round
+didn't offer is denied and logged, even when config allows that tool, so a model
+that names `web_search` from memory on a My files turn searches nothing:
 
 | Scope | Route | Searches first | Tools offered |
 | --- | --- | --- | --- |
@@ -519,7 +535,7 @@ newest answer), `/scope <name>` (the Where Meru looks switch), `/attach` (the fi
 dialog), `/save` (Save to a note on the newest answer; `/save chat` is Share as
 file), `/used` (the side panel for the newest answer), `/copy N` (code block N of
 this chat, numbered as the chat numbers them; `/copy` alone the newest answer's
-last block, and `/copy answer` the whole answer), `/usage` (Settings, Usage), `/me`
+last block, and `/copy answer` the whole answer), `/usage` (the Usage screen), `/me`
 (Settings, About you), `/mcp` (Settings, Connections), `/folders` (Settings,
 Folders), `/skills` (Settings, Skills), `/model` (Settings, Models; `/model <name>`
 and `/model save` switch and save as in the chat), `/log` (Settings, Activity),
@@ -531,7 +547,7 @@ never reaches the model; an unknown one leaves the text in the box and lists the
 commands, as the chat does. The Bridge holds the list, and a test fails when it
 differs from `meru chat`'s.
 
-**Settings** has a back link and eight sections:
+**Settings** has a back link and seven sections:
 
 - **Connections** opens with a card per connector, drawn from the fields its
   manifest declares, with a pill, `merud`'s sentence, an on and off switch,
@@ -577,20 +593,32 @@ differs from `meru chat`'s.
   the profile change in `config.toml`, then a restart.
 - **Activity** lists the `tool_calls` log, the data `meru log` prints: time,
   tool, outcome and duration, with the arguments and result behind a button.
-- **Usage** shows the usage windows the chat's `/usage` box shows.
 - **About** says what Meru is and where its name comes from, what it does and
   why it runs on your computer, the app's version, where `config.toml` and
-  Meru's folder are, and three links: the source code, the design and a new
-  issue on GitHub. The Bridge hands the page the links, so the page's own files
+  Meru's folder are, and four links: the source code, the design, a feature
+  request and the license. The Bridge hands the page the links, so the page's own files
   name no host, and each opens in the browser through `OpenURL`. Under those
   paths, "Run setup again" opens Setup.
+
+**Usage** has a button of its own beside Settings at the foot of the rail, and
+opens a screen with two tabs. **Charts**, open first, shows the usage windows
+the chat's `/usage` box shows, then four bar charts over 30 days, two to a row:
+tasks per day, time to first token per day (p50 and p95), tokens in and tokens
+out per day, each with a labelled y axis. A task is one question or request
+that Meru answered. Under the charts come the ten slowest tasks of the week,
+each a link to its chat, tool calls by outcome, and use by answer model.
+**Prometheus queries** says how to read the same metrics in a Prometheus you
+run, with the `/metrics` address or the line that turns it on, and queries to
+copy (see [Reading the metrics](#reading-the-metrics)). Everything on the
+screen comes from `meru.db`.
 
 **Setup** has four steps, and opens on its own when `merud` reports no folders
 and no profile memory; after that, "Run setup again" in Settings, About opens
 it. **The models**
 lists the three models; with `merud` down it shows the `ollama pull` each one
 needs and the command that starts `merud`. Meru pulls nothing on its own: a model
-is gigabytes, and `merud` doesn't start until its models are there. **Your
+is gigabytes, and `merud` answers no question until Ollama has the models it
+names. **Your
 folders** offers checkboxes for `~/Documents`, `~/Notes` and `~/Desktop` where
 they exist, each with a file count from `merud`, and "Choose another folder".
 **Connections** shows the catalog cards. **About you** asks your name, your email
@@ -615,6 +643,7 @@ add` and `configure` use, and applies it at once:
 | `model_use` | switches to a model set until `merud` stops, unloading the old answer model first (see [Model sets](#model-sets)) |
 | `model_save` | writes the models in use to `[models]` |
 | `model_set` | switches to a model on that list that Ollama has, the same way, then writes `[models] main` |
+| `jobs`, `job_set`, `job_remove`, `job_run`, `job_cancel` | (v0.5) list, add or change, remove, run now and stop scheduled jobs (see [Scheduler](#scheduler)) |
 
 A change to a list edits only that list's lines in `config.toml`: every comment
 and every other key stays. `merud` writes a temporary file, loads it, checks that
@@ -708,6 +737,9 @@ from the app, and Linux and Windows builds come in later versions.
 
 ## merud as an agent harness
 
+[docs/architecture/harness.md](docs/architecture/harness.md) follows one turn
+through the harness in full, step by step, with the numbers the code uses.
+
 An *agent harness* is the code that runs a model in a loop: it builds the prompt,
 runs the tools the model asks for, hands back the results and keeps a record.
 `merud` holds a whole one: a model loop with tool rounds, one gate for every tool
@@ -735,13 +767,18 @@ Four places tie the loop to Meru today:
   the store's `tool_calls` table as a `store.ToolCall`.
 
 A script can drive the harness with no one at the keyboard.
+`meru -image shot.png "find images like this"` sends a picture with one
+question, through the same `attach_file` step and rules as the desktop app's
+attach button; `-image` works with `run --json` too.
 `meru run --json "question"` writes each socket event as one JSON line on stdout
 and exits non-zero when the turn fails. The command denies a tool call that asks
 first, as any client with no one to ask does, and `dispatch` logs it as
 `declined`. The command also writes the approval event to stdout, so the script
 sees which call it refused. A tool doing slow work sends `progress` events
 between its `tool_call` and `tool_result`, with the call's ID, such as the line
-`web_fetch` sends while it installs its page reader. Every tool call still goes through `dispatch`; the
+`web_fetch` sends while it installs its page reader. The `done` event's `outcome`
+says when an answer stopped short, such as `cut_off`, so a script can tell a
+whole answer from part of one. Every tool call still goes through `dispatch`; the
 mode adds no second path.
 
 ---
@@ -769,8 +806,8 @@ explain each step in detail.
 | When the turn ends | the `main` model, with caps | The turn ends when the model answers without calling a tool, or at the round cap (`[agent] max_rounds`, default 8). The last round offers no tools, so the model has to answer. A model that repeats a call twice loses its tools early. Each model call writes at most `[agent] max_output_tokens` (default 8,192, thinking included), and the whole turn has `[agent] turn_timeout` (default 5 minutes). A turn that hits a limit with no answer says sorry instead of going quiet |
 
 The `tools` and `search+tools` routes offer every allowed tool. `search` offers
-`datetime`, `about_meru`, the four read-only file tools, `read_file`, `list_folder`, `grep` and
-`search_files`, and the local commands that don't ask first. A question such as "write about everything
+`datetime`, `about_meru`, the six read-only file tools, `read_file`, `list_folder`, `grep`,
+`search_files`, `search_images` and `view_image`, and the local commands that don't ask first. A question such as "write about everything
 in my work folder" lands on `search`, and ten excerpts can't cover a folder. So
 does "what changed in the meru repo this week?" when `meru` is an indexed folder,
 and a declared `git log` answers it. A command with `confirm = true` changes
@@ -781,7 +818,7 @@ stays shorter.
 
 Every route, `direct` included, also offers `web_search` and `web_fetch` while
 `web_search` is on, which takes both `[builtin] tools` and `[web]
-searxng_url`. A real session drove this, here with an invented song: asked
+searxng_url`, and a SearXNG that answers its check. A real session drove this, here with an invented song: asked
 "what does the song maname maname sung by r. devi acvtually mean", typo and all, the router
 sent the question `direct` at 0.966, where the model had no web tool. The model knew the song only in
 part, called the `web-research` skill as if it were a tool, and told the user
@@ -795,12 +832,14 @@ URL.
 ### Approving a tool call
 
 When `dispatch` reaches a tool in the `confirm` list, the client shows the tool's name
-and arguments and offers the choices `merud` sends, at most these three:
+and arguments and offers the choices `merud` sends, from these:
 
 | Choice | What happens |
 | --- | --- |
 | Approve once | This call runs. The next call to the same tool asks again. |
-| Approve for this session | This call runs, and `dispatch` skips the prompt for that tool until the session ends. The approval covers the tool, whatever its arguments. |
+| Approve for this session | This call runs, and `dispatch` skips the prompt for that tool until the session ends. The approval covers the tool, whatever its arguments. Three kinds of call never offer it and ask every time: `configure`, `web_fetch` on a URL no search result or question gave, and an MCP tool in its server's `always_confirm` list. |
+| This website for this chat | `web_fetch` on a URL no search result or question gave, and only for a read, not a download: this call runs, and later reads on the same host run unasked until the session ends. The approval carries the host, which the button names. |
+| Always this website | The same, in every session: `merud` adds the host to `[web] trusted_sites` (see [Web search](#web-search)). |
 | Deny | The call doesn't run. Its outcome is `declined`, and the model hears that you said no, so it can answer without the tool or ask you what to do. |
 
 - **The question travels on the same socket.** `merud` sends the client an
@@ -822,7 +861,9 @@ and arguments and offers the choices `merud` sends, at most these three:
   [builtin]
   tools   = ["configure", "datetime", "about_meru", "remember", "write_file",
              "read_file", "list_folder", "grep", "search_files",
-             "web_search", "web_fetch"]   # all eleven, the default
+             "search_images", "view_image", "web_search",
+             "web_fetch", "search_notes", "list_notes",
+             "read_note", "schedule_job"]   # all seventeen, the default
   confirm = ["write_file"]   # the shipped default; add "remember" to approve each memory
   ```
 
@@ -832,17 +873,18 @@ and arguments and offers the choices `merud` sends, at most these three:
   works without it. An unknown name stops `merud` at load, with the valid names
   in the message, and so does a `confirm` entry that `tools` doesn't list. A
   listed tool still needs what it works on: the file tools need `[index]
-  folders`, `write_file` needs `[skills] output_dir`, and `web_search` needs
-  `[web] searxng_url`. Without it the tool stays off, and `merud` logs one info
+  folders`, `write_file` needs `[skills] output_dir`, `web_search` needs
+  `[web] searxng_url`, and the Apple Notes tools need a Mac. Without it the tool stays off, and `merud` logs one info
   line at startup that names the tool and the missing setting.
 
-  The built-in tools are `configure`, which always asks, whatever `confirm` says
-  (see [First run and setup](#first-run-and-setup)); `remember`, which saves a
+  The built-in tools are `configure` and `schedule_job`, which always ask,
+  whatever `confirm` says (see [First run and setup](#first-run-and-setup) and
+  [Scheduler](#scheduler)); `remember`, which saves a
   memory without asking unless you list it in `confirm`; `write_file`, which asks
   before each file it saves because the shipped list names it; the two web
   tools, `web_search` and `web_fetch` (see [Web search](#web-search)); the
-  clock tool, `datetime`; `about_meru`, which reports this setup; and four
-  read-only file tools. `web_search`, `datetime`, `about_meru` and the file
+  clock tool, `datetime`; `about_meru`, which reports this setup; six
+  read-only file tools; and three read-only Apple Notes tools. `web_search`, `datetime`, `about_meru` and the file
   tools run without asking unless you list them. `web_fetch` runs without asking for a URL a
   search result or your question gave, and asks otherwise:
 
@@ -850,12 +892,18 @@ and arguments and offers the choices `merud` sends, at most these three:
   | --- | --- |
   | `read_file` | A file's whole text, 12,000 characters per call, with the offset for the next call. PDFs come page by page. A bare filename that no folder holds is looked up in `<output_dir>/attachments/`, so the model can pass the name a mail tool reports. |
   | `list_folder` | A folder's folders, then its files with size and modified date, 1 to 3 levels deep, at most 300 entries. |
-  | `grep` | Every line that holds a word or an RE2 regular expression, as `path:line: text`, until 200 lines, 5 seconds or 20,000 files. A line longer than 200 characters shows the 200 around its first match. With no path it searches every folder but the past chats. |
+  | `grep` | Every line that holds a word or an RE2 regular expression, as `path:line: text`, until 50 lines (the model may ask for up to 200), 5 seconds or 20,000 files. A line longer than 200 characters shows the 200 around its first match. With no path it searches every folder but the past chats. |
   | `search_files` | The hybrid search of [Retrieval](#retrieval) for the model's own query: 8 excerpts by default, at most 20 and 14,000 characters, each numbered after the turn's other excerpts, with its path, heading and lines or page. Its excerpts join the turn's `sources` event. Offered when `[index] folders` is set. |
+  | `search_images` | The indexed images nearest to `query`, words for what a picture shows, or to `image`, the path of a picture in the `[index]` folders or an attached one under the output folder, read with the file tools' rules, a 20 MiB cap and a check that the bytes are an image. 8 by default, at most 20, numbered after the turn's other sources; the text holds only their paths, so the model names and cites them, and one with vision can open them with `view_image`. Offered when the index reads images. |
+  | `view_image` | The picture at `path`, in the `[index]` folders or attached under the output folder, for the model to look at on its next round. The bytes ride on the tool message's `images`, as on an attached picture's question; the result's text, which the transcript and `tool_calls` keep, is one line that names the file and its size, with the picture as an image source. The same checks as `search_images` apply. A picture over 1,536 pixels on its longest side goes as a JPEG scaled down to that, since the model's cost grows with the pixels: a 4,000 by 3,000 phone photo of a bill cost `qwen3.6:35b` 1,756 tokens at 1,536 pixels, and it still read every line. A WebP picture goes as it is, since Go's standard library can't decode it. A turn opens at most 8 pictures; a ninth call is refused with text that says so. Offered only while the `main` model lists `vision` (see [Questions with images](#questions-with-images)). |
   | `datetime` | The current date and time with weekday and zone; the time in another zone; a date's weekday and how many days it is from today. Offered on every route, `direct` included, because "what day is Christmas?" routes direct. |
   | `about_meru` | `merud`'s own facts, in under 2,000 characters: the profile; the `main`, `fast` and `embed` models and what each does; the main model's capabilities, size, quantization and context length from Ollama's `/api/show`; the Ollama version, on a labelled line of its own; the computer; the `[index]` folders with file and chunk counts and the size of `meru.db`; each MCP server and A2A agent with its state and tool count; the local commands, built-in tools, skills and memory counts by kind; the output folder; and `merud`'s build. It copies names, counts and paths only; secrets, env and header values, a server's last error, a memory's text and transcript lines stay out. Offered on every route, as `datetime` is: asked "which model are you using?" on a `direct` turn, a model answered from its training with another company's name and no version. Its description asks the model to quote names, versions and numbers as the tool gives them: with the version inside a sentence, a model read `Ollama 0.34.0` and wrote "Ollama 0.44". |
-  | `web_search` | Numbered web results from SearXNG: title, URL, a snippet and the date when known. Offered when `[web] searxng_url` is set, on every route, `direct` included. |
-  | `web_fetch` | One public web page's text, 12,000 characters per call, like `read_file`; with a `prompt`, the `fast` model's answer from the page; with `save`, a file saved in `~/meru-output/downloads/`. Offered while `[builtin] tools` lists it: on every route while `web_search` is on too, and on the tools routes alone otherwise. |
+  | `web_search` | Web results from SearXNG, numbered after the turn's other sources: title, URL, a snippet and the date when known. Each result joins the turn's `sources` event as a web source. Offered when `[web] searxng_url` is set, on every route, `direct` included. |
+  | `web_fetch` | One public web page's text, 12,000 characters per call, like `read_file`; with a `prompt`, the `fast` model's answer from the page; with `save`, a file saved in `~/meru-output/downloads/`. A page read takes the turn's next number and joins the `sources` event as a web source. Offered while `[builtin] tools` lists it: on every route while `web_search` is on too, and on the tools routes alone otherwise. |
+  | `search_notes` | The user's Apple Notes that hold every word of `query`, in the title or the text, ignoring case: notes whose title matches first, newest first, 10 by default and at most 30, each with its id, title, folder, modified date and a snippet. `folder` limits it to one Notes folder. Offered on the tools routes, on a Mac. |
+  | `list_notes` | With no `folder`, every Notes folder with its note count, then the newest notes; with a `folder`, that folder's notes, newest first. Each note comes with its id. |
+  | `read_note` | One note's text by its id, 12,000 characters per call with the offset for the next, like `read_file`. A locked note gives its title and says it's locked. |
+  | `schedule_job` | Saves a scheduled job the user asked for in chat, such as "every weekday at 7, brief me": a name, a cron schedule with `every_weeks` and `from`, and a prompt with an optional skill, or a declared command with its `args`, and an optional `output`. It never sets `allow`. It always asks, and the approval card shows the schedule in words and the next run beside the cron fields. A job's own turns never see it. See [Scheduler](#scheduler). |
 
   The file tools reach only the `[index] folders`, `[skills] output_dir`
   (`~/meru-output`) and, for `read_file`, `list_folder` and `grep`, the session
@@ -876,6 +924,31 @@ and arguments and offers the choices `merud` sends, at most these three:
   file inside it stays skipped, and the rest of `~/.meru`, `config.toml` and
   `secrets.toml` among it, stays out of reach. `merud` leaves the file tools
   out when no `[index]` folder is listed.
+
+  The Apple Notes tools read the Notes app's own database,
+  `~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite`, through
+  `internal/applenotes`. Each call opens it read-only, answers and closes it, so
+  an answer shows the notes as they are now, changes still in the database's
+  `-wal` file included. Meru keeps no index or copy of a note. Apple publishes
+  no schema, so the reader looks up the entity numbers for notes and folders in
+  `Z_PRIMARYKEY` and the column names with `PRAGMA table_info`, which differ
+  between macOS releases, and decodes a note's text from its gzipped protobuf
+  with `google.golang.org/protobuf`'s wire reader. Deleted notes and Recently
+  Deleted stay out, and a locked note's text is never read. The tools never
+  write: a row written behind the Notes app's back can break its iCloud sync,
+  and writing through the Notes app needs `osascript`, which Meru doesn't run
+  (see [Local commands](#local-commands)).
+
+  Reading the database needs Full Disk Access for `merud`, the program launchd
+  runs. macOS never asks for it; it refuses the open. Until the user grants it,
+  each Notes tool returns one sentence that says where to turn it on, the
+  Settings screen shows the same sentence, and `merud` logs at startup whether it
+  can read the notes. `merud` carries an ad-hoc signature, so macOS ties the
+  grant to the binary's exact build: after every update the user turns Full
+  Disk Access for `merud` off and on again. The Mac installer's Apple Notes step
+  walks the user through the grant (see [Installer](#installer)). A question that says "Apple Notes"
+  or "Notes app" gets the tools on a route that lacks them (see
+  [Routing](#routing)); the router itself isn't told about them.
 
   In `tool_calls` and the metrics, a built-in call has `kind = "builtin"` and
   `server = "meru"`.
@@ -899,22 +972,29 @@ and arguments and offers the choices `merud` sends, at most these three:
   arguments laid out to read, focus on the answer that runs nothing, and Edit
   first, which says no and puts the call in the composer as a draft (see
   [Desktop app](#desktop-app)).
-- **Nobody to ask means no.** A scheduled job, or a client that passed no way to
-  ask, can't say yes, so `dispatch` ends every call that needs a yes as `declined`
-  without a prompt. A job's output says which calls it skipped.
+- **Nobody to ask means no.** A client that passed no way to ask can't say yes,
+  so `dispatch` ends every call that needs a yes as `declined` without a prompt.
+  A scheduled job is the one exception, and a narrow one: a tool that would ask
+  once runs when the job's `allow` names it, and a call that asks every time is
+  declined whatever the job says (see [Scheduler](#scheduler)). A job's answer
+  says which calls it skipped.
 
 ### How a conversation continues
 
 - **A session is one transcript file.** `meru chat` keeps one session open until you
   quit. Each `meru "..."` one-shot starts a new session. The desktop app can reopen
   a past session and continue it.
-- **Each turn starts with the session's history.** `merud` loads your earlier
-  questions and Meru's earlier answers from this session, newest first, until the
-  history budget is full. Older turns drop out of the prompt but stay in the
-  transcript. From v0.4, search can find them there.
-- **Earlier tool results stay out of the history.** The answer that used a result
+- **Each turn starts with the session's history.** `merud` loads up to
+  `[agent] history_turns` (default 10) of your earlier questions and Meru's
+  earlier answers from this session, then drops the oldest until the rest fits
+  the history budget of 8,000 characters. Older turns drop out of the prompt but
+  stay in the transcript, and search can find them there.
+- **Raw tool results stay out of the history.** The answer that used a result
   already carries what mattered from it, and raw results can run to thousands of
-  tokens. The transcript keeps the full results.
+  tokens. The transcript keeps the full results. An earlier answer carries only
+  short notes: up to five notes of the web pages it read (see
+  [Web first](#web-first)), and a `[image: name]` note per picture its question
+  carried.
 - **The router sees the history too**, so it can tell that a follow-up like "reply
   to that thread and confirm I can make it" needs tools. It picks a route and nothing else;
   no model rewrites the follow-up.
@@ -1028,23 +1108,35 @@ Two profiles ship in `config.toml`. **`lite` is the default.**
 | --- | --- | --- |
 | `fast` | `hf.co/openbmb/MiniCPM5-2B-GGUF:Q4_K_M` (1.6 GB) | same |
 | `main` | same model as `fast` | `qwen3.6:35b-a3b-mxfp8` (38 GB, 8-bit) |
-| `embed` | `nomic-embed-text` (~260 MB, 768 dims) | `qwen3-embedding:0.6b` (1024 dims) |
+| `embed` | `embeddinggemma-2:440m` (713 MB, 768 dims, text and images) | same |
 | Hardware | 16 GB of RAM; runs on a CPU, faster with a GPU or Apple silicon | Apple silicon with 64 GB or more |
+
+Both profiles embed with `embeddinggemma-2:440m`, EmbeddingGemma 2 with its
+vision encoder. It puts text and images in one 768-number space, so a question
+can find a picture as well as a page, and it replaced `nomic-embed-text` and
+`qwen3-embedding:0.6b`. Changing the embedding model or its task prefixes makes
+`merud` drop every vector and re-embed every file on its next start (see
+[Storage](#storage)).
 
 - **`lite`** uses two small models. It downloads in a couple of
   minutes and runs on almost any computer. One model fills both `fast` and `main`, so
   only two models sit in memory.
 - **`full`** swaps in Qwen 3.6 35B-A3B, a mixture of experts that runs about 3B of
-  its 36B parameters per token, and a stronger embedding model. Its MXFP8 build
+  its 36B parameters per token. Its MXFP8 build
   runs on Ollama's MLX backend on Apple silicon. It was the fastest model in our
   benchmark (see [Models we tried](#models-we-tried)), and Ollama held 36 to 52 GiB
   for it while it answered, so `full` needs a 64 GB Mac.
+
+Speech to text runs outside Ollama in its own process, with a
+Whisper model per profile, so it takes none of Ollama's model slots (see
+[Speech to text](#speech-to-text)).
 
 `merud` keeps each model loaded by asking Ollama for `keep_alive: -1`, and warms every
 tier at startup. Ollama must allow enough models in memory at once
 (`OLLAMA_MAX_LOADED_MODELS`, 3 for `full`).
 
-The warm-up runs in two parts. Before the socket takes requests, `merud` sends
+The warm-up runs in two parts. Before `merud` takes questions (its socket is
+open, and answers that Ollama isn't ready yet), it sends
 the `fast` model a one-token "hi" and the `embed` model one short text: the
 router needs the first on every question, the store the second to open, and
 both load in a second or two. The answer model, the one a set in use names
@@ -1055,8 +1147,8 @@ and a one-token answer with the set's think setting. A question that reaches
 its first answer call before the load ends waits for that load, and a model
 switch waits too, so Ollama never loads the model twice or unloads it while
 it loads. The info log says `loading the answer model`, then `answer model
-warm` with the time it took, or `couldn't load the answer model` with the
-`ollama pull` command to run. A model that isn't pulled no longer stops
+warm` with the time it took; a failed load logs the error `couldn't load the
+answer model` with the `ollama pull` command to run. A model that isn't pulled no longer stops
 `merud`; the first question then fails with Ollama's reason.
 
 A real session showed why the warm-up uses a real prompt. `merud` warmed
@@ -1076,16 +1168,21 @@ memory, and the other choice, a load on the first question, is the wait the
 real session hit. So the warm-up stays on for every start.
 
 The `fast` tier needs a runtime that reports log probabilities, because
-[routing](#routing) reads them. Ollama added them in v0.12.11; `merud` reads
-`/api/version` when it starts and every 30 seconds after. On anything older it
-stays up, answers no question, and names both versions (see
+[routing](#routing) reads them. Ollama added them in v0.12.11. Meru needs
+v0.40.5 or later all the same, the first release tested to serve its
+embedding model, `embeddinggemma-2`, and to embed images; an older Ollama
+refuses to pull that model with HTTP 412. `merud` reads `/api/version` when it
+starts and every 30 seconds after. On anything older it stays up, answers no
+question, and says which version it found and where to update (see
 [SearXNG and Ollama](#searxng-and-ollama)). Routing costs no extra model: the `fast` model is already loaded.
 
-A new embedding model makes vectors of a different size, and every stored vector
-goes stale. The store records the embedding model's name and vector size. When
-either stops matching config, the store drops every vector and keeps the text, so
-keyword search keeps working while the indexer re-embeds your files (see
-[Storage](#storage)).
+A new embedding model makes every stored vector stale. So does a change to its
+query or document prefix, even when the model and vector size stay the same. The
+store records the model name, vector size and a fingerprint of both prefixes.
+When one changes, the store drops every vector and keeps the text, so keyword
+search keeps working while the indexer re-embeds your files. Older databases
+have no prefix fingerprint. When their model and vector size match, the store
+records the current fingerprint and keeps their vectors (see [Storage](#storage)).
 
 A 120B model at 4-bit needs ~60 GB, which leaves even the 64 GB development machine
 no room and makes it swap. Meru won't support models that size.
@@ -1184,7 +1281,7 @@ router fit beside macOS and a few open apps:
 
 | Memory | Answer model | Why |
 | --- | --- | --- |
-| 16 GB | MiniCPM5-2B, the `lite` profile (about 2 GB with `nomic-embed-text`) | the only answer model we tried that leaves room for the rest of the Mac; it passed 102 of 150, weakest where a task needs tools |
+| 16 GB | MiniCPM5-2B, the `lite` profile (about 2.3 GB with `embeddinggemma-2:440m`) | the only answer model we tried that leaves room for the rest of the Mac; it passed 102 of 150, weakest where a task needs tools |
 | 32 GB | `gemma4:26b-a4b-it-qat` (15 GB) | Gemma 4 at 4 bits: 120 of 150 tasks passed. Ollama loaded it in 15 GB with a 32,768-token context, about 18 GB with the router |
 | 48 GB | `qwen3.6:35b` (23 GB) | Qwen 3.6 35B at 4 bits passed 133 of 150, as many as the 8-bit build. Ollama loaded it in 23 GB with a 32,768-token context, about 27 GB with the router. `gemma4:26b-mxfp8` peaked at 40 GiB and `qwen3.6:35b-a3b-mxfp8` at 52, more than a 48 GB Mac can give them |
 | 64 GB or more | `qwen3.6:35b-a3b-mxfp8`, the `full` profile; `gemma4:26b-mxfp8` for work across several tools | the benchmark's figures above |
@@ -1239,7 +1336,8 @@ main  = "gemma4:26b-mxfp8"
 think = false
 ```
 
-A set names `main`, and may name `fast` and `embed`. `think = false` sends
+A set names at least one of `main`, `fast` and `embed`; a set without `main`
+keeps the answer model in use. `think = false` sends
 Ollama `think: false` with every answer call, so a model that reasons before
 it answers doesn't lose on time to first token for that reason alone; left
 out, each model does what it does by default. Outside a set, `[models] think`
@@ -1260,19 +1358,23 @@ this order, because `keep_alive: -1` keeps every model in memory, and three
 main models of 38, 28 and 17 GB would push a 64 GB Mac into swap and make every
 measurement after it noise:
 
-1. Wait for the startup load of the answer model to end, if it still runs,
-   then check that Ollama has the new main model, so a switch that can't
-   finish unloads nothing.
-2. Ask Ollama to drop the old answer model: `POST /api/generate` with the
-   model, no prompt and `keep_alive: 0` (`OllamaEngine.Unload`).
-3. Ask `/api/ps` every 100 ms until it no longer lists the old model, for at
-   most 10 seconds.
-4. Load the new model with a one-token question, so the first real question
-   doesn't pay for the whole load.
-5. Hand the model and its think setting to the agent, and only then reply.
+First, `merud` waits for the startup load of the answer model to end, if it
+still runs, then checks that Ollama has the new main model, so a switch that
+can't finish unloads nothing. Then come the three numbered steps:
 
-Steps 2 and 3 are skipped when the old answer model is also the `fast` or
-`embed` model, as in `lite`, since the router still needs it. A step that fails
+1. Ask Ollama to drop the old answer model: `POST /api/generate` with the
+   model, no prompt and `keep_alive: 0` (`OllamaEngine.Unload`).
+2. Ask `/api/ps` every 100 ms until it no longer lists the old model, for at
+   most 10 seconds.
+3. Load the new model with a one-token question, so the first real question
+   doesn't pay for the whole load.
+
+Last, `merud` hands the model and its think setting to the agent, and only
+then replies.
+
+Steps 1 and 2 are skipped when the old answer model is the new one, or is also
+the `fast` or `embed` model, as in `lite`, since the router still needs it. A
+step that fails
 comes back as an error that names it, such as "step 2 of 3: Ollama still holds
 qwen3.6:35b in memory after 10s", and the answer model and the set in use stay
 as they were. One switch runs at a time.
@@ -1281,9 +1383,9 @@ Only the main model changes while `merud` runs. The router, the skill pick, the
 summarizer and the index read the `fast` and `embed` models at startup, so a
 set's `fast` and `embed` models take effect once the set is saved and `merud`
 restarts, and the reply says so. A set that changes `embed` needs `--rebuild`:
-a new embedding model makes vectors of another size, every stored vector goes
-stale, and `merud` re-embeds every file in the `[index]` folders at that
-restart. A set that changes `fast` carries a warning, because the router needs
+a new embedding model or changed task prefixes make every stored vector stale,
+and `merud` re-embeds every file in the `[index]` folders at that restart. A
+set that changes `fast` carries a warning, because the router needs
 log probabilities and one token per route letter (see [Routing](#routing)).
 
 **Which model wrote each answer.** Before an answer whose model differs from
@@ -1318,14 +1420,40 @@ questions about images, and search questions from the excerpts search puts in
 the prompt, and can't read mail, notes, the web or files on its own. The
 Settings says so on its card, and `model_set` replies with a warning.
 
-**Context length.** `merud` sends `num_ctx` with every chat call, from
-`[ollama] context_length`, 32768 by default. Meru's prompts with tool schemas
-run to about 20,000 tokens, the benchmark ran at 32768, and Ollama's own
-default can be far smaller, which would cut the prompt short on a fresh
-install. Every call sends the same value, because Ollama reloads a model whose
+**Context length.** `merud` sends `num_ctx` with every chat call. Meru's
+prompts with tool schemas run to about 25,000 tokens, and Ollama's own default
+can be far smaller, which would cut the prompt short on a fresh install. Each
+call to one model sends the same value, because Ollama reloads a model whose
 `num_ctx` changes. The `CONTEXT` column of `ollama ps` shows what each loaded
-model got. `context_length = 0` leaves the choice to Ollama and
-`OLLAMA_CONTEXT_LENGTH`.
+model got.
+
+The answer model gets a window sized for it. Before it loads, at startup and
+on each switch, `merud` asks Ollama's `/api/show` for the most tokens the model
+can read and its attention shape: the layers, the cached heads in each, and
+their width. From the shape it works out the memory a token of context takes
+in Ollama's cache, at 2 bytes a number:
+
+```text
+bytes a token = (cached heads over all layers) × (key width + value width) × 2
+```
+
+The window is the model's most, cut to what fits in an eighth of the
+computer's memory, and never less than `[ollama] context_length`, 32768 by
+default. Ollama sets the cache's memory aside for the whole window when the
+model loads, so the cap matters: `qwen3.6:35b` caches heads in one layer of
+four and takes about 20 KB a token, so its full 262,144 tokens cost 5.4 GB and
+fit an eighth of a 64 GB Mac; a dense model of its size can take ten times as
+much a token and gets a smaller window. The fast and embedding models keep
+`context_length`, since they read short prompts. When the fast model is the
+answer model, as on `lite`, it loaded at `context_length` before `merud` sized
+its window, and loads once more on the next question.
+
+`context_length` is the fallback for a model whose shape Ollama doesn't
+report, such as `gemma4`, and `context_length = 0` leaves every window to
+Ollama and `OLLAMA_CONTEXT_LENGTH`. The agent loop reads the answer model's
+window, to keep a turn's tool rounds inside it (see [Agent loop](#agent-loop),
+step 5). `merud.log` says what it chose at info: `answer model window
+model=qwen3.6:35b window=262144 model_max=262144 cache_mb=5120`.
 
 ---
 
@@ -1337,7 +1465,7 @@ The interface has four methods:
 type Engine interface {
     Generate(ctx context.Context, msgs []Message, tools []ToolSpec, opts Options) (Completion, error)
     Stream(ctx context.Context, msgs []Message, tools []ToolSpec, opts Options) (iter.Seq2[Delta, error], error)
-    Embed(ctx context.Context, texts []string) ([]Vector, error)
+    Embed(ctx context.Context, inputs []Input) ([]Vector, error)
     Info(ctx context.Context) (ModelInfo, error)
 }
 ```
@@ -1362,13 +1490,31 @@ and `Completion` gains `LogProbs`: for each generated position, the chosen token
 the alternatives the model weighed, each with its log probability. Both default to
 off, so other callers see no change, and the interface keeps its four methods.
 
-Two more methods sit outside the interface, for the model ops alone.
-`Unload` drops a model from Ollama's memory with a `POST /api/generate` that
-sets `keep_alive: 0`, and `Pulled` reads `GET /api/tags` with each model's size
-on disk.
+`Embed` takes `[]Input`, not plain strings. An `Input` is a text, an image's
+bytes, or both, with a `Title` for a document and a `Query` flag for a search
+query. Images reached the embed call as a field, the way they reached the chat
+call as `Message.Images`, so the interface kept its four methods. The engine
+applies the embedding model's task prefixes, which `merud` hands it from
+`config.EmbedModels`: for `embeddinggemma-2`, `task: search result | query:
+{query}` on a query and `title: {title} | text: {text}` on a document, and none on
+an image. A model Meru doesn't list gets the text as it is. A text-only input goes
+to `/api/embed` as a plain string, and anything with an image as `{"text",
+"image"}` with the image in base64. Ollama also accepts two shapes that look right
+and aren't: an `images` list beside `input`, which it ignores, and a
+`data:image/...;base64,` string, which it embeds as text. Both return a vector
+that has nothing to do with the picture. `Embed` also sends the model's full
+context as `num_ctx` on every call, because Ollama may load an embedding model
+with less and cuts a longer input without an error.
 
-For images, `Message` gains `Images`, the raw bytes of each image on a user
-message. `OllamaEngine` sends them as the message's `images` array in
+Four more methods sit outside the interface, for the model ops and the
+capability checks. `Unload` drops a model from Ollama's memory with a
+`POST /api/generate` that sets `keep_alive: 0`, and `Pulled` reads
+`GET /api/tags` with each model's size on disk. `Details` and `Capabilities`
+come below.
+
+For images, `Message` gains `Images`, the raw bytes of each picture: on the
+user message for an attached image, and on the tool message for a picture
+`view_image` opened. `OllamaEngine` sends them as the message's `images` array in
 `/api/chat`, which Ollama documents as base64 strings; Go's `encoding/json`
 writes a `[]byte` that way with no code of ours. Only a model with the `vision`
 capability can read them, and Ollama's `POST /api/show` lists a model's
@@ -1377,11 +1523,15 @@ capabilities, such as `["completion", "vision", "tools", "thinking"]`.
 the quantization and the context length, and keeps each model's answer for the
 life of the engine; a failed call keeps nothing. `Capabilities` reads the list
 through `Details`, and `Pulled` reads `GET /api/tags`, the models Ollama has on
-disk. All three sit outside the interface, which keeps its four methods: `merud`
+disk. These sit outside the interface, which keeps its four methods: `merud`
 hands the agent a check built on `Capabilities` for image turns and another for
 whether the answer model can take tools; `about_meru` and the models in Settings
 need `Details`, and only the models in Settings need `Pulled`. The "ollama http"
 debug line counts a request's images; no log line or span holds their bytes.
+
+Speech to text doesn't go through the interface: it runs in
+whisper.cpp's server, not in Ollama, and `internal/speech` talks to it (see
+[Speech to text](#speech-to-text)).
 
 Two engines may come later, behind the same interface:
 
@@ -1411,11 +1561,12 @@ order.
    the question, with an earlier question appended on a follow-up. No model
    rewrites the query. The `tools` route searches too: the router sends some
    questions about your files there, and an answer from the files beats one from
-   the model alone. Four rules then adjust the route (see [Routing](#routing)):
+   the model alone. Five rules then adjust the route (see [Routing](#routing)):
    a `direct` question that names an indexed folder or asks about past chats
    becomes `search`, a question that names a connected tool server gets tools, and so does a
-   question that says "remember", asks for the web, gives a URL, or names
-   what a connected server's tools act on ("email" for Gmail's tools). The
+   question that says "remember", names Apple Notes, asks for the web, gives a
+   URL, or names what a connected server's tools act on ("email" for Gmail's
+   tools). The
    same signs skip the search on a `tools` turn: a web, mail or notes-app question gets no
    excerpts, which crowd the answer and cost time, and the file tools stay on
    offer. `search` and `search+tools` always search. From v0.4, a separate
@@ -1446,8 +1597,10 @@ order.
    question on an Apple silicon Mac with `nvidia-smi`), your profile, the note on your folders, a line on what
    Meru's own tools can change (with, when config allows `about_meru`, a line
    that sends questions about Meru itself, such as which model answers, to that
-   tool instead of the model's training), a line that says where your past
-   chats are, the tools note, and the list of skills. The parts each question changes come after: recalled memories, the
+   tool instead of the model's training), a line that says the model can look at
+   pictures with `view_image` (when config allows it and the `main` model lists
+   `vision`), a line that says where your past chats are, the tools note, and
+   the list of skills. The parts each question changes come after: recalled memories, the
    picked skills' instructions, file excerpts with earlier conversations, and
    what the web-first step found. The time of day goes last, to the minute
    with the zone and its offset from UTC, such as "The time now is 20:02 EDT
@@ -1480,10 +1633,20 @@ order.
    tokens. The caps keep one part from crowding out the others; a `lite` turn
    uses well under a tenth of the model's 131k-token window. On the `tools` and
    `search+tools` routes the model also gets the allowed tools' schemas; on
-   `search` it gets the four file tools' schemas and those of the local
-   commands that don't ask, with a note that says it may run the `cmd.` tools.
+   `search` it gets the file tools' schemas (`read_file`, `list_folder`, `grep`
+   and `search_files`, and `search_images` and `view_image` while images and
+   vision allow them) and those of the local commands that don't ask.
    Every route gets the schemas of `datetime` and `about_meru`, and of
-   `web_search` and `web_fetch` while `web_search` is on.
+   `web_search` and `web_fetch` while `web_search` is on. On an Auto turn the
+   route's list decides what the model sees, not what runs: a call to an allowed
+   tool the round didn't offer still goes through `dispatch` and runs, and the
+   turn counts it as a malformed call (see [Model sets](#model-sets)). A route
+   offers fewer tools to keep the prompt short, and a model that rightly reaches
+   for another allowed tool shouldn't fail for it. On a turn whose scope the user
+   picked, the list is a fence: the agent hands `dispatch` the round's offer as
+   `Call.Offered`, and `dispatch` denies any other tool, with a line telling the
+   model to use the tools it was given. The call still gets its `tool_call` and
+   `tool_result` lines and its `tool_calls` row, with the outcome `denied`.
    The note on the file tools says it may read whole files, list folders, grep
    and search again when the excerpts fall short. A turn that offers
    `web_search`, on any route, adds a line to the tools note: "When you aren't
@@ -1517,7 +1680,8 @@ order.
    budget for thinking: `think` only turns it on or off.
 4. **Dispatch tools.** Every call goes through one function, `dispatch`, in this
    order:
-   1. **Allowlist.** A tool that no backend offers is `denied`. It doesn't run,
+   1. **Allowlist.** A tool that no backend offers is `denied`, and on a turn
+      whose scope the user picked, so is a tool the round didn't offer. It doesn't run,
       but it still gets a `tool_call` line, a `tool_result` line and a
       `tool_calls` row, so a model that keeps reaching for forbidden tools shows
       up in the log. A call named after a skill, such as `web-research`, gets
@@ -1525,7 +1689,9 @@ order.
    2. **Transcript.** The `tool_call` line goes in before the call runs. If it
       can't be written, the call doesn't run.
    3. **Confirm.** Each tool asks never, asks unless approved for this session, or
-      asks every time (`configure` only). If you say no, or nobody can be asked,
+      asks every time (`configure`, `web_fetch` on a URL no search result or
+      question gave, and an MCP tool in its server's `always_confirm` list). If
+      you say no, or nobody can be asked,
       the outcome is `declined`.
    4. **Call.** The MCP server, A2A agent, built-in tool or local command runs,
       under its own timeout. The outcome is `ok`, `error`, `timeout` or
@@ -1560,6 +1726,41 @@ order.
    the second repeat, later rounds offer no tools. A 2B model offered only
    `datetime` once called it with no arguments in all eight rounds.
 
+   Each round sends every earlier call and result again, so a turn that reads
+   many pages can outgrow the answer model's context window (see Context
+   length under [Model sets](#model-sets)). Ollama
+   then stops the answer with `length` after a few hundred words. Before each
+   new round, `merud` estimates the prompt: the tokens Ollama counted for the
+   round that just ran, plus the new messages' characters divided by three.
+   Only an engine that reports no count gets every character divided by three,
+   which runs far high on tool schemas: in one turn it passed the limit while
+   Ollama counted 18,000 tokens, and the turn lost its tools after one search.
+   When the estimate passes 80% of the
+   window, it shortens this turn's oldest tool results, oldest first, to their
+   first 400 characters and a note that tells the model to call the tool again
+   if it needs the whole result. The 20% left over is room for the answer. A
+   shortened call no longer counts toward repeats, so calling it again runs it.
+   The newest round's results stay whole, since the model hasn't read them,
+   and so do the system prompt, the history and the question, which the
+   context budget sizes (`agent/budget.go`). When shortening isn't enough, later
+   rounds offer no tools, so the model answers from what it has. A model that
+   calls a tool anyway gets one more round, with a user message that says tools
+   are off and asks for the answer now; this shares the one retry a turn has
+   with the empty-reply retry below. In a real turn the model wrote "I'll pull
+   the full text of the top 4 articles" with five calls that couldn't run, and
+   the user read that plan as the answer. The turn then ends `window_full`, and
+   the answer closes with a note that the prompt filled the context window, so
+   the answer uses only what it read, and that Continue picks it up. The prompt
+   Meru builds before any tool runs is large: with the full model set, the
+   system prompt, skills, excerpts and about 15,000 tokens of tool schemas came
+   to 24,485 tokens, which leaves a 32,768-token window little room for
+   results; the window `merud` sizes for the answer model leaves it more. The transcript
+   keeps every result whole. The turn span records `meru.turn.shortened_results`
+   and `meru.turn.window_full`. With `context_length = 0` Meru doesn't know the
+   window and shortens nothing. In a real turn that read about twenty pages,
+   the prompts of its rounds added up to about 169,000 tokens against a
+   32,768-token window, and the answer stopped after 650 tokens.
+
    A round can end with no text and no tool call, when a thinking model spends
    it all on hidden reasoning. When the turn has a round left and the round
    didn't stop at `max_output_tokens`, `merud` asks once more: the same
@@ -1575,7 +1776,8 @@ order.
    wrote. Ollama then sends an `{"error": ...}` line in the stream after its
    200 OK, and the engine returns `ErrModelOutput` (see
    [Engine layer](#engine-layer)). When the turn has a round and time left,
-   `merud` runs the round once more with the same tools, plus a user message:
+   `merud` runs the round once more with the same tools (none, when the retry
+   is the turn's last round), plus a user message:
    "Your last tool call didn't parse, so it didn't run. Call the tool again
    with valid arguments, or answer in plain text." Text the failed round
    streamed stays on screen, and a blank line separates it from the retry's
@@ -1598,14 +1800,44 @@ ends without a full answer still answers, with an outcome of its own:
 | --- | --- | --- |
 | `timeout` | `turn_timeout` ran out | the text so far and a note that it stopped, or a sorry |
 | `cut_off` | the last call hit `max_output_tokens` | the text so far and a note that it stopped, or a sorry |
-| `gave_up` | the rounds ended with no text, such as only tool calls, even after the one retry | "Sorry, I couldn't answer that. Try asking again, or rephrase the question." |
+| `window_full` | the tool results filled the context window, so later rounds offered no tools (step 5) | the answer from what it read, then a note naming the window's size and pointing at Continue |
+| `gave_up` | the rounds ended with no text, such as only tool calls, even after the one retry when a round was left for it | "Sorry, I couldn't answer that. Try asking again, or rephrase the question." |
 | `bad_output` | Ollama couldn't parse the model's output, even after the one retry | any text so far, then "The model wrote a tool call that Ollama couldn't read, twice. Try asking again, or rephrase the question." (without "twice" when no round was left to retry) |
-| `no_vision` | the question carried images and the main model lacks the `vision` capability | "<model> can't look at images, so Meru didn't send it this question. Pick a model with vision for [models] main in config.toml. To check a model, run `ollama show <model>` and look for "vision" under Capabilities." |
+| `no_vision` | the question carried images and the main model lacks the `vision` capability | when the index holds images like the first one: "Here are the images in your folders most like the one you attached:", the list, and a line that the model can't look at pictures. Otherwise: "<model> can't look at images, so Meru didn't send it this question." Both end with the suggestion described in [Questions with images](#questions-with-images). |
 
 The words go out as ordinary `token` events, so both clients show them as the
 answer. The outcome goes on the `meru.turn` span, the `turn` log line and
-`meru.turn.duration`, and in the assistant line's `outcome` field in the
-transcript.
+`meru.turn.duration`, in the assistant line's `outcome` field in the
+transcript, and in the `done` event's `outcome` field, empty for a full answer.
+
+### Continuing an answer
+
+An answer that ends `cut_off`, `window_full` or `timeout` stopped with work worth keeping: the
+pages it read and the calls it made. Asking again would do that work over, so
+both clients offer **Continue** under the chat's newest answer when it stopped
+short: a button in Meru.app and `/continue` in `meru chat`. Either sends an
+`ask` with `continue: true` and the chat's session, and no text of its own.
+
+`merud` reads the session's last turn from its transcript, which already holds
+the question, every tool call with its arguments and result, and the answer so
+far. It hands the model, in place of a question, a summary of that turn:
+
+- the last question, quoted;
+- each tool call, with its arguments and the first 600 characters of its
+  result, or how it failed; past 8,000 characters the oldest calls drop out,
+  since a long summary would fill the window that cut the answer off;
+- a request to pick up where the answer stopped, use these results, call a tool
+  only for what is still missing, and not repeat what it wrote.
+
+The answer so far reaches the model through the history, as every earlier
+answer does. The turn routes, searches and recalls memories on the last
+question, and skips the web-first step, since the summary holds what the web
+gave. The URL guard knows the URLs of the last question as before. The
+transcript's user line reads "Continue", what the user pressed, and a later
+turn's history shows the same. `merud` refuses Continue on a chat whose last
+answer is whole: "the last answer in this chat is complete, so there is nothing
+to continue." `meru run --json` starts a session per question, so it has nothing
+to continue and doesn't offer it.
 
 `dispatch` sees the tools through one interface, `Backend`, with four
 implementations in a fixed order: the built-in tools, the local commands, the MCP
@@ -1618,20 +1850,36 @@ dropped, and their `tool_calls` rows record the cancellation.
 
 ### Questions with images
 
-A question from the desktop app can carry up to five images (see
-[Desktop app](#desktop-app)). `merud` reads each one from the uploads folder
+A question can carry up to five images, attached in the desktop app (see
+[Desktop app](#desktop-app)) or from a terminal (below). `merud` reads each one from the uploads folder
 before the turn starts, then asks `OllamaEngine.Capabilities` whether the `main`
 model lists `vision`. When it doesn't, the turn calls no model and answers with
-the `no_vision` message above; the message names the model from config and says
-how to check another, and names none of its own, since the list of models with
-vision changes with each release. When it does:
+the `no_vision` message above. The message ends with a suggestion drawn from your
+own `[[models.sets]]`: the first set, in config order, whose `main` model lists
+both `vision` and `tools` and that Ollama has pulled, as in "qwen3.6:35b can:
+switch to it with `/model qwen-4bit` in meru chat, or Use for answers in
+Settings, Models." With no such set, it says to pick a model that can see
+pictures with `/model` or in Settings, Models. The names come from config, never
+from code, since the models with vision change with each release.
+
+**Images like it.** When the index reads images (see [What gets
+indexed](#what-gets-indexed)), `merud` first embeds the question's first image
+and finds the eight indexed images nearest to it, before the vision check and
+with no chat model call (the embedding is the only model call). The search is the turn's search: it goes out as the `sources`
+event, numbered from `[1]`, and the turn searches no text, so the answer's numbers
+point at one list. Without vision, the answer is that list. With vision, the list
+joins the prompt, and the model, which sees the attached image and the paths of
+the found ones, can open any of them with `view_image` and say which fit. A failed or empty search leaves the turn as
+it was. When the model has vision:
 
 - **No router.** The `fast` model reads text alone, so its guess would ignore
   what the question is about. The turn takes the route its scope gives, as a
   scoped turn does, and `direct` in Auto, with the tools `direct` offers. A
   scope still holds: My files searches first, and Mail and calendar and Web
-  offer their tools, with the images on the question all the same. Skills are
-  still picked from the question's text.
+  offer their tools, with the images on the question all the same. Every
+  scope, Just talk included, gets the list of similar images in the prompt and
+  the `sources` event when the search found some. Skills are still picked from
+  the question's text.
 - **This turn only.** The images go on the question's user message, and on no
   other. The transcript's user line keeps their full paths in an `images`
   field, never their bytes, and a later turn's history carries a text note per
@@ -1643,8 +1891,10 @@ vision changes with each release. When it does:
   turn's info line an `images` count, and a debug line the count and total
   bytes. No span or log line holds an image.
 
-`meru` and `meru chat` send no images: a terminal has no picker or drop, and
-the one-shot client would need a second request to copy the file first.
+The terminal clients send images too. `meru -image shot.png "..."` and
+`/attach <path>` in `meru chat` first ask `merud` to copy the file into the
+uploads folder with `attach_file`, then name the copy in the question, as the
+desktop app's attach button does.
 
 ### Claims no tool backs
 
@@ -1687,8 +1937,11 @@ changes in its own description.
 
 The second part checks the answer. A turn that ended without a full answer,
 `bad_output` among them, gets no check, since it ends in Meru's own message.
-When a turn ends with a full answer and no tool call in it ended `ok`, `merud` reads the answer sentence by sentence,
-leaving out code blocks, and looks for a claim of a finished action:
+When a turn ends with a full answer and no tool call the model made ended `ok`
+(the calls `merud` makes itself for [Web first](#web-first) don't count), `merud`
+reads the answer sentence by sentence, leaving out code blocks, and looks for a
+claim of a finished action. The table gives the main shapes; `honest.go` holds
+the full word lists:
 
 | Rule | Matches |
 | --- | --- |
@@ -1698,9 +1951,9 @@ leaving out code blocks, and looks for a claim of a finished action:
 | "I", "I've" or "I have", with one word allowed between, and moved, saved, sent, deleted, removed, renamed, copied or scheduled | "I've moved the folder", "I just sent the email" |
 | the same with created, updated, wrote or written, when the sentence names a file, folder, note, email, event, reminder, calendar or a path | "I've created the file ~/notes/plan.md" |
 
-A sentence that ends in "?", or that holds "if", "want me", "I can", "I'll", "let
-me", "not", "never" or any "n't", counts as a question, an offer or a denial, and
-never as a claim. Case doesn't matter, and every pattern matches whole words.
+A sentence that ends in "?", or that holds words such as "if", "want me", "I
+can", "I'll", "let me", "shall I", "would you", "not", "never", "unable" or any
+"n't", counts as a question, an offer or a denial, and never as a claim. Case doesn't matter, and every pattern matches whole words.
 
 When a claim turns up, `merud` sends a `notice` event after the last `token` and
 before `done`, with the text "Meru didn't run any tool for this answer, so
@@ -1774,9 +2027,10 @@ classification and reads the answer from the model's probabilities:
    (`num_predict = 1`, `logprobs = true`, `top_logprobs = 20`) and with thinking
    off (`think = false`). A thinking model such as MiniCPM5 otherwise spends its
    one token starting its hidden reasoning, and no letter comes back.
-3. The router keeps the alternatives whose text is one of the four letters, turns
-   each log probability back into a probability, divides by a fitted temperature,
-   and normalizes the four so they sum to 1.
+3. The router keeps the alternatives whose text is one of the four letters,
+   adding up variants such as " A" and "a", divides each log probability by a
+   fitted temperature, turns it back into a probability, and normalizes the four
+   so they sum to 1.
 4. The most likely letter is the route, and its probability is the confidence.
 
 ![Flow chart of the router. The prompt lists four lettered routes, A answer, B search, C tools and D search+tools, then examples and the turn, and ends with Answer:. The fast model in Ollama returns one token with log probabilities, with num_predict = 1, logprobs = true and top_logprobs = 20. The router keeps the letters A to D, applies the temperature and scales the four to sum to 1. When the top probability reaches min_confidence and at least two letters came back, the route is the most likely letter, with outcome ok. Otherwise the router falls back to search+tools, with outcome low_confidence, or degraded when fewer than two letters came back.](docs/architecture/img/300-routing.png)
@@ -1838,8 +2092,9 @@ France" searches too, because the assistant shares its name with the folder.
 
 The first rule also moves a `direct` question about past chats to `search`: one
 that names a chat, conversation or session along with "previous", "earlier",
-"past", "last", "before", "ago", "yesterday", "prior", "old", "older" or
-"history", or says "we" with "talked", "discussed" or "chatted". The router
+"past", "last", "before", "ago", "yesterday", "prior", "old", "older",
+"history", "folder", "tag", "tags" or "tagged", or says "we" with "talked",
+"discussed" or "chatted". The router
 sent "check my previous conversations with you, what were they all about" to
 `direct`, which offers neither the recalled sessions nor the file tools, and the
 model said it had no access to past conversations. `search` offers both (see
@@ -1860,14 +2115,19 @@ that holds the tool schemas.
 The third: when the question holds "remember" as a whole word and the route is
 `direct` or `search`, the loop adds the rest, so the model can call `remember`. "Remember that I
 work on the registry team" reads like chit-chat to the router, and a `direct` turn
-would answer "noted" and save nothing.
+would answer "noted" and save nothing. The same rule covers Apple Notes: a
+question that says "Apple Notes" or "Notes app" gets tools while the Apple Notes
+tools are on. "My notes" alone doesn't count, since it may mean the notes in
+your folders or an Obsidian vault. The router's prompt doesn't name these
+tools: adding "web pages" and "remember" to it once cut its accuracy on the
+labelled fit set from 0.907 to 0.850.
 
 The fourth: when the question asks for the web and `web_search` exists, or gives
 an http or https URL and `web_fetch` exists, and the route is `direct` or
 `search`, the loop adds the rest. A question asks for the web when it holds one
 of these phrases as whole words, in any case: "web", "internet", "online", "the
-net", "web search", "internet search", "search the web", "search the internet",
-"search online", "look up", "look it up" (or "this", "that", "them"), "google
+net", "web search", "websearch", "internet search", "search the web", "search
+the internet", "search the net", "search online", "look up", "look it up" (or "this", "that", "them"), "google
 it" (or "this", "that", "for"), "do research", "do some research", "deep
 research", and "research about" (or "this", "it", "that"). "research" alone
 isn't on the list, since "summarise my research folder" is about your files,
@@ -1896,9 +2156,10 @@ saying thanks", and the second rule still catches "search my obsidian vault for
 notes about sourdough", which the router sends to `search`. All five rules stay.
 
 `make router-eval` scores the router against the local Ollama on a labelled set of
-153 questions, 46 of them held out, and fits the temperature. It also compares
-the two `decision` rules on the same answers. With the connected list, `top`
-got 131 of the 153 right against 126 without it, and missed a needed search or
+162 questions, 48 of them held out, and fits the temperature. It also compares
+the two `decision` rules on the same answers. The figures here come from the set
+when it held 153 questions, before nine questions about pictures joined it. With
+the connected list, `top` got 131 of the 153 right against 126 without it, and missed a needed search or
 tool on 15 against 20; it offered unneeded tools on 5 against 2. The list adds
 about 48 tokens to the prompt. At 1.25 the
 probabilities sit close to calibrated, so `min_confidence = 0.45` means what it
@@ -1914,9 +2175,9 @@ The full design, with the prompt contract, tests and calibration results, is in
 Meru keeps two kinds of data, with one rule between them: **files hold the truth,
 and the database indexes them.** Delete `meru.db` and `merud` rebuilds it.
 
-![Diagram with the files that hold the truth on the left and meru.db on the right. The indexer chunks and embeds your folders into documents, chunks, chunk_fts and chunk_vec. Replaying the session transcripts fills tool_calls and, from v0.4, sessions, messages, message_fts and session_vec. The indexer embeds the memory files into memories, memory_fts and memory_vec. Reading config.toml and skills fills meta and, from v0.5, jobs and job_runs. Delete meru.db and merud rebuilds every table from the files.](docs/architecture/img/300-storage.png)
+![Diagram with the files that hold the truth on the left and meru.db on the right. The indexer chunks and embeds your folders into documents, chunks, chunk_fts and chunk_vec. Replaying the session transcripts fills tool_calls and turns and, from v0.4, sessions, messages, message_fts, summary_fts and session_vec. A syncer embeds the memory files into memories, memory_fts and memory_vec. Reading config.toml fills meta. From v0.5 a turn row also names the scheduled job it ran for. Delete meru.db and merud rebuilds every table from the files.](docs/architecture/img/300-storage.png)
 
-*Figure 4. Every arrow runs left to right, and every table on the right has a file behind it, memories included. v0.2 built `documents`, `chunks`, `chunk_fts`, `chunk_vec` and `meta`, and v0.3 added `tool_calls`; the rest arrive with later milestones, as the table below marks. Edit a memory file by hand and the indexer picks up the change the same way it does for your notes.*
+*Figure 4. Every arrow runs left to right, and every table on the right has a file behind it, memories included. v0.2 built `documents`, `chunks`, `chunk_fts`, `chunk_vec` and `meta`, and v0.3 added `tool_calls` and `turns`; the rest arrive with later milestones, as the table below marks. Edit a memory file by hand and the indexer picks up the change the same way it does for your notes.*
 
 ### Session transcripts
 
@@ -1959,16 +2220,22 @@ before the model's first round (see [Web first](#web-first)); a call the model
 asked for has no `caller`. An assistant line whose turn read the web gets a
 `web` field: up to five notes, each a URL, a title and a gist of at most 300
 characters, pages before search results, 1,500 characters in all. History hands
-them to the model after the answer, one line each:
+them to the model after the answer, under a line that marks them as Meru's,
+one line each:
 
 ```text
-[from the web: Acme Flow https://acme.example/flow — Acme Flow moves notes between apps.]
+(Meru's notes on the pages this turn read, for later questions. They aren't part of the answer above; never copy them into an answer, and cite pages by number as usual.)
+- Acme Flow https://acme.example/flow — Acme Flow moves notes between apps.
 ```
+
+The line above the notes says who wrote them and that they aren't for the user.
+When the notes were bare `[from the web: …]` lines, a model answering a
+follow-up copied them, run together, onto the end of its answer.
 
 A user line gets an `images` field, the full paths of the copies in the uploads
 folder, only when the question carried images; the bytes stay in the files. An
 assistant line gets an `outcome` field only when the turn ended without a
-full answer: `timeout`, `cut_off`, `gave_up`, `bad_output` or `no_vision` (see
+full answer: `timeout`, `cut_off`, `window_full`, `gave_up`, `bad_output` or `no_vision` (see
 [Agent loop](#agent-loop)). It gets a `notice` field only when the answer
 claimed an action and no tool call in the turn succeeded (see
 [Claims no tool backs](#claims-no-tool-backs)).
@@ -2004,8 +2271,8 @@ files with mode `0600`, so only you can read them.
 | `memories` (v0.4) | one row per memory file: its ID (`<kind>/<name>.md`), kind, text, created, source, mtime and content hash | `memory/*/*.md` |
 | `memory_vec` / `memory_fts` (v0.4) | vector and keyword indexes over memories | memories |
 | `turns` | one row per answered question: session, start time, source, route, tokens in and out, duration, tool calls, the files its prompt read, trace ID, and the answer model with its time to first token, writing time, bad calls and whether the turn hit the cap. `meru usage` and the chat's usage numbers count it | `sessions/*.jsonl` (the assistant line holds route, duration, files and the model's numbers; the `model_switch` lines name the model) |
-| `jobs` / `job_runs` (v0.5) | scheduled jobs and each run's outcome | jobs: `[[jobs]]` in `config.toml`; runs: the job's session transcript |
-| `meta` | schema version, embedding model name and vector size | config |
+| `turns.job` (v0.5) | which job a run belongs to, for each job's last run | the run's transcript: its user line names the job; the jobs themselves are `[[jobs]]` in `config.toml` and stay out of the database |
+| `meta` | schema version, embedding model name, vector size and task-prefix fingerprint | config |
 
 v0.2 built `documents`, `chunks`, `chunk_vec`, `chunk_fts` and `meta`, and v0.3
 added `tool_calls`. Each other table arrives with the milestone marked beside it.
@@ -2019,13 +2286,17 @@ reads the newest rows. When `merud` starts and finds the table empty, it rebuild
 the table from the transcripts, pairing each call's lines by `call_id`; a call with
 no `tool_result` line, because `merud` stopped mid-call, gets the outcome
 `cancelled`. `messages` and `tool_calls` store the trace ID of their turn, so you
-can jump from a slow trace in Grafana to the rows it produced, and back.
+can jump from a slow trace in your OTLP backend to the rows it produced, and back.
 
-When the embedding model's name or vector size in `meta` stops matching config, the
-store deletes every row of `chunk_vec`, `memory_vec` and `session_vec` and keeps
-`documents`, `chunks`, `memories` and `sessions`. Keyword search keeps working while
-the indexer re-embeds. The store reports the gap by counting chunks that lack a
-vector (`NeedsReembed`), so the count stays right if `merud` stops halfway through.
+When the embedding model's name in config, its task-prefix fingerprint, or the
+vector size Ollama reports no longer matches `meta`, the store deletes every row
+of `chunk_vec`, `memory_vec` and `session_vec` and keeps `documents`, `chunks`,
+`memories` and `sessions`. A database from an older release may have no prefix
+fingerprint. When its model and vector size match, the store records the current
+fingerprint and keeps these vectors. Keyword search keeps working while the
+indexer re-embeds after a later model or prefix change. The store reports the
+gap by counting chunks that lack a vector (`NeedsReembed`), so the count stays
+right if `merud` stops halfway through.
 The memory syncer re-embeds each memory that lacks a vector, and the summarizer
 does the same for each summary.
 
@@ -2074,7 +2345,10 @@ The indexer reads the folders you name into the store, keeps them current while
 
 Only the folders under `[index] folders` in `config.toml`. The list ships empty, so a
 fresh Meru indexes nothing, and it reads your home folder only if you list `~`.
-`merud` reads the list when it starts, so a change takes a restart.
+`merud` reads the list when it starts, so a hand edit to `config.toml` takes a
+restart. Adding or removing a folder in `meru chat` or the desktop app takes
+effect at once: `merud` writes the list, hands the indexer the new folders and
+restarts the watcher with a scan.
 
 ```toml
 [index]
@@ -2084,6 +2358,7 @@ max_file_mb    = 5
 chunk_tokens   = 500
 overlap_tokens = 50
 watch          = true
+images         = true                   # PNG, JPEG, GIF and WebP files too
 ```
 
 Inside those folders the indexer checks each entry against these rules, in order,
@@ -2096,9 +2371,9 @@ and skips it at the first one that matches:
 | 3 | `hidden` | a name that starts with `.` |
 | 4 | `build-folder` | `node_modules`, `.venv`, `venv`, `vendor`, `target`, `dist`, `build`, `__pycache__` |
 | 5 | `ignored` | `[index] ignore`, then each folder's `.gitignore` and `.meruignore`, from the top folder down |
-| 6 | `media`, `binary`, `unsupported` | by extension: images, audio, video, archives, programs, databases, and any type with no chunker |
-| 7 | `too-large` | over `max_file_mb` |
-| 8 | `binary` | a NUL byte in the first 8 KB (PDFs excepted) |
+| 6 | `media`, `binary`, `unsupported` | by extension: audio, video, archives, programs, databases, HEIC and other images Ollama can't embed, any image when `[index] images` is off, and any type with no chunker |
+| 7 | `too-large` | over `max_file_mb`, or over 20 MiB for an image |
+| 8 | `binary` | a NUL byte in the first 8 KB (PDFs and images excepted) |
 
 - **Secrets sit beyond any ignore file's reach.** No `.gitignore` or `.meruignore`
   line can bring one back, because a key in the index would end up in a prompt.
@@ -2114,6 +2389,18 @@ the last matching line wins, and a deeper folder's file beats a shallower one's.
 Meru reads `.meruignore` after `.gitignore` in the same folder, so it can skip more
 for Meru alone, or bring back with `!name` a file git ignores.
 
+**Images.** With `[index] images = true`, the default, and an embedding model that
+takes images (`embeddinggemma-2:440m` does; `config.EmbedModels` marks it), the
+indexer reads PNG, JPEG, GIF and WebP files too. It checks the first bytes really
+are an image, sends the whole file to Ollama as `{"image": base64}`, and stores one
+document of kind `image` with one chunk and one vector, in the same tables as text.
+The chunk's text, such as "Image shot.png in /Users/you/Documents/img", names the
+file and its full folder path, and lets keyword search find a picture by its name; its vector, from the picture itself, lets a question find it by
+what it shows. Ollama scales every image to the same 268 tokens, so Meru sends the
+file as it is. HEIC, which iPhone photos and some Mac screenshots use, stays out:
+Ollama refuses it and Go can't decode it. The file tools (`read_file`, `grep` and the
+rest) still see an image as media, since they read text.
+
 ### Chunking
 
 The indexer cuts each file into chunks along its own structure:
@@ -2125,6 +2412,7 @@ The indexer cuts each file into chunks along its own structure:
 | other code, plain text | blank-line blocks | none | lines |
 | HTML | `<h1>` to `<h6>`, then paragraphs; scripts, styles and `<head>` dropped | the heading path | none |
 | PDF | page, then paragraphs; plain text, no layout | none | page |
+| Image (PNG, JPEG, GIF, WebP) | not split: one chunk whose text names the file and its folder | the file name | the file |
 
 - **Size.** A chunk holds about `chunk_tokens` (500) tokens and repeats the last
   `overlap_tokens` (50) of the chunk before it, so a sentence cut at a boundary
@@ -2132,9 +2420,11 @@ The indexer cuts each file into chunks along its own structure:
   because Ollama doesn't expose the embedding model's tokenizer.
 - **No chunk passes the limit.** A paragraph too big for one chunk gets split at
   line breaks, then between words, and last at a fixed width.
-- **The heading path travels with the text.** Each embedded chunk starts with its
-  heading path, so the third chunk of a long "Garden > Spring" section still embeds
-  as being about the garden in spring.
+- **The heading path travels with the text.** Each chunk embeds with its heading
+  path as the title in the embedding model's document prefix, `title: Garden >
+  Spring | text: …` for `embeddinggemma-2`, so the third chunk of a long section
+  still embeds as being about the garden in spring. A query takes the model's
+  query prefix (see [Engine layer](#engine-layer)).
 
 ### Keeping it current
 
@@ -2183,6 +2473,48 @@ and [Getting your content in](#getting-your-content-in) shows how files become
 chunks: Markdown by heading, code by declaration or blank-line block, PDFs by page as
 plain text with no layout.
 
+### Image search
+
+The index holds images beside text (see [What gets indexed](#what-gets-indexed)),
+and `embeddinggemma-2` puts both in one vector space, so a file search can find a
+picture by what it shows. It keeps at most two images among its ten results: an
+image's chunk text is only its name, and the answer model can't see the picture,
+so more would crowd out text it can use. Each image result's citation carries
+`kind: "image"` and reads `[1] ~/Documents/img/shot.png (image)`.
+
+`retrieve.SearchImages` searches images alone, for `search_images` and for a
+question with an attached image. Both store queries join `documents` and keep
+`kind = 'image'`, in one query each:
+
+- **Like a picture:** the picture's bytes are embedded with no prefix, and images
+  rank by vector alone, since keyword search can't match pixels.
+- **From words:** the words get the query prefix, and two lists fuse with RRF:
+  images by meaning, and images whose names or folders hold the words. Unlike
+  file search, the name list counts a quarter as much. Many pictures carry names
+  such as `taxi.png` or a folder such as `nyc-trip`, which match the words of a
+  question about a different picture from the same trip. On the owner's 25
+  test images, equal weight put the right image first for 19 of 75 questions,
+  and a quarter weight for 27.
+
+**Looking at one.** A found image's text is only its name, so to read a receipt
+or a ticket the model calls `view_image` (see [Approving a tool call](#approving-a-tool-call)).
+`dispatch.Result` carries the picture in `Images`, beside `Text`. `dispatch`
+logs `Text` alone, so the picture never reaches the transcript or `meru.db`, and
+the agent puts `Images` on the tool's message, where Ollama shows it to the model
+on its next round. The agent offers `view_image` only while the `main` model lists
+`vision`, and then the system prompt says so in one line, `pictureNote`: asked
+to itemize receipts it had listed a turn before, a model with the tool called
+nothing and said it couldn't read images, as an earlier answer in the chat had
+claimed. A model without vision never sees the tool or the line. When such a model's full answer
+cites an image or names a file ending in `.png`, `.jpg`, `.jpeg`, `.gif` or
+`.webp`, a `notice` under the answer says "<model> reads text only, so it can't
+look at these pictures", with the suggestion from [Questions with
+images](#questions-with-images).
+
+The desktop app shows an image source as a 40-pixel preview on its chip. The
+Bridge makes it, and only for an image `merud` cited in an answer or in a past chat
+the app opened, so the page can't ask it to read a file of its own choosing.
+
 ### How hybrid search works
 
 SQLite does both searches; our code merges the results.
@@ -2195,9 +2527,10 @@ names an indexed folder or asks about past chats (see [Routing](#routing)). Its 
 question appended on a follow-up (see
 [How a conversation continues](#how-a-conversation-continues)).
 
-So far a turn searches file chunks. From v0.4 it also searches memories and the
-summaries of past sessions. Each source gets the same keyword and meaning search,
-`rrf` merges the results within that source, and each source has its own share of
+A turn searches file chunks, memories and past sessions. Each source runs its
+own searches: memories add a list ranked by recency, and past sessions search
+their summaries by meaning and by keyword and their messages by keyword. `rrf`
+merges the lists within each source, and each source has its own share of
 the context budget, so one busy source can't crowd out the others.
 
 | Piece | Comes from |
@@ -2210,8 +2543,9 @@ the context budget, so one busy source can't crowd out the others.
 
 *Figure 5. Only the vector side needs a model call. The keyword side, the merge and the final lookup are all SQLite or plain Go inside `merud`.*
 
-The keyword query quotes every word of the query and joins them with `OR`, so text
-from the user can never reach FTS5 as query syntax. It keeps the first 32 distinct
+The keyword query drops filler words such as "what" and "it", unless nothing else
+is left, then quotes each remaining word and joins them with `OR`, so text from the
+user can never reach FTS5 as query syntax. It keeps the first 32 distinct
 words, which is why the new question comes before the previous one.
 
 `merud` runs the vector query and the keyword query one after the other, then merges the two
@@ -2278,7 +2612,7 @@ retrieval = "auto"      # the default; or "agentic"
 | Search before the answer | yes, on turns about your files (see below) | no |
 | Earlier conversations in the prompt | yes | no |
 | Profile and recalled memories | yes | yes |
-| File tools offered | the four, on the routes that offer tools | the same |
+| File tools offered | `read_file`, `list_folder`, `grep` and `search_files`, and `search_images` and `view_image` while images and vision allow them, on the routes that offer tools | the same |
 | Note in the prompt, on turns about your files | the excerpts, with the rule on citing, and "read, list, grep or search again when the excerpts fall short" | "look first with `search_files` or `grep`, then `read_file`, stop after two or three rounds, cite the excerpts" |
 
 `agentic` needs `search_files` in `[builtin] tools`; `merud` refuses to start
@@ -2352,13 +2686,18 @@ tools.
   question points at a connected tool. The signs that add tools to a route
   decide it (see [Routing](#routing)): the question names a tool server, says
   "remember", asks for the web, gives a URL, or names what a server's tools
-  act on. `search` and
+  act on. It skips it too when a picked skill brings `web_search` and no file
+  tool, as `web-research` does: "can you search for things from the last 2
+  days", a follow-up in a chat about a rocket launch, named no web phrase, and
+  the turn put nine unrelated excerpts and 43,000 tokens in the prompt
+  ([#174](https://github.com/aarora79/meru/issues/174)). `search` and
   `search+tools` always search: the router, or the folder rule, saw files in the
   question. The turn still offers the file tools, so the model can look when it
   has to. Before this, "search the web for the latest Go release" put ten
-  excerpts from your folders in the prompt, and since `web_search` numbers its
+  excerpts from your folders in the prompt, and since `web_search` numbered its
   results from `[1]` too, the Sources list under the answer could name one of
-  your files.
+  your files. Web results now take the numbers after the turn's excerpts (see
+  [Citations](#citations)).
 - **The file-tools note only on file turns.** The note that the model may read,
   list, grep and search the folders joins only a turn about your files that
   offers the file tools. It sits after the parts every turn shares and before the
@@ -2420,7 +2759,15 @@ Before the first token, `merud` sends the client a `sources` event that lists ea
 excerpt with its number, path (as `~/…`), heading, and line range or PDF page.
 When `search_files` returns excerpts later in the turn, they take the next
 numbers, ride on the call's `tool_result` event, and `merud` sends a new
-`sources` event that holds every source so far. Clients keep the last one. Once
+`sources` event that holds every source so far. Clients keep the last one.
+`web_search` and `web_fetch` do the same: each result, and each page read,
+takes the next number and joins the list as a web source, with `kind = "web"`,
+its URL in `url` and in `path`, and its title as the heading. A number names one
+thing across the turn, a file excerpt or a page, never both. Meru.app shows a
+web source as a chip with a globe and the site's name that opens the page;
+`meru` and `meru chat` print its title and URL as a link. A reopened chat lists
+only the files its turns read, since the transcript keeps the web results as
+notes, not as numbered sources. Once
 the answer ends, one-shot `meru` prints a `Sources:` list and `meru chat` shows the
 same list under the answer. Both list only the sources the answer cites, and an
 answer that cites none gets no list: the model decides when a source matters. An
@@ -2527,17 +2874,18 @@ Meru keeps no index file. The database already indexes the files, and
 
 0. **Your profile, in every prompt.** Every file in `me/` and `preferences/` goes
    into the system prompt of every turn, under "What you know about the user",
-   up to 2,000 characters; past that, the newest files win and the rest wait
-   for recall. These are the facts Meru should never have to search for: your
+   up to 2,000 characters; past that, the newest files win and the rest stay
+   out of the prompt, since recall skips these two kinds. These are the facts Meru should never have to search for: your
    name, your email, your work, where you live, how you like answers. Without them, the
    model can't tell whether "Sam" in a letter is you or someone you know.
    `meru setup user` asks for them one at a time and saves each as a memory,
    and you can add more in chat ("remember that I work on the registry team").
    While both folders are empty, `meru chat` says Meru doesn't know you yet and
    points at `meru setup user`.
-1. **Indexing.** The indexer treats `~/.meru/memory/` like any folder you index: each
-   file gets a vector and a keyword entry. It picks up hand edits through the usual
-   mtime and content-hash check.
+1. **Indexing.** A small syncer, apart from the file indexer, keeps
+   `~/.meru/memory/` in step with the store: each file becomes one row with one
+   vector, from its first 4 KiB, and a keyword entry, with no chunking. It picks
+   up hand edits through the usual mtime and content-hash check.
 2. **Recall.** Each turn searches memories by meaning and by keyword, adds a third
    list ranked by recency, and merges all three with `rrf`. The top results go into
    the context, up to the memory budget. Recall runs on every route, including
@@ -2647,7 +2995,7 @@ Meru ships with four skills. `writing` and `explainer` come from the owner's
 | `writing` | Plain-English rules for any prose Meru writes: emails, summaries, reports |
 | `explainer` | Builds a self-contained HTML page that teaches a topic, with diagrams |
 | `web-research` | For how to use a program or command, and for questions that need current facts: search the user's own words first, with a name in double quotes; never swap in a product or company the model knows for the one named; search again when the results are about something else; read the one or two best pages with `web_fetch` and a prompt, prefer primary sources, check dates against today, quote versions from the page, cite URLs, and say when sources disagree. Brings `web_search` and `web_fetch` |
-| `file-research` | For questions about the user's own files, and not for how to use a program: `search_files` for a topic in any words, `grep` for an exact name or phrase, `list_folder` to see a folder, `read_file` for the whole text; try other words once, stop after two or three rounds, cite the numbered excerpts. Brings those four tools |
+| `file-research` | For questions about the user's own files and pictures, and not for how to use a program: `search_files` for a topic in any words, `grep` for an exact name or phrase, `list_folder` to see a folder, `read_file` for the whole text, `search_images` for pictures and `view_image` to look at one; try other words once, stop after two or three rounds, cite the numbered excerpts. Brings those six tools |
 
 The fast model picks from the descriptions alone, so their words decide which
 skill loads. `make pick-eval` asks the pick 21 labelled questions three times
@@ -2689,8 +3037,10 @@ own files did worse, 42 of 63: naming the skill drew the model to it.
 know how MCP works. You can run it again at any time. v0.3 doesn't start it on its
 own the first time you run `meru`.
 
-1. **Ollama.** Meru checks that Ollama answers. If it doesn't, Meru prints the
-   install step for your platform and waits for you to press Enter.
+1. **Ollama.** Meru checks that Ollama answers and is 0.40.5 or later. If it
+   doesn't answer, Meru prints the install step for your platform and waits for
+   you to press Enter; if it is older, Meru says to update it, and `q` stops
+   setup.
 2. **Models.** With no `config.toml` yet, you pick `lite` (the default) or `full`.
    Meru names the profile's models and, after a yes, downloads each with
    `ollama pull`, which draws its own progress bar.
@@ -2795,21 +3145,28 @@ and `web_fetch` refuses loopback.
 The catalog has no shell server; to let the model run a program, declare it in
 `[[commands]]` (see [Local commands](#local-commands)).
 
-For each server, you choose one of two paths:
+`meru setup` hands Obsidian and Google to `merud` as connectors, which `merud`
+installs and runs itself (see [Setting up a connector](#setting-up-a-connector)).
+`meru mcp add` adds a server by hand, and offers three choices for it:
 
 - **"Do it for me."** Meru asks only for what the server needs, one question at a
   time, and reads each key without showing it on screen: "Paste the API key from
   Obsidian's Local REST API plugin". For `google`, Meru prints the command that starts the server and never
   runs it, and notes that the server gives you a sign-in link the first time the
-  model uses a Google tool. Then Meru shows you the exact config block it will
-  add, and writes it only after you approve.
+  model uses a Google tool. When `merud` will probe the server, Meru saves the
+  key to `secrets.toml` first, so `merud` can start it. Then Meru shows you the
+  exact config block it will add, and changes `config.toml` only after you
+  approve.
 - **"Show me how."** Meru prints the config block, any install command and the
   `secrets.toml` lines, and names the file to paste them into. Nothing changes
   until you do it yourself.
+- **Skip.** Nothing changes.
 
 Meru adds the block to the end of `config.toml` as plain text, so your comments
 stay. It writes a temporary copy first and loads it, and replaces the file only
-when the copy loads and its servers pass the same checks `merud` runs.
+when the copy loads and its servers pass the main checks `merud` runs: a name,
+one of `command` and `url`, no wildcards, and `confirm` inside `allow`. `merud`
+checks the rest, such as the loopback rule, when it loads the entry.
 
 Outside setup, one command adds any server:
 
@@ -2819,7 +3176,7 @@ meru mcp add stdio <name> -- <command> [args...]   # a server merud starts
 meru mcp add http <name> <url> [--remote]          # a Streamable HTTP server you run
 ```
 
-`meru mcp add google` offers the same two paths as setup. The older forms, `meru
+`meru mcp add google` offers the same three choices. The older forms, `meru
 mcp add <name> -- <command>` and `--url <url>`, still work. `meru mcp` shows the
 state of each configured server (see [MCP](#mcp)). `meru mcp list` shows the
 catalog, then each server in `config.toml` with what `merud` says
@@ -2838,18 +3195,20 @@ so the error says to try again.
 
 For each tool the probe reports two MCP hints, when the server gives them:
 `readOnlyHint` (the tool changes nothing) and `destructiveHint` (it may delete or
-overwrite). From them `meru` proposes a split: read-only tools go in `allow`, and
-tools that may change something go in `allow` and `confirm`, so each call asks
-first. A tool with no hints counts as one that may change something. For a catalog
+overwrite). `meru` proposes a split from `readOnlyHint` alone: read-only tools go
+in `allow`, and tools that may change something go in `allow` and `confirm`, so
+each call asks first. A tool with no hints counts as one that may change
+something. `destructiveHint` only labels a tool "may delete" in the table. For a catalog
 entry the probe runs too, but the catalog's own lists win over the hints, and a tool
 the catalog doesn't name starts out of `allow`. You edit the proposal before `meru`
 writes the entry: Enter accepts, and `-name`, `+name` and `?name` leave a tool out,
 allow it without asking, or make it ask. MCP calls these hints, not promises: a
 server can mislabel a tool, so the proposal is a starting point and you make the
 call. When the probe fails, `meru` says why and offers to try again, to write the
-entry anyway (with the catalog's lists, or an empty `allow`), or to cancel. For a
-server you run, such as `google`, `meru` probes only when something answers at the
-URL. When nothing does, it writes the catalog's lists and says `merud` connects on
+entry anyway (with the catalog's lists, or an empty `allow`), or to cancel. With
+`merud` down, `meru` probes nothing and writes the catalog's lists, or an empty
+`allow` for a server outside the catalog. For a catalog server you start
+yourself, `google`, `meru` probes only when something answers at the URL. When nothing does, it writes the catalog's lists and says `merud` connects on
 your first question after you start the server. A URL off this machine needs
 `--remote`, and `meru` says that each tool call sends your data there; the entry
 gets `remote = true`.
@@ -2869,8 +3228,9 @@ so the new server works without a restart.
 every time, and offers only "approve once" and "deny". A session approval isn't
 available for it, and `builtin.confirm` can't switch the prompt off. Config grants
 lasting trust, so the model can't grant any to itself. (Built-in tools need no
-allowlist entry: the model always sees `configure`, and from v0.4 `remember` and
-`write_file`.)
+MCP allowlist entry. `[builtin] tools` lists the ones the model sees, all of
+them by default, and taking a name out, `configure` included, turns that tool
+off.)
 
 **Secrets stay out of config.** API keys go in `~/.meru/secrets.toml`, a flat list of `name = "value"` lines. A config value
 refers to one as `secret:<name>`, in an MCP server's `env` or `headers` or an A2A
@@ -2941,8 +3301,8 @@ a tag. `scripts/release.sh` remains the only publisher.
 ### Mac installer
 
 The Mac installer, "Install Meru.app", takes a Mac with Apple silicon from nothing
-to a running Meru in ten steps: Ollama and the models, folders in the index, web
-search, your Obsidian notes, skills and commands, Google if you want it, your
+to a running Meru in eleven steps: Ollama and the models, folders in the index, web
+search, your Obsidian notes, your Apple Notes, skills and commands, Google if you want it, your
 profile, and `merud` started at login, which then installs the connectors you
 turned on. Each release carries it in a disk image, `Meru-vX.Y.Z-macos-arm64.dmg`,
 beside the zip files. `scripts/install.sh` and the `meru-install` skill stay for
@@ -2965,7 +3325,7 @@ What runs where:
 | Part | Runs as | Does |
 | --- | --- | --- |
 | `cmd/meru-installer` | the window | serves the page, binds the Bridge, shows the folder dialog |
-| `internal/installer` | the installer's process | the ten steps, the Bridge the page calls, the allowlist of programs |
+| `internal/installer` | the installer's process | the eleven steps, the Bridge the page calls, the allowlist of programs |
 | programs from the allowlist | child processes, no shell | `brew`, `launchctl`, `open`, `ditto`, `xattr`, `codesign`, `sysctl`, `sw_vers`, `df` |
 | Ollama | Ollama.app, or a Homebrew service | answers `POST /api/pull`, whose stream gives each download's progress |
 | `merud` | the launchd job `com.meru.merud` | the connectors the last step hands it, and everything after the last step |
@@ -2995,7 +3355,10 @@ What runs where:
   deletes the app when the check fails. It sends no telemetry and never checks for
   updates.
 - Each link on its screens is a name that the Bridge maps to a fixed `https`
-  address. The page can't open an address of its own.
+  address. The page can't open an address of its own. The Apple Notes step's two
+  buttons have a Bridge method each: one opens the fixed System Settings address
+  of the Full Disk Access list, the other shows `~/.local/bin/merud` in Finder
+  with `open -R`.
 
 **The steps.** Each screen says what the step does, why Meru needs it, and what it
 downloads and how long it takes. Continue runs it and shows its progress line by
@@ -3010,10 +3373,11 @@ and Skip. You can skip every step but About you.
 | 4 | Folders to search | lists the folders config has, then Documents, Desktop and Notes with file counts; the system's folder dialog adds more | `[index] folders` |
 | 5 | Web search | keeps a SearXNG that already answers JSON on `127.0.0.1:8888`, which `merud` then only watches. Otherwise it looks for the `docker` command in its usual places, and hands the SearXNG connector to the last step, turned on | `[web] searxng_url`; `web_search` and `web_fetch` in `[builtin] tools` |
 | 6 | Obsidian notes | takes your vault folder from the folder dialog, checks it is a folder, and hands the Obsidian connector to the last step with it. An `obsidian` entry in `[[mcp.servers]]` stays as it is, or goes to the last step as an Adopt | nothing |
-| 7 | Skills and commands | takes the four built-in skills out of `[skills] disabled`, and offers the template's sample `[[commands]]`: the Mac snapshots start ticked, and a sample whose program or folder this Mac lacks is greyed out | the ticked `[[commands]]`, uncommented, at the end of the file |
-| 8 | Gmail, Calendar and Drive | walks through Google's console in three screens, takes your address, client ID and secret, and hands the Google connector to the last step with them. A `google` entry stays as it is, or goes to the last step as an Adopt | `~/meru-output/attachments/` |
-| 9 | About you | asks your name, your email and how you like answers | `memory/me/` and `memory/preferences/` |
-| 10 | Start Meru | writes `com.meru.merud.plist` from `deploy/launchd/` with the paths filled in, loads it, waits for `ping`, hands `merud` the connectors, then follows `merud`'s own first scan through `index_status` for up to two minutes | the launchd job; `merud` writes `[connectors.<id>]` and `secrets.toml` |
+| 7 | Apple Notes | turns on the three notes tools; a button opens the Full Disk Access list in System Settings and another shows `merud` in Finder, to drag into it. No program can grant that access, so the step can't check it; `merud` checks on each call | `search_notes`, `list_notes` and `read_note` in `[builtin] tools` |
+| 8 | Skills and commands | takes the four built-in skills out of `[skills] disabled`, and offers the template's sample `[[commands]]`: the Mac snapshots start ticked, and a sample whose program or folder this Mac lacks is greyed out | the ticked `[[commands]]`, uncommented, at the end of the file |
+| 9 | Gmail, Calendar and Drive | walks through Google's console in three screens, takes your address, client ID and secret, and hands the Google connector to the last step with them. A `google` entry stays as it is, or goes to the last step as an Adopt | `~/meru-output/attachments/` |
+| 10 | About you | asks your name, your email and how you like answers | `memory/me/` and `memory/preferences/` |
+| 11 | Start Meru | writes `com.meru.merud.plist` from `deploy/launchd/` with the paths filled in, loads it, waits for `ping`, hands `merud` the connectors, then follows `merud`'s own first scan through `index_status` for up to two minutes | the launchd job; `merud` writes `[connectors.<id>]` and `secrets.toml` |
 
 The last screen lists what each step did, or that you skipped it. It names
 `~/.meru/config.toml`, with a button that opens it in your text editor, and says
@@ -3197,8 +3561,9 @@ confirm = ["send_gmail_message"]
 remote  = false                          # true only if the URL isn't loopback
 ```
 
-A server entry has either `command` or `url`. `env` goes only with `command`: a `url`
-entry with `env` fails to load, with a message that points at `headers`. `merud`
+A server entry has either `command` or `url`. `env` goes only with `command`: `merud`
+refuses a `url` entry with `env` at startup or reload, with a message that points
+at `headers`. `merud`
 refuses a Streamable HTTP URL that isn't loopback unless the entry says
 `remote = true`, the same rule A2A agents follow. `remote` covers one thing: whether
 `merud` may connect to a URL on another machine. It says nothing about what the
@@ -3322,7 +3687,7 @@ Step 7, the release notes and the install skill's last changes, is
 ### The manifest
 
 Each connector has one TOML file, `internal/connectors/manifests/<id>.toml`,
-compiled into `merud`. Four ship:
+compiled into `merud`. Five ship:
 
 | ID | Kind | Install | What it is |
 | --- | --- | --- | --- |
@@ -3330,27 +3695,39 @@ compiled into `merud`. Four ship:
 | `obsidian` | stdio | the npm package `obsidian-mcp` | notes in an Obsidian vault folder |
 | `google` | http | the Python package `workspace-mcp` | Gmail, Calendar, Drive and Docs |
 | `ollama` | dependency | none | the model runtime; status only |
+| `whisper` | service | a download and one model file, each by SHA-256 | whisper.cpp's server, for speech to text |
 
 A manifest names:
 
-- `id`, `name`, `kind` (`stdio`, `http`, `container` or `dependency`),
-  `required`, `default_on` and `idle_timeout`;
+- `id`, `name`, `kind` (`stdio`, `http`, `container`, `service` or
+  `dependency`), `required`, `default_on` and `idle_timeout`. A `service` is
+  a downloaded program that `merud` starts on loopback and sends plain HTTP
+  requests, not MCP; the `Service` supervisor runs it;
 - `[install]`: `type` (`npm`, `pip`, `binary`, `container` or `none`), and the
   `package` and exact `version`, or a container `image` with its digest, or a
-  `url_<os>_<arch>` and `sha256_<os>_<arch>` per platform for a download;
+  `url_<os>_<arch>` and `sha256_<os>_<arch>` per platform for a download. A
+  binary install may add `[[install.files]]`, extra downloads such as a
+  model, each a plain file `name`, an https `url` and a `sha256`, saved in
+  the install folder. A file downloads only when a `{file.<id>}`
+  placeholder picks it;
 - `[launch]`: the `command`, `args` and `env` that start it, the loopback `url`
   and `port` it answers on, `auth` (`none` or `oauth`), and a container's
   `volumes`. For an npm or pip connector, `command` is the bare name of a
   program the package installs, such as `obsidian-mcp`, and Meru finds it in
   the install folder (see [The runtime folder](#the-runtime-folder)); for a
   binary it is a path under `{pkg}`. `{pkg}` stands for the install folder,
-  `{meru_dir}` for `~/.meru`, and `{field.<id>}` for a value the user gave;
+  `{meru_dir}` for `~/.meru`, and `{field.<id>}` for a value the user gave.
+  A service may also use `{file.<id>}`, the path of the `[[install.files]]`
+  entry that the choice field `<id>` names, and `{token}`, a random value
+  `merud` makes for each start, in its `args` and in `base_path`, which goes
+  in front of every path `merud` asks it for;
 - `[[field]]`: what to ask the user, each with an `id`, a `type` (`text`,
   `folder`, `secret`, `email`, `choice` or `oauth`), a `label`, `help`,
   `required`, and an optional `pattern`, `default` and `choices`. Every client
   will draw the same form from these;
 - `[health]`: how to tell it works. An MCP server gets a cheap tool call
-  (`tool`, `args`); a container or a dependency gets an HTTP GET (`path`).
+  (`tool`, `args`); a container, a service or a dependency gets an HTTP GET
+  (`path`).
   `expect` is `nonempty`, `contains:<text>` or `json_key:<key>`;
 - `[mcp]`: `allow`, `confirm` and `always_confirm`, with the same meaning as in
   an `[[mcp.servers]]` entry.
@@ -3367,12 +3744,20 @@ breaks a rule:
 - a download without an https URL and a SHA-256 for each platform it names;
 - a secret field with a default;
 - a `pattern` that doesn't compile;
-- an http or container connector whose `url` isn't loopback;
+- an http, container or service connector whose `url` isn't loopback;
+- an `[[install.files]]` entry on an install that isn't binary, or with a
+  name that holds a folder or repeats another, a URL that isn't https, or
+  no SHA-256;
+- a `{file.<id>}` whose field isn't a choice, or has a choice that names no
+  file, and a `{file.<id>}` or `{token}` outside a service;
 - a launch placeholder that names no field, or a secret on the command line,
   where other users can read it in the process list;
 - an npm or pip `command` that holds a folder, or a binary `command` outside
   `{pkg}`;
 - a wildcard in a tool list, or a `confirm` tool that `allow` doesn't list.
+
+`whisper` is the speech-to-text connector (see
+[Speech to text](#speech-to-text)).
 
 ### Pinned versions
 
@@ -3450,11 +3835,12 @@ also pins `chrome-headless-shell` 154.0.8037.92 for `web_fetch`'s page reader
 Google's Chrome for Testing. Google publishes MD5, not SHA-256, for those zips,
 so each SHA-256 was computed from a download whose MD5 matched Google's.
 Windows has no pin yet. The first time a connector needs one, `merud`
-downloads the `.tar.gz` into a temporary folder under `~/.meru/runtime`, checks
+downloads the `.tar.gz`, or the `.zip` for Chrome, into a temporary folder under `~/.meru/runtime`, checks
 its SHA-256 against the pin, and unpacks it only if the two match. Unpacking
 refuses an entry that is absolute, climbs out with `..`, links outside the
 folder, or is a hard link or a device. The finished folder gets a marker file,
-`.meru-installed`, and then moves to `node-<v>` or `uv-<v>` in one rename, so a
+`.meru-installed`, and then moves to `<runtime>-<version>`, such as `node-<v>`,
+`uv-<v>` or `chrome-headless-shell-<v>`, in one rename, so a
 runtime folder either doesn't exist or is complete. Once a new pin's folder is
 in place, older versions of the same runtime go.
 
@@ -3480,7 +3866,7 @@ in place, older versions of the same runtime go.
   `UV_NO_CONFIG=1` skips your `uv.toml`. Each uv release fixes the list of
   Python builds it knows, so the uv pin also fixes the Python patch release.
 - **docker** comes from a fixed list of absolute paths (Docker Desktop,
-  OrbStack, Homebrew, `/usr/bin`). None there is "Docker isn't installed"; a
+  OrbStack, Homebrew, `/usr/local/bin`, `/usr/bin` and `~/.docker/bin`). None there is "Docker isn't installed"; a
   failing `docker info` is "Docker isn't running". Only docker gets your real
   `HOME`, where Docker keeps its socket and settings.
 
@@ -3546,8 +3932,8 @@ installing, starting ──port taken──▶ needs_config ──30 s, or a rel
 ```
 
 - **Off by default.** A connector starts only when its `[connectors.<id>]`
-  table says `enabled = true`, or its manifest says `default_on`; none does
-  today.
+  table says `enabled = true`, or its manifest says `default_on`; neither
+  Obsidian's manifest nor Google's does.
 - **Set up by hand wins.** When `[[mcp.servers]]` has an entry with the
   connector's ID, that entry runs through the pool's own rules, unchanged, and
   the connector shows `by_hand` with the sentence "Obsidian runs from your own
@@ -3767,7 +4153,7 @@ The mode comes from config (`connectors.ContainerMode`):
 | `[connectors.searxng] enabled = true`, and `searxng_url` is `http://127.0.0.1:8888` | run | checks, and runs its own container when nothing answers |
 | `enabled = true` with another `searxng_url` | watch | checks and reports; Meru's container answers only at 8888 |
 | no `enabled` key, and `[builtin] tools` lists `web_search` | watch | checks and reports, as `merud` did before connectors; it starts nothing |
-| `enabled = false`, `web_search` not listed, or `searxng_url = ""` | off | nothing |
+| `enabled = false`, `searxng_url = ""`, or no `enabled` key and `web_search` not listed | off | nothing |
 
 The watch mode is the back-compat rule: a config from before connectors,
 which lists `web_search` and names a URL by default, keeps working, and an
@@ -3833,12 +4219,13 @@ search" line, and the desktop app's rail names web search with its state.
 `merud` can't answer instead of finding no `merud` at all. The check asks
 `GET /api/version` through the engine's `Info`, at start, then every 30
 seconds, and at once when a request comes while Ollama fails. Once Ollama
-answers with 0.12.11 or later, `merud` loads the fast and embedding models
+answers with 0.40.5 or later, `merud` loads the fast and embedding models
 and only then opens the store and builds the rest. Until then:
 
 - the connectors op lists Ollama alone, `failed`, with "Ollama isn't running
-  at http://127.0.0.1:11434.", "Ollama 0.12.0 is too old; Meru needs 0.12.11
-  or later." or "Ollama … couldn't load a model: …";
+  at http://127.0.0.1:11434.", "Ollama 0.34.0 is too old for Meru's search
+  model. Update it from ollama.com/download." or "Ollama … couldn't load a
+  model: …";
 - `mcp_status` answers with no servers, so `meru mcp status` prints the
   connector table;
 - every other request gets "Ollama isn't running, so Meru can't answer yet.",
@@ -4072,8 +4459,8 @@ tools route:
 
 | Tool | Offered when | What it does |
 | --- | --- | --- |
-| `web_search` | `[web] searxng_url` is set and `[builtin] tools` lists it, as both are by default, and the SearXNG connector is ok | One GET to `<searxng_url>/search?format=json`, with a 15-second limit. It returns up to `max_results` results, numbered, each with its title, URL, a snippet cut to 300 characters and the date when SearXNG has one. Its description tells the model to cite results by URL. |
-| `web_fetch` | `[builtin] tools` lists it, as it does by default | Fetches one public page (HTML, PDF or plain text, at most 5 MiB, 20 seconds). It works in three modes, described below. HTML and PDF go through the indexer's own readers. A page whose text comes from JavaScript goes through a headless Chrome (see [Pages that need JavaScript](#pages-that-need-javascript)). |
+| `web_search` | `[web] searxng_url` is set and `[builtin] tools` lists it, as both are by default, and the SearXNG connector is ok | One GET to `<searxng_url>/search?format=json`, with a 15-second limit. It returns up to `max_results` results, numbered after the turn's other sources, each with its title, URL, a snippet cut to 300 characters and the date when SearXNG has one, and one web source per result (see [Citations](#citations)). Its text tells the model to cite results by number. |
+| `web_fetch` | `[builtin] tools` lists it, as it does by default | Fetches one public page (HTML, PDF or plain text, at most 16 MiB, 20 seconds; news pages run past 5 MB, almost all scripts). It works in three modes, described below. HTML and PDF go through the indexer's own readers. A page whose text comes from JavaScript goes through a headless Chrome (see [Pages that need JavaScript](#pages-that-need-javascript)). |
 
 ```toml
 [web]
@@ -4122,15 +4509,39 @@ would go. A URL with no query string also runs unasked when its host is one a kn
 URL came from: the model often knows a site's canonical page, such as
 `go.dev/doc/devel/release`, when the results showed only `go.dev/dl/`, and an
 attacker's site still has to turn up in real search results first. Any other URL
-asks, offering once and deny with no session choice, as
-`configure` does; a session choice would let every later made-up URL through.
-`save` asks every time, even for a known URL, because a download stays on disk;
-there it offers once, session and deny, as `write_file` does. A scheduled job has
-nobody to ask, so `dispatch` declines a call that asks there.
+asks, with no choice that covers the tool for the session, as `configure` does: such
+a choice would let every later made-up URL through. It offers four choices: once;
+**this website for this chat**; **always this website**; and deny. The two website
+choices name the URL's host, such as `raw.githubusercontent.com`, exactly as it is
+written, with no wildcard: trusting `github.com` trusts no other host.
+
+- **This website for this chat** runs the call and lets later reads on that host,
+  query strings included, run unasked until the session ends. It lives in memory,
+  beside the session's known URLs.
+- **Always this website** does the same in every session from now on. `merud`
+  appends the host to `[web] trusted_sites` in `config.toml`, through the same
+  checked edit as every other list, and Settings lists the hosts with a Remove
+  button; `meru chat` lists them with `/sites` and removes one with `/sites remove
+  <host>`. An entry is a bare host name: no scheme, path, port or wildcard.
+
+Trusting a host lets the model put anything in a URL on that host, and the host's
+owner can read those URLs in their logs. On a large public site, such as GitHub's
+raw files or arxiv.org, the owner is not the one a page would leak data to. On a
+small site anyone runs, it would be, so the prompt names the exact host and never
+offers a pattern.
+`save` asks even for a known URL or a trusted host, because a download stays on
+disk; there it offers once, session and deny, as `write_file` does, and a session
+approval covers later saves of known URLs. A download to an unknown URL never
+offers the website choices: it asks every time. A scheduled job has
+nobody to ask, so `dispatch` declines a call that asks every time there, even
+when the job's `allow` lists `web_fetch` (see [Scheduler](#scheduler)).
 
 `dispatch` decides whether a tool asks per tool, from `Confirm`. For the guard, a
 backend may also have `ConfirmCall(call)`, which decides per call and which
-`dispatch` asks first. The built-ins keep each session's known URLs in memory:
+`dispatch` asks first, and `CallSite(call)` and `TrustSite(call, host, always)`,
+which name the host a call reaches and record the user's trust in it. `dispatch`
+offers the website choices only when the backend names a host, so the code that
+knows URLs stays in the built-ins. The built-ins keep each session's known URLs in memory:
 `web_search` adds each result it shows, and `ConfirmCall` adds the URLs in the
 call's `Question`, which the agent fills with the user's words (this turn's
 question and the earlier questions in the session's history), never with excerpts
@@ -4205,7 +4616,9 @@ page shows. A page with its text in the HTML never reaches the browser.
 - **When the page is ready.** Scripts often fill a page after it loads. The
   reader takes the page once it has loaded, its text length has held still for
   750 ms and no bytes have moved through the proxy for 500 ms, or 8 seconds after
-  it began. A rendered call gets 20 seconds in all.
+  it began. The render, Chrome's start included, gets 20 seconds after the
+  plain fetch, which has 20 of its own, or 2 minutes on the first render, which
+  installs Chrome.
 - **The proxy.** Chrome reaches the network only through a proxy that `merud`
   runs on loopback for that page (`--proxy-server`, with no exception for
   loopback). The proxy dials with `web_fetch`'s own check, so a page and its
@@ -4243,7 +4656,7 @@ So `merud` itself searches before the model's first round in two cases:
 
 | Case | When | What `merud` runs |
 | --- | --- | --- |
-| `asked` | the question asks for the web (see [Routing](#routing), the fourth rule) and `web_search` is on; or it holds an http or https URL and `web_fetch` is on; or the desktop app's scope is web | `web_fetch` on each URL, two at most. With no URL, `web_search` on the question without its URLs, the phrases that asked for the web, a closing instruction ("and tell me what it is in three lines") and the filler words at either end (see below); a follow-up too short to stand alone gets the earlier question, as a file search does, and one that speaks only of the web searches for the earlier question alone |
+| `asked` | the question holds an http or https URL and `web_fetch` is on; or it holds no URL, asks for the web (see [Routing](#routing), the fourth rule) and `web_search` is on; or the desktop app's scope is web | `web_fetch` on each URL, two at most. With no URL, `web_search` on the question without its URLs, the phrases that asked for the web, a closing instruction ("and tell me what it is in three lines") and the filler words at either end (see below); a follow-up too short to stand alone gets the earlier question, as a file search does, and one that speaks only of the web searches for the earlier question alone |
 | `named` | an `auto` turn searched your files first, no connected tool is the question's target, the question doesn't say "my", "mine", "our" or "ours", it names a thing, and the excerpts don't cover it | `web_search` on the name in double quotes, then up to five of the question's other words that aren't filler |
 
 The calls go through `dispatch` like any other. Their `tool_call` lines and
@@ -4251,7 +4664,7 @@ The calls go through `dispatch` like any other. Their `tool_call` lines and
 approval column, and each sends its `tool_call` and `tool_result` events, so the
 chat shows the search. What comes back sits in the prompt under "From the web",
 among the parts each question changes, with a rule that mirrors the one for your
-files: cite each source by its URL, never swap in a product, company or person
+files: cite each source by its number, never swap in a product, company or person
 you know for the one the user named, and search again with other words when the
 results are about something else. The section holds at most 8,000 characters,
 in equal shares among the calls. The route becomes at least `tools` (`direct`
@@ -4310,11 +4723,243 @@ characters of a page.
 
 ---
 
+## Speech to text
+
+In Meru.app you press a microphone button, speak, and press it
+again. Meru turns the words into text in the composer, where you read them,
+fix them, and press Send. The text then goes as a typed question would. The
+answer model never hears the audio: speech to text is a step before the
+question, not part of it. `meru chat` keeps typing, since a terminal has no
+microphone without a native audio library, which the thin client can't take
+on.
+
+The work lands in six steps after this design. Five are in place: the
+binary built by CI, the connectors' `service` kind and `[[install.files]]`,
+the `whisper` connector with a model per profile, which Settings and
+`meru mcp set whisper enabled=true` turn on, and the `transcribe` op in
+`merud` with `meru transcribe`, and the button in Meru.app. One comes next:
+the installer step with a FAQ page.
+
+### Why whisper.cpp, not Ollama
+
+A test on 2026-10-18 (Mac Studio, M4 Max, 64 GB, Ollama 0.40.5) tried both.
+
+Ollama has no transcription endpoint. Its `gemma4:e2b` and `gemma4:e4b`
+models list `audio` among their capabilities, and they transcribe a WAV file
+passed in a message's `images` field, which the API docs name for pictures
+only. Ollama ignored every field named for audio without an error. They cost too
+much for the job:
+
+- **They push Meru's models out.** Ollama keeps at most
+  `OLLAMA_MAX_LOADED_MODELS` models loaded, 3 per GPU by default, and a Mac
+  with a separate answer model already has three. A voice question loaded
+  `gemma4:e2b` (7.4 GB) and pushed out the router, so the question waited
+  about 5 seconds for its first word against 0.1 seconds typed, and 13
+  seconds when the answer model was the one pushed out. On a 16 GB Mac,
+  `lite` and `gemma4:e2b` together need more than the GPU may use.
+- **They follow what they hear.** They are chat models. Asked to transcribe
+  "In two sentences, explain why the sky is blue", `gemma4:e2b` explained why
+  the sky is blue. A system message stopped it, and half a second of silence
+  at the end stopped it losing the last word, but each new model would need
+  both checks again.
+
+whisper.cpp's `whisper-server` does only speech to text, so it has nothing
+to obey. It runs in its own process, outside Ollama's count, and on the same
+Mac it transcribed a 26-second clip in under half a second:
+
+| Profile | Model file | On disk | In memory | Languages |
+| --- | --- | --- | --- | --- |
+| `lite` | `ggml-base.en.bin` | 148 MB | 445 MB | English |
+| `full` | `ggml-large-v3-turbo-q5_0.bin` | 574 MB | 890 MB | many |
+
+On a real recording through a USB webcam's microphone, the `full` model made
+no mistake and the `lite` one heard "Porto" as "portal". The connector's
+`model` setting, `[connectors.whisper] model`, picks the other file. Both come from `huggingface.co/ggerganov/whisper.cpp`
+at commit `5359861c739e955e79d9a303bcbc70fb988958b1`, each pinned by SHA-256.
+
+### The binary
+
+whisper.cpp publishes `whisper-server` for Linux and Windows but not for
+macOS, where it ships only a library for Xcode apps. `merud` is built without
+cgo and can't load it. So a GitHub Actions workflow in Meru's repository,
+`whisper-server.yml`, run by hand, builds it:
+
+- from whisper.cpp's `v1.9.5` source tarball, checked against a SHA-256 kept
+  in the workflow (commit `d2a764c648779feb36d44363f212a29b00aad1af`);
+- on a `macos-14` runner, for Apple silicon, with Metal, the Metal shaders
+  inside the binary and static libraries, so the result is one file that
+  links only to macOS's own frameworks;
+- with `GGML_NATIVE=OFF`, so the compiler doesn't tune the code to the
+  runner's CPU, which could crash it on an older Mac, and for macOS 13.3 and
+  later.
+
+The workflow checks that `otool -L` lists only system libraries and that the
+program transcribes a test clip to the expected words. It publishes the file,
+`SHA256SUMS` and whisper.cpp's MIT licence to a release of its own,
+`whisper-server-v1.9.5`, which nothing moves or deletes, and records which
+commit and workflow built the file with GitHub's build attestation. The
+connector pins the file's SHA-256. A new whisper.cpp version is a pull request
+that changes the workflow's pin and the manifest's.
+
+The first run published `whisper-server-darwin-arm64` on 2026-10-18,
+SHA-256 `8a41d4c21710a0325e35a5a5b66548b9d952e6832e2c13de81ccb64c3a56f2db`,
+built from commit `2a2736e`. On the M4 Max it used Metal, took 897 MB with
+the `full` model, and transcribed the real recording as before. It still
+needs a run on an M1 or M2 before the connector ships.
+
+Linux and Windows come later. Until then the connector has no download for
+them, and speech to text is off there.
+
+### The connector
+
+`whisper` is a connector (see [Connectors and the supervisor](#connectors-and-the-supervisor)),
+off until `[connectors.whisper] enabled = true`. It uses the `service` kind
+and `[[install.files]]` (see [The manifest](#the-manifest)), and `merud`
+runs it with the `Service` supervisor (`internal/connectors/service.go`):
+
+- **Install when turned on.** When config turns the connector on, the
+  supervisor installs the program and the model file in the background, so
+  the first recording doesn't wait for a 574 MB download. Its card says
+  "Meru is installing…", then "ready. It starts when you use it."
+- **One model, by choice.** The manifest lists both model files in
+  `[[install.files]]` and has a choice field, `model`, whose choices are
+  their names. Only the chosen file downloads. `merud` hands the
+  supervisor the profile's choice as the field's default, `base.en` for
+  `lite` and `large-v3-turbo` for `full`, and a `model` key in the table
+  wins over it. One setting, then, in the place every connector keeps its
+  settings, and the Settings card draws it as a choice.
+- **Start on use.** A recording starts the program, and the supervisor
+  stops it after ten idle minutes. A program that exits on its own counts
+  as a crash and starts again at the next recording; the fifth crash in
+  ten minutes stops the connector until Fix, as for Obsidian.
+- **A path no web page can guess.** `whisper-server` answers any web page
+  in the browser (`Access-Control-Allow-Origin: *`), and its `/load`
+  endpoint loads a model from any path it is given. So each start passes
+  `--request-path /{token}`, where `{token}` is 128 random bits `merud`
+  makes for that start. Every route then sits under that path, and
+  `/inference`, `/load` and `/health` without it answer 404. Only `merud`
+  knows the path; another user on the same Mac could read it in the
+  process list, as for any command line.
+
+The launch is
+`whisper-server --host 127.0.0.1 --port 8178 -m {file.model} --request-path /{token}`,
+so the server listens on this machine only. Turning it on downloads about
+160 MB for `lite` or 580 MB for `full`: on the development Mac the first
+took 18.5 seconds and the second 58. A model the user picks later downloads
+beside the first one, which stays until the runtime folder goes. A `model`
+that isn't one of the two is refused before config changes.
+
+The manifest has a download for `darwin_arm64` only. On any other computer
+the connector stays off when turned on, and says why: "Speech to text isn't
+available on this computer yet: Meru has no linux_amd64 build of it." It
+never tries an install that can't work.
+
+`TestIntegrationWhisper`, behind the `integration` build tag, installs the
+real connector into a temporary home, starts it through the supervisor, and
+checks that it writes down a clip `say` spoke and that `/inference` and
+`/load` answer 404 without the token.
+
+### The transcribe op
+
+The app records 16 kHz, mono, 16-bit PCM and wraps it as a WAV file, for at
+most 60 seconds: 1.9 MB. The Bridge sends it to `merud` in a `transcribe`
+request, in `Request.Audio`, a pointer to a struct that holds the bytes, so
+a `Request` stays comparable with `==`. Go's `encoding/json` writes the
+bytes as base64, 2.6 MB. Events and replies keep the socket's 1 MiB limit on
+a line; a request line may run to `rpc.MaxRequestLine`, 4 MiB.
+
+`merud`'s `handleTranscribe` (`cmd/merud/speech.go`) does four things:
+
+1. `speech.CheckWAV` reads the RIFF header: it walks the chunks to `fmt `
+   and `data` and divides the sound's bytes by the bytes per second. It
+   refuses anything that isn't PCM or float WAV, such as an `.m4a`, which
+   `whisper-server` would refuse anyway, and a recording over 60 seconds,
+   with half a second of slack for a recorder that stops late.
+2. The whisper `Service`'s `Use` gives the base URL, with the start's token
+   path, and starts the server when it isn't running. With the connector
+   off, installing or failed, its sentence is the error.
+3. `speech.Transcribe` posts the file to `<base>/inference` as a form, with
+   `temperature=0`, so the same recording gives the same words, and
+   `response_format=json`, through a client that follows no redirect.
+4. `speech.Clean` drops what Whisper writes in square brackets and treats
+   text with no letter or digit as nothing heard: on silence `base.en`
+   writes `[BLANK_AUDIO]` and `large-v3-turbo` writes `.`. The reply is one
+   `transcript` event, its `Text` empty when nothing was heard, then
+   `done`.
+
+Speech to text isn't part of the `Engine` interface, which serves Ollama
+and keeps its four methods.
+
+`meru transcribe <file.wav>` sends a file through the same op and prints the
+words, or "(Meru heard no words.)". It lets a user try speech to text
+before Meru.app's button, and a script use it.
+
+On the development Mac, through the scratch `merud` with `large-v3-turbo`:
+the first recording, 20 seconds from the USB webcam, took 3.6 seconds,
+which includes starting the server and loading the model; after that each
+took 0.3 to 0.4 seconds, the 26.5-second clip included. Silence came back
+as no words, an `.m4a` file and a 61-second one as refusals.
+
+### Recording in Meru.app
+
+- The composer has a microphone button beside the attach button. A press
+  asks the Bridge's `SpeechStatus` whether the whisper connector is ok; when
+  it isn't, the line above the box shows the connector's sentence, such as
+  "Speech to text is off. Turn it on in Settings, Connections.", and nothing
+  records. Otherwise the button turns red and pulses, and the line reads
+  "Listening… 12 s. Press the microphone again to stop". A second press, or
+  60 seconds, stops it. "Turning speech into text…" follows, then the words
+  land in the box after any text already there, with the cursor at the end,
+  and the line says "Check the words, then press Send." Nothing sends without
+  that press. No words gives "Meru heard nothing. Try again closer to the
+  microphone."
+- The page records in `web/js/voice.js` with `getUserMedia` and
+  `MediaRecorder`, which in the macOS WebView makes AAC. When it stops,
+  `decodeAudioData` decodes it and an `OfflineAudioContext` of one channel at
+  16 kHz mixes and resamples it in one pass, faster than real time; a few
+  lines of JavaScript write the 44-byte WAV header and the 16-bit samples.
+  No audio worklet and no native recorder were needed. The microphone is
+  let go as soon as recording stops, so macOS's indicator goes out.
+- The Bridge's `Transcribe` takes the WAV as base64, decodes it, refuses
+  more than 3 MiB, and sends the `transcribe` op with a two-minute timeout;
+  it keeps no copy.
+- The window's `Permissions` (Wails v3 beta.28) allow the microphone without
+  WebKit's own prompt, which would ask on every launch, and deny the camera.
+  macOS still asks once, from `Info.plist`'s `NSMicrophoneUsageDescription`:
+  "Meru turns what you say into text on this Mac. The sound never leaves
+  it." Wails' WebView exposes `navigator.mediaDevices` on its own `wails://`
+  page, so `getUserMedia` works as in a browser.
+- A Mac may have no microphone: a Mac Studio or a Mac mini has none until
+  one is plugged in. With no input device the line says "This Mac has no
+  microphone. Connect one, such as AirPods or a webcam." A refused
+  permission names the System Settings pane that turns it on.
+- On 2026-10-18 the owner recorded through a USB webcam on the Mac Studio,
+  saw the words land in the box, and sent them as a question.
+
+### What Meru keeps
+
+Nothing of the sound. The WAV lives in the app's memory and in `merud`'s for
+the one request, and nothing writes it to disk: no file, no transcript line,
+no `tool_calls` row, since speech to text isn't a tool call. The text joins a
+chat only when you send it, as typed text does. `merud` logs one info line
+per request with the model, the length of the audio, the time taken and the
+outcome, never the words:
+
+```text
+level=INFO msg=transcribe model=ggml-large-v3-turbo-q5_0.bin seconds=20.0 ms=3525 outcome=ok
+```
+
+The supervisor logs `whisper-server`'s own output at debug level. Version
+1.9.5 prints its startup and request lines but not the words it heard; every
+server log from the tests on 2026-10-18 was searched for them.
+
+---
+
 ## Other agents (A2A)
 
 Meru hands tasks to other agents over A2A, an open protocol for agent-to-agent work.
 As with MCP, Meru is only a client; it doesn't serve A2A. The client comes from the
-A2A project's Go SDK, `github.com/a2aproject/a2a-go/v2` (v2.5.0), and speaks version
+A2A project's Go SDK, `github.com/a2aproject/a2a-go/v2` (v2.6.0), and speaks version
 1.0 of the protocol over JSON-RPC or REST. An agent whose card speaks only an older
 version fails with an error that says so.
 
@@ -4368,36 +5013,176 @@ with "network was renamed remote".
 
 ## Scheduler
 
-A job is a prompt plus a cron expression, declared in `config.toml`:
+`merud` runs jobs on a schedule: a prompt, a prompt with a named skill, or one
+declared `[[commands]]` entry. It is the first half of v0.5, built in steps
+under [#167](https://github.com/aarora79/meru/issues/167): the schedule rules in
+`internal/jobs` came first; now `merud` runs every kind of job in `[[jobs]]`, a
+prompt, a skill or a command, with `allow` and `output`, files each run in the
+Jobs folder, and answers every op below, with a Jobs section in Settings and
+`/jobs` in `meru chat` to add, edit, pause, remove, run and stop jobs, and
+`schedule_job` adds one when you ask in chat.
+
+### A job
+
+A job is a name, a schedule and one action, declared in `config.toml`:
 
 ```toml
 [[jobs]]
 name     = "morning-brief"
-schedule = "0 7 * * 1-5"          # 7:00 on weekdays
-prompt   = "Brief me on today's calendar, unread email and anything due this week."
-output   = "notification"          # or "digest", or a file path
+schedule = "0 7 * * 1-5"               # 7:00 on weekdays, this computer's time zone
+prompt   = "Brief me on today's calendar, unread mail and anything due this week."
+allow    = ["write_file"]              # tools it may use without asking once
+output   = "briefs/{date}.md"          # optional; under [skills] output_dir
+
+[[jobs]]
+name        = "go-news"
+schedule    = "0 9 * * 2"              # Tuesdays at 9:00 ...
+every_weeks = 2                        # ... every other week
+from        = "2026-10-27"             # the first day it may run
+skill       = "web-research"
+prompt      = "Summarize what changed in the Go release notes."
+
+[[jobs]]
+name     = "backup"
+schedule = "30 23 * * *"
+command  = "backup-notes"              # a [[commands]] entry; no model runs
 ```
 
-Each run is a session with its own transcript, so a job's work lands in the same log
-and traces as your questions. `merud` runs it through the same agent loop
-as a question you type, and sends the output to a digest, a file or a notification.
-Jobs don't stream, since no one is watching, and nobody can approve a tool call, so
-`dispatch` declines every call that needs a yes during a job. That includes a local
-command with `confirm = true`: its outcome is `declined`, its row still goes in, and
-the job's output says it skipped the call, so a brief with a missing section has a
-reason on record.
-The operating system's service manager (`launchd`, `systemd` or a Windows service)
-restarts `merud` after a reboot. The scheduler lives inside `merud`, not in the
-service manager, so jobs use the loaded models and land in the same audit log and
-traces.
+| Key | What it says |
+| --- | --- |
+| `name` | letters, digits, `-` and `_`, unique; at most 50 jobs, so the metric's `job` attribute stays a small set |
+| `schedule` | five-field cron: minute, hour, day of month, month, day of week; `*`, numbers, names (`mon`, `jan`), ranges, steps (`*/15`) and lists |
+| `every_weeks`, `from` | run only every N weeks; the weeks count from the Monday of `from`'s week, and nothing runs before `from` |
+| `prompt` | the question the run asks, through the agent loop |
+| `skill` | a skill the run loads without the pick step; needs `prompt` |
+| `command`, `args` | a `[[commands]]` entry and its parameters; no model runs |
+| `allow` | tools the run may use without asking, when they would ask once |
+| `output` | a file under `[skills] output_dir` the answer also goes to; `{date}`, `{time}` and `{job}` fill in |
+| `enabled` | `false` pauses the job |
+
+Each cron field becomes a set of allowed values, kept as a bitmask, and `Next`
+finds the first matching minute after a time, skipping whole months, days and
+hours that can't match. It builds each candidate from the wall clock with
+`time.Date`, so daylight saving time does what people expect: 2:30 on the night
+clocks jump from 2:00 to 3:00 doesn't happen, so a 2:30 job skips that day, and
+1:30 on the night it happens twice runs once. A schedule that matches no date
+within five years, such as 31 February, is refused when config loads. When the
+two day fields are both restricted, a day matches if either does, as in cron.
+`Describe` writes the schedule in words for the clients: "7:00 on weekdays",
+"9:00 on Tuesdays, every other week from 27 October 2026".
+
+### When a job runs
+
+A loop in `merud` asks `jobs.Due` about every enabled job every 30 seconds,
+comparing wall-clock times. A ticker that compares the clock finds a run that
+fell due while the Mac slept within 30 seconds of waking, whatever Go's timers
+do across sleep. `Due` takes the job's schedule, its last run and the time now:
+
+- **On time:** the latest scheduled time has passed since the last run; the job
+  runs.
+- **Late:** the Mac slept through 7:00 and woke at 8:30. The job runs once, for
+  the latest slot, and its prompt starts with a line that says how late it is. A
+  job that missed several slots, such as an hourly one overnight, runs once.
+- **Too late:** every missed slot is more than 12 hours old (`jobs.CatchUp`).
+  The job doesn't run; `merud` logs the slot it skipped and moves on, so
+  yesterday's brief doesn't arrive at 9 p.m.
+
+The last run of each job comes from the turns table at startup, which a rebuild
+fills from the transcripts. A run moves the job's last run when it starts, so a
+run that fails waits for its next time. Runs share the warm model and go one at
+a time; a job whose last run still runs skips that slot. A question you type
+isn't blocked: Ollama serves both.
+
+### Where a run goes
+
+Each run is a chat. Its session sits in a chat folder named **Jobs**, which the
+first run creates; both clients show it first in the chat list, and `merud`
+refuses to rename or remove it while `[[jobs]]` holds a job. A run's title is the job's
+name and the time, such as "morning-brief · Fri 24 Oct 07:00", so a job's runs
+read as a log, newest first. The user line records the job's name, so the
+turns row carries it and a rebuild knows each job's last run.
+
+- **A prompt** runs through `agent.Handle` with source `job`, as a typed
+  question would, within `[agent] turn_timeout`. Nothing streams, since nobody
+  watches.
+- **A skill** loads without the pick call; its tools join the route as a picked
+  skill's do.
+- **A command** runs the `[[commands]]` entry through `dispatch`, with no model:
+  a user line names it, and its output, cut to 4,000 characters, is the answer.
+- **`output`**, when set and the run ended `ok`, writes the answer with one
+  `write_file` call through `dispatch`, caller `meru`, so the file lands in the
+  audit log and stays under `output_dir`.
+
+### Approvals in a job
+
+Nobody can answer an approval during a job, so `dispatch` treats a job's calls
+by how they would ask:
+
+| The call | In a job |
+| --- | --- |
+| needs no approval | runs |
+| asks once (`confirm` lists it, or a command has `confirm = true`), and the job's `allow` names it | runs; the approval line reads `once` |
+| asks once, and `allow` doesn't name it | `declined`; the answer says it skipped the call |
+| asks every time: `configure`, `web_fetch` on a URL nobody gave, a download, an MCP tool in `always_confirm` | `declined`, whatever `allow` says |
+
+The last row keeps the URL guard whole: an unattended job can't send data out
+through an address the model made up, and a page it reads can't change config.
+A website in `[web] trusted_sites` reads without asking, in a job as anywhere.
+A job that reads mail or web pages can be told by them to do something, and
+what its `allow` lists runs without asking, so allow only what the job needs,
+and a tool that sends only when sending is the job's purpose.
+
+### Pausing, cancelling and managing jobs
+
+| Op | What `merud` does |
+| --- | --- |
+| `jobs` | lists each job with its schedule in words, next and last run, the last run's outcome and chat, and whether it runs now |
+| `job_set` | adds or replaces one job in `config.toml` through a checked edit, which keeps the comment above it; with `dry_run` it only checks the job and returns its schedule in words, which the add form shows as you type. `enabled = false` pauses; resuming doesn't catch up the slots missed while paused, and a changed schedule counts from the edit |
+| `job_remove` | takes the job out of `config.toml`; its runs stay in the Jobs folder |
+| `job_run` | runs the job now, outside its schedule; this doesn't count as its last run |
+| `job_cancel` | stops the job's run in progress, as Ctrl-C stops a question: the run ends `cancelled`, its chat keeps what it wrote, and the schedule stays |
+
+Meru.app has a Jobs section in Settings, with an Add a job form, and Pause,
+Edit and Remove on each job. `meru chat` has `/jobs`: Enter runs the marked job
+now, `c` stops its run, `p` pauses or resumes, `d d` removes, and `a` and `e`
+walk through a new job's or the marked job's name, schedule, prompt and skill.
+A job's command, arguments, `allow` and `output` are set in Settings or
+`config.toml`. A request's job fields come only from
+`merud`'s own scheduler; the socket refuses them from a client, so no client can
+make an ask that borrows a job's approvals.
+
+You can also ask: "every other Tuesday at 9, summarize the Go release notes".
+The built-in tool `schedule_job` proposes the job, and asks every time, as
+`configure` does: the card shows the job with its schedule in words, such as
+"9:00 on Tuesdays, every other week from 27 October 2026", and nothing is saved
+until you say yes. It sets no `allow` list; what a job may do unwatched is set
+in Settings or `config.toml`. A question with "schedule", "daily" or
+"weekly", "every" or "each" before a time word such as "weekday" or "morning",
+or "job" with a time of day such as "8am", gets the tools route, so a `direct`
+guess still offers the tool. A job's own turns never see
+`schedule_job` or `configure`, so no job makes or changes jobs.
+
+### What the scheduler doesn't do
+
+It sends no notifications and keeps no digest yet; those and `meru brief` are
+planned for v0.6. A job never waits for an approval. It runs no shell line, only
+declared commands, and a script runs by its own path. It has no seconds, no
+`@reboot`, and no time zone but the computer's own. The operating system's
+service manager (`launchd`, `systemd`) restarts `merud` after a reboot; the
+scheduler lives inside `merud`, so jobs use the loaded models and land in the
+same audit log and traces.
 
 ---
 
 ## Observability
 
-Every stage of a turn emits OpenTelemetry (OTel) metrics and traces: routing,
-retrieval, each model call and each tool call. A dashboard can then show where a slow
-answer spent its time, how many tokens it used, and which tool failed.
+Every stage of a turn emits OpenTelemetry (OTel) traces: routing, retrieval,
+each model call and each tool call. The model-call metrics cover the `main`
+model's rounds and the summarizer; the router, the skill pick, `web_fetch`'s
+prompt and every embedding call get spans only. Meru needs no dashboard program to
+show them: the Usage screen in both clients draws its charts from `meru.db`, and a
+Prometheus you run can read the same metrics from `merud` (see
+[Reading the metrics](#reading-the-metrics)).
 
 ### Local only
 
@@ -4405,17 +5190,23 @@ Meru collects this data about itself, and none of it leaves your machine. It goe
 only to an endpoint you run on this machine:
 
 - The OTLP (OpenTelemetry Protocol) exporter stays **off until you set
-  `observability.otlp_endpoint`.** Without an endpoint, metrics go to a no-op
-  provider and spans record nothing. Each span still gets a trace ID, so the log and
+  `observability.otlp_endpoint`.** With neither `otlp_endpoint` nor
+  `prometheus` set, metrics go to a no-op provider and spans record nothing. Each span still gets a trace ID, so the log and
   the transcript can name the turn. Instrumentation then costs almost nothing.
 - `merud` **refuses to start if the endpoint isn't a loopback address.** No setting
   sends metrics or traces anywhere else.
+- The **`/metrics` page stays off until you set `observability.prometheus`** to a
+  loopback `host:port`, and `merud` refuses any other address. It answers GET and
+  HEAD on `/metrics` alone, and only to a request whose `Host` names this
+  machine, so a web page can't read it through your browser by pointing its own
+  domain name at 127.0.0.1.
 - **Spans carry no prompt or response text** unless you set `capture_content = true`.
   They always carry token counts, durations, model names and tool names, which reveal
   nothing about what you asked.
 
 ```toml
 [observability]
+prometheus       = "127.0.0.1:9464"         # serves /metrics; loopback only; unset = off
 otlp_endpoint    = "http://127.0.0.1:4318"   # OTLP/HTTP; loopback only; unset = off
 metrics_interval = "10s"
 traces           = true
@@ -4425,18 +5216,24 @@ capture_content  = false                     # prompt/response text in spans
 ### Traces
 
 Each turn produces one trace. A question over the socket starts at `rpc.request`;
-a scheduled job (v0.5) starts at `meru.turn`. In v0.3 a turn on the `search+tools`
+a scheduled job's run (v0.5) starts at `meru.job`, with the run's `meru.turn` under it. In v0.3 a turn on the `search+tools`
 route with one round of tool calls looks like this:
 
-![Trace tree for one v0.3 turn on the search+tools route with one tool round. rpc.request, with op, source and question length, holds meru.turn, with route, source, session, iterations and outcome. Under meru.turn, in order: meru.session; meru.transcript.append for the user line; meru.route, with a gen_ai.chat fast span and its POST /api/chat; meru.search, with meru.retrieve and its POST /api/embed; meru.prompt; gen_ai.chat main for round 1, with its POST /api/chat; meru.dispatch, one per call, holding a tools/call span for MCP or an invoke_agent span for A2A; meru.transcript.append for the call's lines; gen_ai.chat main for round 2, the answer, with its POST /api/chat; and meru.transcript.append for the assistant line. The same trace ID goes on the transcript lines, the messages and tool_calls rows, and every log line of the turn.](docs/architecture/img/300-trace.png)
+![Trace tree for one turn on the search+tools route with one tool round. rpc.request, with op, source and question length, holds meru.turn, with route, source, session, iterations and outcome. Under meru.turn, in order: meru.session; meru.transcript.append for the user line; meru.route, with a gen_ai.chat fast span and its POST /api/chat; meru.skills.pick, which runs beside meru.route, with its own gen_ai.chat fast span; meru.search, on turns about your files, with meru.retrieve and its POST /api/embed; meru.retrieve.sessions for past sessions, on turns that search first; meru.recall for memories, on every turn; meru.prompt; gen_ai.chat main for round 1, with its POST /api/chat; meru.dispatch, one per call, holding a tools/call span for MCP or an invoke_agent span for A2A; meru.transcript.append for the call's lines; gen_ai.chat main for round 2, the answer, with its POST /api/chat; and meru.transcript.append for the assistant line. The same trace ID goes on the transcript lines, the messages and tool_calls rows, and every log line of the turn.](docs/architecture/img/300-trace.png)
 
-*Figure 7. One v0.3 turn on the `search+tools` route with one tool round. The router's one-token call and each round of the main model get a `gen_ai.chat` span with its HTTP request under it; the search sits before the first round, and each tool call gets a `meru.dispatch` span between the rounds. The trace ID also sits on the transcript lines and every log line of the turn, so a slow bar in Grafana leads to the exact lines, and a line leads back to its timing.*
+*Figure 7. One turn on the `search+tools` route with one tool round. The router's one-token call and each round of the main model get a `gen_ai.chat` span with its HTTP request under it; the search sits before the first round, and each tool call gets a `meru.dispatch` span between the rounds. The trace ID also sits on the transcript lines and every log line of the turn, so a slow bar in a trace viewer leads to the exact lines, and a line leads back to its timing.*
 
 A turn on the `direct` route has no `meru.search`, unless the question names an
-indexed folder. A turn on `direct` or `search` has no tool spans, and one
-`gen_ai.chat main`. The calls of one round run at the same time, so their
-`meru.dispatch` spans overlap. v0.4 adds memories under `meru.retrieve`, and a
-`meru.retrieve.sessions` span under `meru.turn` for past sessions. Each session
+indexed folder or asks about past chats; with `[index] retrieval = "agentic"` no
+turn searches first, and a question with an attached picture gets a
+`meru.search` span for the image search. `direct` and `search` offer fewer tools
+(`datetime`, `about_meru`, the web tools, and on `search` the file tools), so
+they can still have tool rounds. The calls of one round run at the same time,
+so their `meru.dispatch` spans overlap. v0.4 adds a `meru.recall` span under
+`meru.turn` for memories, on every turn, and a `meru.retrieve.sessions` span on
+turns that search first, for past sessions. The skill pick has its own
+`meru.skills.pick` span beside `meru.route`, with the `fast` model's
+`gen_ai.chat` under it. Each session
 summary is a trace of its own: `meru.summarize`, with the fast model's
 `gen_ai.chat` inside.
 
@@ -4459,7 +5256,9 @@ span records the error and sets its status to Error; a cancelled one gets a
 Every tool call gets a `meru.dispatch` span, whatever its kind. It carries
 `gen_ai.tool.name`, `meru.tool.kind`, `meru.tool.server`, `meru.tool.outcome` and
 `meru.tool.approval`, the same keys the tool metrics use, so a dashboard can go from
-a metric to its traces. The backend's own span nests under it:
+a metric to its traces. One value differs: the span's `gen_ai.tool.name` is the
+full name, such as `google.search_gmail_messages`, while the metric's tool is
+the bare name. The backend's own span nests under it:
 
 - **MCP** spans follow the OTel MCP semantic conventions: each is named
   `tools/call <tool>` and carries `mcp.method.name` and `gen_ai.tool.name`.
@@ -4467,15 +5266,18 @@ a metric to its traces. The backend's own span nests under it:
   named `invoke_agent <agent>`, with `gen_ai.operation.name = invoke_agent`,
   `gen_ai.agent.name`, `server.address` and `server.port`. Meru adds
   `meru.a2a.skill`, `meru.a2a.task.id` and `meru.a2a.task.state`.
-- **Built-in** tools have only the `meru.dispatch` span, except `web_fetch` with a
-  prompt, which adds the `fast` model's `gen_ai.chat` span under it.
+- **Built-in** tools have only the `meru.dispatch` span, with three exceptions:
+  `web_fetch` with a prompt adds the `fast` model's `gen_ai.chat` span, and on a
+  page that needs JavaScript a `meru.web.render` span; `search_files` adds
+  `meru.retrieve` with its embedding call; and `search_images` adds its
+  embedding call.
 - **Local commands** add `meru.command.exit_code` and `meru.command.truncated` to
   the `meru.dispatch` span, which has no child.
 
 MCP and A2A spans also carry `meru.tool.server` and `meru.tool.allowed`. A failed
 call's `error.type` says how it failed: `tool_error` (the MCP convention's name)
-when the server or agent reports failure, or Meru's own `denied`, `unavailable` or
-`timeout`. Arguments and results go on the spans only when `capture_content = true`.
+when the server or agent reports failure, Meru's own `denied`, `unavailable` or
+`timeout`, or, for an MCP protocol error, the JSON-RPC error code. Arguments and results go on the spans only when `capture_content = true`.
 `merud` writes each trace ID to the session transcript, `messages` and
 `tool_calls`, and to every log line of the turn.
 
@@ -4486,25 +5288,27 @@ for the rest.
 
 | Metric | Type | Attributes | Answers |
 | --- | --- | --- | --- |
-| `gen_ai.client.token.usage` | histogram | model, tier, `gen_ai.token.type` (input/output) | tokens per call |
+| `gen_ai.client.token.usage` | histogram | model, tier, operation, `gen_ai.token.type` (input/output) | tokens per call |
 | `gen_ai.client.operation.duration` | histogram | model, tier, operation | model call latency |
 | `gen_ai.server.time_to_first_token` | histogram | model, tier | the v0.1 "first token < 1 s" target |
 | `gen_ai.server.time_per_output_token` | histogram | model, tier | decode speed |
 | `meru.engine.load.duration` | histogram | model | cold loads Ollama had to do (should be ~0) |
 | `meru.route.decisions` | counter | route, outcome (ok/low_confidence/degraded) | how often each route wins, and how often the router is unsure |
-| `meru.turn.duration` | histogram | route, source (cli/tui/job), outcome (ok/error/cancelled/timeout/cut_off/gave_up/bad_output) | end-to-end latency; its sum over `outcome="ok"` is active time |
+| `meru.turn.duration` | histogram | route, source (cli/tui/desktop/job), outcome (ok/error/cancelled/timeout/cut_off/window_full/gave_up/bad_output) | end-to-end latency; its sum over `outcome="ok"` is active time |
 | `meru.sessions` | counter | source | sessions started |
 | `meru.turn.tokens` | counter | `gen_ai.token.type` (input/output), route, source | the main model's tokens per answered question, summed over its model calls |
 | `meru.turn.docs` | histogram | route | distinct files each answered question read |
 | `meru.turn.iterations` | histogram | route | loop depth |
-| `meru.context.tokens` | histogram | section (system/skills/memories/sessions/chunks/web/history/tools) | data for the context budget policy |
+| `meru.context.tokens` | histogram | section (skills/memories/sessions/chunks/web/history/tools) | data for the context budget policy; the fixed part of the system prompt isn't measured yet |
 | `meru.tool.calls` | counter | `meru.tool.kind` (mcp/a2a/builtin/command), `meru.tool.server`, `gen_ai.tool.name`, `meru.outcome` (ok/error/denied/declined/cancelled/timeout) | tool usage and failures |
 | `meru.tool.duration` | histogram | `meru.tool.kind`, `meru.tool.server`, `gen_ai.tool.name` | tool latency, for calls that ran |
 | `meru.model.malformed_calls` | counter | model | tool calls the main model wrote that Meru couldn't run as written |
-| `meru.retrieval.duration` | histogram | stage (vector/fts/fusion/memories/sessions) | retrieval cost (v0.2; memories and sessions stages v0.4) |
+| `meru.retrieval.duration` | histogram | stage (vector/fts/fusion/memories/sessions/images) | retrieval cost (v0.2; memories and sessions stages v0.4; images v0.4.13) |
+| `meru.speech.duration` | histogram | model (the whisper connector's two files), outcome (ok/error/empty/too_long/cancelled) | how long one recording takes to become text, the server's start included |
 | `meru.web.render.duration` | histogram | outcome (ok/error/timeout/cancelled) | how long a page that needs JavaScript takes in the page reader, Chrome's start included |
 | `meru.rpc.active_streams` | up-down counter | — | open client sessions |
-| `meru.scheduler.job_runs` | counter | job, outcome | (v0.5) scheduled work |
+| `meru.scheduler.job_runs` | counter | job, outcome | (v0.5) scheduled work: did each job run, and how did it end |
+| `meru.scheduler.lateness` | histogram | job | (v0.5) how late runs start after sleep or a restart |
 
 The OTel Go runtime package adds heap, garbage-collection and goroutine metrics.
 
@@ -4540,20 +5344,47 @@ keeps the real names. `meru.tool.duration` covers only the time a tool ran, so a
 call that never ran (denied, declined, or cancelled before it started) adds to
 `meru.tool.calls` and records no duration.
 
-### The stack
+### Reading the metrics
 
-`merud` speaks plain OTLP/HTTP, so any OTLP backend works. The reference setup is one
-container, **`grafana/otel-lgtm`**, which bundles an OTel Collector, Prometheus,
-Tempo and Grafana. The repo ships its compose file and a ready-made Meru dashboard.
-The compose file:
+Meru ships no dashboard program. There are three ways to read the numbers, and
+the first needs nothing installed.
 
-- binds ports to `127.0.0.1` only (4318 for OTLP, 3000 for Grafana);
-- turns off Grafana's own reporting and update checks:
-  `GF_ANALYTICS_REPORTING_ENABLED=false`, `GF_ANALYTICS_CHECK_FOR_UPDATES=false`,
-  `GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES=false`.
+- **The Usage screen.** The Usage button in the desktop app's rail and `/usage` in
+  `meru chat` draw their charts from the `turns` and `tool_calls` tables in
+  `meru.db`, which rebuild from the transcripts. The socket op `usage` with
+  kind `detail` returns the data: 30 days of tasks, tokens and time to first
+  token (p50 and p95 by nearest rank, in local days), the ten slowest tasks
+  of the last 7 days, the twelve busiest tools by outcome, use by answer model,
+  and the `/metrics` address. An older `merud` answers that kind with the plain
+  windows, and both clients then say the charts need a newer `merud`.
+- **`/metrics` for Prometheus.** With `prometheus = "127.0.0.1:9464"`, `merud`
+  serves every metric above in Prometheus's text format, version 0.0.4, at
+  `http://127.0.0.1:9464/metrics`. A manual reader beside the OTLP push collects
+  the instruments on each request, and `merud` writes the text itself, with no
+  Prometheus library. Names follow the OpenTelemetry Collector's rule: dots
+  become `_`, the unit adds `_seconds` or `_bytes`, and a counter ends in
+  `_total`, so `meru.tool.calls` is `meru_tool_calls_total` and
+  `meru.turn.duration` is `meru_turn_duration_seconds`. A `target_info` line
+  carries `service_name="merud"` and the version. Counters start from zero
+  when `merud` restarts; `rate()` and `increase()` allow for that. A taken port
+  stops `merud` at start, with the key to change.
+- **OTLP.** `otlp_endpoint` pushes metrics, and traces when `traces = true`, to
+  any OTLP/HTTP collector you run on this machine, such as an OpenTelemetry
+  Collector in front of Jaeger. Traces go only this way. When the push fails,
+  `merud` logs it once an hour, with the hint to blank `otlp_endpoint` if no
+  collector runs there.
 
-To run the parts as separate binaries (Collector, Prometheus, Jaeger or Tempo), point
-`otlp_endpoint` at the Collector. `merud` needs no change.
+`/metrics` and OTLP can run at once; each reader sees every instrument, so they
+report the same numbers. A few PromQL queries for the page:
+
+```promql
+# Tasks per day
+sum(increase(meru_turn_duration_seconds_count[1d]))
+# Time to first token, p95 over the last hour
+histogram_quantile(0.95, sum by (le) (rate(gen_ai_server_time_to_first_token_seconds_bucket[1h])))
+# Tool calls that failed today, by tool and outcome
+sum by (gen_ai_tool_name, meru_outcome) (increase(meru_tool_calls_total{meru_outcome!="ok"}[1d]))
+```
 
 ### Logs
 
@@ -4562,11 +5393,11 @@ and doesn't export them. `[log] level` picks how much it writes; `merud -v` forc
 `debug`.
 
 - **`info`** (the default): startup settings, each model warm-up, the store's
-  counts, each index scan's counts, shutdown, and one `turn` line per turn with its
-  route, outcome, total time, time to first token and token counts.
+  counts, each index scan's counts, shutdown, a `route` line per decision with
+  its whole distribution, and one `turn` line per turn with its route, outcome,
+  total time, time to first token and token counts.
 - **`debug`**: adds a line for each stage of a turn: the request, the session, the
-  history, each transcript write, the route with its whole distribution, the
-  search's result count, the prompt's size, each Ollama call (status, time to headers, first token, Ollama's
+  history, each transcript write, the search's result count, the prompt's size, each Ollama call (status, time to headers, first token, Ollama's
   own timings, tokens per second) and the reply.
 
 Every line of a turn carries its `trace_id`, the same ID the trace and the
@@ -4621,6 +5452,9 @@ transcript lines hold. No level writes question or answer text. With
 - No telemetry leaves the machine. Meru's own metrics and traces are off by default,
   go only to loopback when on, and leave out prompt text unless you opt in. Meru
   sends no crash reports and never checks for updates.
+- Any program on this machine can read the `/metrics` page while it's on. It
+  holds counts, durations and names from small fixed sets: models, routes,
+  servers, tools and outcomes, never a question, a path or a session ID.
 - The store is a plain file, readable only by you (mode `0600`). Back it up or
   delete it; it's yours.
 - Deleting a chat removes its transcript and its content in `meru.db`; its
@@ -4635,9 +5469,22 @@ transcript lines hold. No level writes question or answer text. With
   text, and nowhere else.
 - The indexer reads only the folders you list, never follows a symlink, and never
   indexes a file that looks like a secret. The file tools, `read_file`,
-  `list_folder`, `grep` and `search_files`, apply the same rules through the
+  `list_folder`, `grep`, `search_files`, `search_images` and `view_image`, apply
+  the same rules through the
   indexer's own code, so outside the output folder and your own session
   transcripts the model can read no file that search couldn't reach.
+- An image in those folders goes to Ollama on loopback to be embedded, EXIF data
+  and all, and nowhere else. A search hands the answer model a picture's name
+  and path. The model sees the picture itself only when it calls `view_image`,
+  which Meru offers while the `main` model lists `vision`; the bytes go to Ollama
+  on loopback, and the transcript keeps only the file's name and size.
+  `[index] images = false` keeps images out of the index.
+- The Apple Notes tools read the Notes app's database only when the model calls
+  one, and only once you give `merud` Full Disk Access. What they return goes to
+  the local model, and the transcript and `tool_calls` keep it as they keep any
+  tool result. They never write to the database, and Meru keeps no copy of a
+  note. Take the three names out of `[builtin] tools`, or turn off Full Disk
+  Access for `merud`, and Meru reads no note.
 - `meru log` and the `tool_calls` table let you review every external action.
 - The Mac installer downloads only what a step names, after you press Continue:
   Ollama and uv through Homebrew, the models through Ollama, the SearXNG image
@@ -4650,8 +5497,14 @@ transcript lines hold. No level writes question or answer text. With
   compiled into `merud`; the package and its dependencies from the npm
   registry or PyPI; a Python build through uv; and a container image by
   digest through Docker (see [The runtime folder](#the-runtime-folder)).
-  Nothing downloads until a connector needs it, and today no code in `merud`
-  calls the installer yet.
+  Nothing downloads until a connector needs it: `merud` installs a connector the
+  first time it starts it, and the page reader installs chrome-headless-shell
+  the first time a page needs JavaScript.
+- Speech to text keeps the sound on the machine: Meru.app or
+  `meru transcribe` sends it to `merud` over the socket, `merud` to
+  whisper.cpp's server on loopback, and nothing writes it to disk. Only the text you send joins a
+  chat. The connector downloads its program from Meru's own release and its
+  model from Hugging Face, each pinned by SHA-256, when you turn it on.
 - The desktop app loads nothing from the network. Its page, fonts and libraries
   ship inside the binary, its Content-Security-Policy blocks remote scripts,
   images and connections, and its Wails updater stays unconfigured, so it never
@@ -4678,8 +5531,9 @@ transcript lines hold. No level writes question or answer text. With
 We'll settle these with working code and measurements.
 
 1. **Router quality.** The router reads probabilities instead of parsing text (see
-   [Routing](#routing)). A labelled set of 135 questions and `make router-eval`
-   measure it. On the development machine with MiniCPM5-2B, a prompt that puts
+   [Routing](#routing)). A labelled set of questions, 162 today, and
+   `make router-eval` measure it. The figures below come from the first 135
+   rows. On the development machine with MiniCPM5-2B, a prompt that puts
    contrastive option text, the indexed folders and two examples per route ahead
    of the turn picks the labelled route for 32 of 40 held-out questions, and takes
    about 28 ms per warm decision. The v0.1 prompt picked 17 of 36. Naming the
@@ -4733,9 +5587,9 @@ We'll settle these with working code and measurements.
   Eino and ADK Go. ADK Go pulls a cloud-model client into the dependency tree, and
   neither saves much once the allowlist, audit and budget logic are ours.
 - **Model runtime:** Ollama on loopback for now (see open question 4).
-- **Models:** the `lite` profile by default (MiniCPM5-2B + `nomic-embed-text`), and
-  `full` for Apple silicon with 64 GB or more (`qwen3.6:35b-a3b-mxfp8` +
-  `qwen3-embedding:0.6b`).
+- **Models:** the `lite` profile by default (MiniCPM5-2B + `embeddinggemma-2:440m`),
+  and `full` for Apple silicon with 64 GB or more (`qwen3.6:35b-a3b-mxfp8` +
+  `embeddinggemma-2:440m`).
 - **Storage:** JSONL transcripts as the source of truth; SQLite via
   `ncruces/go-sqlite3` as the index, with vectors in a plain table and vec1's
   distance function. No separate vector database.
@@ -4766,8 +5620,9 @@ We'll settle these with working code and measurements.
   wait in a queue of up to five in the client.
 - **Tool approvals:** approve once, approve for this session, or deny, asked over
   the same socket as the answer. Session approvals never touch config; lasting
-  trust comes only from editing the `confirm` list. With no one to ask (scripts,
-  scheduled jobs), `dispatch` declines the call.
+  trust comes only from editing the `confirm` list. With no one to ask, as in a
+  script, `dispatch` declines the call; a scheduled job runs a call that asks
+  once when its `allow` names the tool, and declines the rest.
 - **Tool results:** the model reads up to 16,000 characters of each result; the
   transcript and `tool_calls` keep 4,000, with secrets removed. Base64 runs of
   2,000 characters or more in an MCP or A2A result become a short note first.

@@ -316,7 +316,8 @@ func TestURLWebFirst(t *testing.T) {
 				t.Errorf("fetched %v, want %v", got, tt.want)
 			}
 			system := eng.lastCall().msgs[0].Content
-			if has := strings.Contains(system, "[1] https://acme.example/flow") || strings.Contains(system, "[2] https://acme.example/flow"); has != (len(tt.want) > 0) {
+			// The page's text, with its own number, reaches the prompt.
+			if has := strings.Contains(system, "Cite this page as [1]."); has != (len(tt.want) > 0) {
 				t.Errorf("prompt holds the page = %v, want %v", has, len(tt.want) > 0)
 			}
 		})
@@ -467,7 +468,7 @@ func TestWebNotesInHistory(t *testing.T) {
 		t.Fatalf("Handle: %v", err)
 	}
 	msgs := eng.lastCall().msgs
-	note := "[from the web: Acme Flow https://acme.example/flow — Acme Flow moves notes between apps.]"
+	note := "- Acme Flow https://acme.example/flow — Acme Flow moves notes between apps."
 	if !strings.Contains(msgs[2].Content, note) {
 		t.Errorf("history's first answer = %q, want the note %q", msgs[2].Content, note)
 	}
@@ -625,7 +626,7 @@ func TestQuickSessionReplay(t *testing.T) {
 	// Turn 3: the follow-up's history holds what the page said.
 	ask(session, "what do people make of it?")
 	history := eng.calls[3].msgs
-	note := "[from the web: Acme Quick https://quick.acme.example/ — Acme Quick is an assistant that answers from team documents.]"
+	note := "- Acme Quick https://quick.acme.example/ — Acme Quick is an assistant that answers from team documents."
 	if !slices.ContainsFunc(history, func(m engine.Message) bool { return strings.Contains(m.Content, note) }) {
 		t.Errorf("turn 3: history lacks the page's note %q", note)
 	}

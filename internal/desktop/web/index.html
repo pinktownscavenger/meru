@@ -36,6 +36,7 @@
       <div class="sessions" id="sessions"></div>
       <section class="status" id="status" aria-label="merud status" aria-live="polite"></section>
       <div class="rail-foot">
+        <button type="button" class="rail-link" id="open-usage">Usage</button>
         <button type="button" class="rail-link" id="open-settings">Settings</button>
       </div>
     </nav>
@@ -46,6 +47,7 @@
       <button type="button" class="icon-button" id="mini-expand" aria-label="Show the sidebar"></button>
       <button type="button" class="icon-button" id="mini-new" aria-label="New chat"></button>
       <button type="button" class="icon-button" id="mini-chats" aria-label="Chats"></button>
+      <button type="button" class="icon-button" id="mini-usage" aria-label="Usage"></button>
       <button type="button" class="icon-button" id="mini-settings" aria-label="Settings"></button>
       <span class="mini-status" id="mini-status" role="img" aria-label="merud status"></span>
     </nav>
@@ -58,6 +60,7 @@
         </div>
         <div class="head-actions">
           <button type="button" class="text-button" id="share" hidden>Share as file</button>
+          <button type="button" class="icon-button" id="site" hidden aria-label="Open Meru's website" title="Meru's website: aarora79.github.io/meru"></button>
           <button type="button" class="icon-button" id="toggle-panel" aria-controls="panel" aria-expanded="true" aria-label="Hide the side panel"></button>
         </div>
       </header>
@@ -82,6 +85,7 @@
           <div class="composer-bar">
             <div class="scope" id="scope" role="radiogroup" aria-label="Where Meru looks"></div>
             <button type="button" class="icon-button" id="attach" aria-label="Attach files or images" title="Attach files or images, or drop them on the chat"></button>
+            <button type="button" class="icon-button mic" id="mic" aria-label="Speak a question" title="Speak a question" aria-pressed="false"></button>
             <span class="hint">Enter sends · Shift+Enter adds a line</span>
             <button type="button" class="button secondary" id="stop" hidden>Stop</button>
             <button type="submit" class="button primary" id="send">Send</button>
@@ -91,6 +95,7 @@
     </main>
 
     <main class="page" id="settings-view" hidden aria-labelledby="settings-title"></main>
+    <main class="page" id="usage-view" hidden aria-labelledby="usage-title"></main>
     <main class="page" id="setup-view" hidden aria-labelledby="setup-title"></main>
 
     <aside class="panel" id="panel" aria-labelledby="panel-title">

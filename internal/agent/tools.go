@@ -49,12 +49,6 @@ const exploreNote = "To answer from the user's files, look in them first: call s
 	"search_files numbers each excerpt: cite the ones you use by their number in square brackets, like [1]. " +
 	"Never invent a file, a quote or a citation. If what you find doesn't answer the question, say so."
 
-// commandsNote joins the system prompt on a "search" turn that offers
-// local commands. It names them by their prefix, so the model knows the
-// cmd. tools are there to run.
-const commandsNote = "You may also run the cmd. tools offered with this question. " +
-	"Each runs one program the user declared and returns what it printed."
-
 // webFallbackNote follows toolsNote on a turn that offers both web_search
 // and a file tool. A real turn showed why. Asked "help me understand btop
 // with some simple commands", a small model grepped the user's folders,
@@ -77,10 +71,16 @@ const webNote = "When you aren't sure of a fact, such as a song, a film, a book,
 	"Never tell the user you can't search the web."
 
 // noteFor returns the tools note for a turn that offers specs: toolsNote
-// when any is an MCP tool, an A2A skill or a built-in other than the file
-// tools (datetime included); otherwise commandsNote when any is a command;
-// and "" for none. The file tools get a note of their own; see
-// fileToolsNoteFor.
+// when any is a tool other than the file tools: an MCP tool, an A2A
+// skill, a local command, or a built-in such as datetime; and "" when the
+// turn offers only file tools, or none. The file tools get a note of their
+// own; see fileToolsNoteFor.
+//
+// A local command needs no note of its own. Its description, from its
+// [[commands]] entry, says what program it runs. A separate note for the
+// cmd. tools never reached a prompt with the default config, since every
+// route offers datetime, and turning it on changed no answer on the
+// benchmark's command questions (issue #135), so it went.
 //
 // When specs hold web_search, webNote follows toolsNote, and when they
 // hold a file tool too, webFallbackNote follows that. Both depend only on
@@ -92,13 +92,11 @@ const webNote = "When you aren't sure of a fact, such as a song, a film, a book,
 // to guess a URL, and web_fetch asks the user before it fetches a URL that
 // no search result gave.
 func noteFor(specs []engine.ToolSpec) string {
-	var cmds, other, files, web bool
+	var other, files, web bool
 	for _, s := range specs {
 		switch {
 		case builtin.IsFileTool(s.Name):
 			files = true
-		case toolKind(s.Name) == dispatch.KindCommand:
-			cmds = true
 		default:
 			other = true
 			if s.Name == builtin.WebSearch {
@@ -115,8 +113,6 @@ func noteFor(specs []engine.ToolSpec) string {
 		return toolsNote + " " + webNote
 	case other:
 		return toolsNote
-	case cmds:
-		return commandsNote
 	}
 	return ""
 }
@@ -175,7 +171,11 @@ type turn struct {
 	scope string
 	// images are the bytes of the images the question carried, for the
 	// question's message; nil for none. See images.go.
-	images  [][]byte
+	images [][]byte
+	// similar holds the indexed images like the first attached one, found
+	// before the model runs; empty for a turn with no image or no image
+	// search. See similar.go.
+	similar fileHits
 	traceID string
 	emit    func(rpc.Event) error
 	approve rpc.ApproveFunc
@@ -184,6 +184,13 @@ type turn struct {
 	rounds int
 	// calls counts the tool calls so far, to number their IDs.
 	calls int
+	// viewed counts the view_image calls that may show the model a
+	// picture this turn, up to maxViewed; see runCalls.
+	viewed int
+	// blind names the answer model when it can't look at pictures, for
+	// the notice under an answer that names some; "" when it can, or when
+	// the turn never got as far as its tool list. See withoutViewing.
+	blind string
 	// called holds the name of each tool the turn called, whatever the
 	// outcome, for the check on answers that say they called one; see
 	// toolClaims.
@@ -202,6 +209,12 @@ type turn struct {
 	// repeats counts the calls the model repeated this turn. At maxRepeats
 	// the turn stops offering tools.
 	repeats int
+	// shortened counts the earlier tool results fitWindow cut short to
+	// keep the prompt inside the context window this turn.
+	shortened int
+	// windowFull is true once fitWindow couldn't make the next prompt
+	// fit; the turn then offers no more tools.
+	windowFull bool
 	// emptyRetry is true once the turn has asked the model a second time
 	// after a round with no text (see retriesEmpty). A turn does it once.
 	emptyRetry bool
@@ -222,6 +235,13 @@ type turn struct {
 	// offer is the tools the current round offers, which skillHint reads.
 	// converse sets it before each round.
 	offer []engine.ToolSpec
+	// job is the scheduled job this turn runs for, and skill the skill it
+	// names; both "" for a question someone asked. See Handle.
+	job, skill string
+	// handoff is what a Continue turn's model reads in place of a
+	// question: the last turn's question and its tool calls; "" on any
+	// other turn. See continue.go.
+	handoff string
 	// webFirst says why the turn went to the web before the model's first
 	// round: webFirstAsked, webFirstNamed, or "" for no reason.
 	webFirst string
@@ -389,6 +409,9 @@ const (
 // endBadOutput.
 func (a *Agent) converse(ctx context.Context, t *turn, msgs []engine.Message, specs []engine.ToolSpec) (reply, error) {
 	var total reply
+	// base is where the turn's tool rounds start in msgs; fitWindow
+	// shortens results from there on and leaves the rest alone.
+	base := len(msgs)
 	// nudge is true for the round that retries one whose output Ollama
 	// couldn't read. That round's call alone carries outputNudge.
 	nudge := false
@@ -396,7 +419,7 @@ func (a *Agent) converse(ctx context.Context, t *turn, msgs []engine.Message, sp
 		t.rounds++
 		start := time.Now()
 		offer := specs
-		if t.rounds >= a.maxRounds || t.repeats >= maxRepeats {
+		if t.rounds >= a.maxRounds || t.repeats >= maxRepeats || t.windowFull {
 			offer = nil
 		}
 		call := msgs
@@ -443,7 +466,18 @@ func (a *Agent) converse(ctx context.Context, t *turn, msgs []engine.Message, sp
 			a.log.DebugContext(ctx, "round finished", "round", t.rounds, "tool_calls", 0,
 				"ms", time.Since(start).Milliseconds())
 			if a.retriesEmpty(t, rep) {
-				return a.retryEmpty(ctx, t, msgs, total)
+				return a.retryEmpty(ctx, t, msgs, total, emptyNudge)
+			}
+			// A model whose tools went off still asked for some: its text
+			// is likely a plan, such as "I'll read the top four articles",
+			// with no answer after it. See retriesDropped.
+			if a.retriesDropped(t, rep, offer) {
+				if strings.TrimSpace(rep.text) != "" {
+					if err := t.emit(rpc.Event{Type: rpc.EventToken, Text: "\n\n"}); err != nil {
+						return total, err
+					}
+				}
+				return a.retryEmpty(ctx, t, msgs, total, droppedNudge)
 			}
 			total.text, total.doneReason = rep.text, rep.doneReason
 			return total, nil
@@ -451,12 +485,16 @@ func (a *Agent) converse(ctx context.Context, t *turn, msgs []engine.Message, sp
 
 		// The model reads its own calls back before their results, as
 		// Ollama's chat format expects.
+		newest := len(msgs)
 		msgs = append(msgs, engine.Message{Role: engine.RoleAssistant, Content: rep.text, ToolCalls: rep.calls})
 		results, err := a.runRound(ctx, t, rep.calls)
 		if err != nil {
 			return total, err
 		}
 		msgs = append(msgs, results...)
+		if a.fitWindow(ctx, t, msgs, base, newest, rep.usage.PromptTokens, specs) {
+			t.windowFull = true
+		}
 		a.log.DebugContext(ctx, "round finished", "round", t.rounds, "tool_calls", len(rep.calls),
 			"ms", time.Since(start).Milliseconds())
 	}
@@ -480,6 +518,24 @@ func (a *Agent) retriesEmpty(t *turn, rep reply) bool {
 		!t.emptyRetry && t.rounds < a.maxRounds
 }
 
+// retriesDropped says whether converse should ask the model once more
+// after rep, a round that offered no tools and still called some. The
+// turn turned its tools off, because the prompt filled the context window
+// (fitWindow) or the model repeated itself, and the model didn't know.
+// In a real turn it wrote "I'll pull the full text of the top 4 articles"
+// with five calls that couldn't run, and the user read that plan as the
+// answer. It shares the one retry a turn gets with retriesEmpty, and
+// needs a round left.
+func (a *Agent) retriesDropped(t *turn, rep reply, offer []engine.ToolSpec) bool {
+	return len(rep.calls) > 0 && len(offer) == 0 && rep.doneReason != "length" &&
+		!t.emptyRetry && t.rounds < a.maxRounds
+}
+
+// droppedNudge is the message the retry after dropped calls adds, for
+// that one call, as emptyNudge does.
+const droppedNudge = "Tools are off for the rest of this answer, so the calls you just made didn't run. " +
+	"Write the answer now from the tool results above and what you know. Don't call a tool."
+
 // emptyNudge is the message the empty-reply retry adds after the turn's
 // messages. It goes in as a user message, because some models' chat
 // templates accept a system message only in first place (see
@@ -496,13 +552,14 @@ const emptyNudge = "Answer the question now in plain text, from the tool results
 // It returns total, the turn's stats so far, with this call's usage added
 // and its text and stop reason as the turn's. When this call is empty too,
 // Handle ends the turn with the usual apology. It fails as answer does.
-func (a *Agent) retryEmpty(ctx context.Context, t *turn, msgs []engine.Message, total reply) (reply, error) {
+func (a *Agent) retryEmpty(ctx context.Context, t *turn, msgs []engine.Message, total reply, nudge string) (reply, error) {
 	t.rounds++
 	t.emptyRetry = true
-	a.log.DebugContext(ctx, "empty reply: asking the model once more, with no tools", "round", t.rounds)
+	a.log.DebugContext(ctx, "asking the model once more, with no tools, to answer now", "round", t.rounds,
+		"after_dropped_calls", nudge == droppedNudge)
 	start := time.Now()
 	// slices.Concat builds a new slice, so msgs itself doesn't change.
-	nudged := slices.Concat(msgs, []engine.Message{{Role: engine.RoleUser, Content: emptyNudge}})
+	nudged := slices.Concat(msgs, []engine.Message{{Role: engine.RoleUser, Content: nudge}})
 	rep, err := a.answer(ctx, nudged, nil, t.emit)
 	total.add(rep)
 	total.text, total.doneReason = rep.text, rep.doneReason
@@ -702,7 +759,17 @@ type ranCall struct {
 // succeeded brought back to t.web (see webHitsOf).
 func (a *Agent) runCalls(ctx context.Context, t *turn, calls []engine.ToolCall, caller string) ([]ranCall, error) {
 	ids := make([]string, len(calls))
+	// capped marks each view_image call past the turn's limit on pictures.
+	// The slots go out here, in call order, before any goroutine starts, so
+	// the goroutines below only read their own mark and need no lock.
+	capped := make([]bool, len(calls))
 	for i, c := range calls {
+		if c.Name == builtin.ViewImage {
+			capped[i] = t.viewed >= maxViewed
+			if !capped[i] {
+				t.viewed++
+			}
+		}
 		t.calls++
 		t.called = append(t.called, c.Name)
 		ids[i] = c.ID
@@ -720,6 +787,21 @@ func (a *Agent) runCalls(ctx context.Context, t *turn, calls []engine.ToolCall, 
 	appendTo := func(l transcript.Line) error { return a.appendLine(ctx, t.sess, l) }
 	// allowed names every tool config allows, for skillHint.
 	allowed := a.offeredNames()
+	// fence names the tools the model's calls may reach on a turn whose
+	// scope the user picked: the round's offer, and nothing else. A scope
+	// such as "My files" promises what the turn touches, and a model can
+	// name a tool it wasn't shown. merud's own web-first calls aren't
+	// fenced; the scope chose them. nil, on an auto turn, fences nothing
+	// (see dispatch.Call.Offered).
+	var fence []string
+	if caller == "" && t.scope != rpc.ScopeAuto {
+		// make with length 0 gives an empty, non-nil slice, so a round
+		// that offered no tool still fences every call.
+		fence = make([]string, 0, len(t.offer))
+		for _, s := range t.offer {
+			fence = append(fence, s.Name)
+		}
+	}
 
 	// Each goroutine writes only its own slot of out and found, so they
 	// need no lock.
@@ -742,6 +824,11 @@ func (a *Agent) runCalls(ctx context.Context, t *turn, calls []engine.ToolCall, 
 				_ = t.emit(rpc.Event{Type: rpc.EventProgress, Text: text,
 					Tool: &rpc.ToolEvent{ID: ids[i], Name: c.Name, Kind: toolKind(c.Name)}})
 			})
+			// A call past the limit still goes through dispatch, so it gets
+			// its tool_calls row; view_image reads the mark and refuses.
+			if capped[i] {
+				cctx = builtin.WithViewCapped(cctx, maxViewed)
+			}
 			res, outcome := a.tools.Dispatch(cctx, dispatch.Call{
 				ID:       ids[i],
 				Name:     c.Name,
@@ -754,11 +841,15 @@ func (a *Agent) runCalls(ctx context.Context, t *turn, calls []engine.ToolCall, 
 				TraceID:  t.traceID,
 				Caller:   caller,
 				Hint:     skillHint(t.skills, c.Name, t.offer, allowed),
+				Offered:  fence,
 				// An incognito chat's calls get a tool_calls row without
 				// their arguments or results; see dispatch.Call.
 				Incognito: t.sess.Incognito(),
 			})
-			out[i] = engine.Message{Role: engine.RoleTool, ToolName: c.Name, Content: res.Text}
+			// res.Images, from view_image, rides on the tool message: the
+			// model looks at the picture on its next round. Dispatch logged
+			// res.Text alone.
+			out[i] = engine.Message{Role: engine.RoleTool, ToolName: c.Name, Content: res.Text, Images: res.Images}
 			found[i] = res.Sources
 			outcomes[i] = outcome.Outcome
 			return t.emit(rpc.Event{Type: rpc.EventToolResult, Tool: &rpc.ToolEvent{

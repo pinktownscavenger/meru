@@ -446,6 +446,8 @@ func (b *Bridge) run(ctx context.Context, id string, in Input, say func(string))
 		return b.runConnector(id, func(cfg config.Config) (string, *HandOff, error) {
 			return SetUpObsidian(p, connectorState(cfg, "obsidian"), in.Obsidian)
 		})
+	case StepNotes:
+		return SetUpNotes(p)
 	case StepSkills:
 		return SaveSkillsAndCommands(p, in.Commands)
 	case StepGoogle:
@@ -499,6 +501,12 @@ func (b *Bridge) runOllama(ctx context.Context, say func(string)) (string, error
 	}
 	v, err := StartOllama(ctx, b.o.Run, b.o.Local, p.Home, base, say)
 	if err != nil {
+		return "", err
+	}
+	// An Ollama older than config.MinOllama can't pull Meru's search model,
+	// so the step stops here, before any download, with the sentence merud
+	// and meru setup show. Once Ollama is updated, the step runs again.
+	if err := ollamaNewEnough(v); err != nil {
 		return "", err
 	}
 	done = append(done, "Ollama "+v+" runs at "+base+".")

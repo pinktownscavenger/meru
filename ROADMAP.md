@@ -11,7 +11,8 @@ Each milestone is useful on its own. We ship them in this order.
 - Model tiers (`fast`, `main`, `embed`) kept warm in Ollama; `lite` profile by default,
   `full` profile in config
 - OpenTelemetry metrics + traces for turns and model calls, OTLP export (loopback only)
-- `deploy/` observability stack (`grafana/otel-lgtm`) with a Meru dashboard
+- `deploy/` observability stack (`grafana/otel-lgtm`) with a Meru dashboard; the
+  Usage page and `/metrics` replaced it after v0.4.11 (#106)
 - `meru "..."` for one question (plain streamed text) and `meru chat`, a terminal UI
   built with Bubble Tea
 - `config.toml` + `~/.meru/` layout
@@ -152,6 +153,11 @@ No milestone names these, and each is on `main`:
 - `web_fetch` reads pages that build their text with JavaScript, through a
   headless Chrome that `merud` installs on first need and runs for one page at a
   time behind its own proxy (#100)
+- Charts on the Usage page in both clients, from `meru.db`, and a `/metrics` page
+  for a Prometheus you run, in place of the Grafana stack (#106)
+- Apple Notes, read live and read-only from the Notes app's database through the
+  built-in `search_notes`, `list_notes` and `read_note`, on a Mac with Full Disk
+  Access for `merud`
 
 ## Headless mode
 
@@ -202,30 +208,53 @@ set passed 92% with `gemma-moe`, 90% with `qwen-dense` and 89% with `qwen-moe`.
 Chained tool calls split them most (78%, 67% and 61%), and `qwen-moe` answered
 fastest, with a median of 6.5 s to the last token.
 
+## Speech to text
+
+The owner asked for this ahead of v0.5. It turns speech into a typed question,
+so it needs nothing from a later milestone. The design is in ARCHITECTURE.md,
+[Speech to text](ARCHITECTURE.md#speech-to-text).
+
+- [x] A test of both paths, Gemma 4 in Ollama and whisper.cpp, and the design in
+  ARCHITECTURE.md, 200 and 100
+- [x] A GitHub Actions workflow that builds `whisper-server` for Apple silicon
+  from pinned source and publishes it as the release `whisper-server-v1.9.5`
+- [x] Connectors: a `service` kind and `[[install.files]]`
+- [x] The `whisper` connector, with a Whisper model per profile as its `model`
+  setting's default
+- [x] `internal/speech` and the `transcribe` op, with the socket's limit at 4 MiB,
+  and `meru transcribe`
+- [x] Meru.app: the microphone button, the microphone prompt and the
+  no-microphone message
+- [ ] The installer step and a FAQ page
+
+**Done when:** on a Mac with a microphone you press the button in Meru.app, say
+a question, see the words in the box, fix one, press Send, and get an answer,
+with no audio file left on disk.
+
 ## v0.5 — It acts unprompted
-- Ubuntu 24.04 x86-64 command-line installation through `scripts/install.sh`, with
-  the `lite` profile by default
-- Optional SearXNG through working rootless Podman or Docker, with neither runtime
-  installed by Meru
-- `merud` as a systemd user service, with lingering only after the user accepts it
-- App-only Ubuntu desktop package through the same checked setup path, built on
-  Ubuntu from the exact release commit
-- Job definitions (prompt + cron) as `[[jobs]]` in `config.toml`
-- In-daemon scheduler sharing the warm model
-- Digests, notifications, `meru brief`
+- [x] Job definitions (prompt + cron) as `[[jobs]]` in `config.toml`, with a
+  named skill, every N weeks, and each run a chat in the Jobs folder
+  ([#167](https://github.com/aarora79/meru/issues/167))
+- [x] In-daemon scheduler sharing the warm model, with catch-up after sleep,
+  Run now and Stop in both clients
+- [x] Jobs that run a declared command, pre-approve tools, or write a file
+- [x] Adding, changing, pausing and removing jobs from both clients
+- [x] Adding jobs by asking Meru (`schedule_job`)
 
-**Ubuntu done when:** on a fresh Ubuntu 24.04 x86-64 machine, one documented
-command installs command-line Meru with the `lite` profile, starts `merud`, and a
-normal question plus a question about an indexed file both use the right model.
+**Done when:** a morning brief lands without you asking. Shipped in v0.5.0: a
+job such as "every weekday at 7, brief me on my calendar" runs in its own chat.
 
-**Ubuntu desktop done when:** on a fresh Ubuntu 24.04 x86-64 desktop, the checked
-`.deb` installs from that command; Meru opens from the app menu, chats through the
-user service, attaches and drops files, picks a folder, and opens HTTP and file links.
+## v0.6 — It tells you, on any machine
+- [ ] Digests, notifications, `meru brief`
+- [ ] Meru working end to end on Ubuntu 24.04: an install path, `merud` as a systemd
+  user service, answer models picked by GPU memory, and the desktop app
+  ([#84](https://github.com/aarora79/meru/issues/84))
 
-**Scheduler done when:** a morning brief lands without you asking.
+**Done when:** a digest of the day's job runs reaches you without opening Meru,
+and one documented command sets up the same Meru on a fresh Ubuntu machine.
 
 ## Later, maybe
-- Voice: local speech-to-text, text-to-speech and a wake word
+- Voice beyond speech to text: answers read aloud and a wake word
 - Menu-bar companion app, next to the desktop app
 - Escalation to a larger model without asking: you can switch models by hand, and
   the switch unloads the old one first, but Meru never picks the larger model itself

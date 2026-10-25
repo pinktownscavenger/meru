@@ -41,9 +41,10 @@ app already sends; `merud` got no new op for it. The short version of the audit
 | Attachments, files and images | has: `/attach <path>`; no drag and drop or file dialog, which need a window |
 | Share as file, Save to a note | has: `/save chat`, `/save` |
 | Try again | has: `/retry` |
+| Continue | has: `/continue`, with a line under an answer that stopped short |
 | What this answer used, Remembered, Forget | has: `/used`, with `d d` to forget |
 | Past chats and reopening one | has: `/chats [words]` |
-| Settings: Connections, Folders, About you, Skills, Models, Activity, Usage, About | has: `/mcp`, `/folders`, `/me`, `/skills`, `/model`, `/log`, `/usage`, `/about`; partial for Connections (no form for a server of your own: `meru mcp add stdio\|http`) and Models (the sets, not the cards of models we tried) |
+| Settings: Connections, Folders, About you, Skills, Models, Activity, About, and the Usage screen | has: `/mcp`, `/folders`, `/me`, `/skills`, `/model`, `/log`, `/usage`, `/about`; partial for Connections (no form for a server of your own: `meru mcp add stdio\|http`) and Models (the sets, not the cards of models we tried) |
 | Setup | in another terminal: `meru setup` and `meru setup user` |
 | Version beside the name | has |
 | SVG preview, image previews, sidebar and panel layout | not in a terminal: they draw pictures or need a mouse-driven window |
@@ -78,7 +79,7 @@ search index is and how many memories Meru keeps, and on a wide terminal how muc
 you asked in the last hour:
 
 ```text
-Meru मेरु lite · minicpm5:2b · 2637 docs (11698 vectors, 84 MB) · 7 memories        1h: 4 questions · 18k in · 2.1k out  ● connected
+Meru मेरु lite · minicpm5:2b · 2637 docs (11698 vectors, 84 MB) · 7 memories        1h: 4 tasks · 18k in · 2.1k out  ● connected
 ```
 
 While Meru knows nothing about you, the header says `no profile`, and the empty
@@ -167,7 +168,7 @@ step the marked tool through Off, Ask and Allow:
   │                                                               │
   │                   1h   today     week   month     30d     all │
   │ sessions           1       2        5      12      14      30 │
-  │ questions          4       9       31      88      97     212 │
+  │ tasks              4       9       31      88      97     212 │
   │ tokens in        18k     41k     150k    420k    468k    1.4M │
   │ tokens out      2.1k    5.3k      19k     61k     66k    180k │
   │ active time   2m 14s  5m 01s  20m 10s  1h 01m  1h 07m  3h 05m │
@@ -478,8 +479,13 @@ adds `no profile`. `noProfile` makes that call for the header and for the empty
 conversation, which adds the nudge under its usual hint.
 
 On the right sit the last hour's usage, dim, from `lastHour`
-(`1h: 4 questions · 18k in · 2.1k out`), and the connection status. When the
-terminal is narrow, the header gives things up in this order: the usage first,
+(`1h: 4 tasks · 18k in · 2.1k out`), the connection status, and last Meru's
+website. `siteLink` writes `aarora79.github.io/meru` dim, wrapped in an OSC 8
+link to `about.SiteURL` when the terminal draws links. A terminal that draws
+links opens it on a click; with `[chat] mouse_copy` on, the chat takes the
+click, and `linkUnder` reads row 0, the header, with the same `linkAt` it uses
+for the conversation. When the terminal is narrow, the header gives things up in
+this order: the website first, since `/about` lists it too; then the usage,
 because `/usage` shows it in full; then the bracket with the vectors and size, whole,
 because cutting it mid-way would leave an open `(`, and the memory count with it;
 then the rest of the details shrink with an ellipsis from the right, and last they
@@ -496,13 +502,21 @@ approval box follows them while it is open. What comes next depends on the state
 
 - waiting for the first token: the spinner and "thinking…", unless the approval box
   already says what Meru waits for;
-- streaming: the raw text, wrapped, with a teal `▍` at the end;
+- streaming: the raw text, wrapped, with a teal `▍` at the end, and, once `merud`
+  has sent nothing for `quietSeconds` (5), the spinner and `quietLine`'s "still
+  working · 52 s". Each event sets the turn's `lastNews`, and closing the
+  approval box does too, since a wait for the user isn't `merud` being quiet.
+  The model can go quiet for minutes after its first words while it writes a
+  long tool call, such as a whole page for `write_file`: Ollama sends a call
+  only when it's done, and without the line the screen looked stuck;
 - finished or stopped: the answer rendered as Markdown;
 
 and then, on lines of their own: for a finished answer, `merud`'s notice if it
 sent one, the files it cites and the stats; "stopped"; or the error box.
 
-`sourcesBlock` draws the files, dim, like the stats line under them:
+`sourcesBlock` draws the files and web pages the answer cites, dim, like the
+stats line under them. A web page prints as its title and URL, and its link,
+from `Citation.Link`, opens the page:
 
 ```text
   The garden project sows tomatoes on 12 April [1].
@@ -706,6 +720,11 @@ mark the selected choice, so the selection shows with colour off too. `View` swa
 the help line for a `keyList`, a slice of key bindings with the two methods the
 help component needs, so the bottom line lists the keys that answer the box.
 
+Each choice's key is its first letter, except the two website choices, which
+`web_fetch` offers for a URL it doesn't know: `w` trusts the host for the session
+and `a` always, since `s` already means the session. `choiceLabel` names the host
+the approval carries: "en.wikipedia.org this session".
+
 `e` is Edit first, as in the app. `editFirst` answers deny, then puts the call in
 the input as a draft (`draftOf`): "Run mail.send with these arguments instead:" and
 the arguments as the box shows them, for the user to change and send as a new
@@ -721,8 +740,8 @@ and it sits in the conversation those boxes cover.
 A line that starts with `/` never reaches the model; `submit` hands it to
 `command`, which splits the name from its argument with
 `strings.Cut(text, " ")` and sends each name to its function. Most live in the
-file of the box they open: `/chats` in chats.go, `/scope` and `/retry` in
-scope.go, `/attach` in attach.go, `/save` in save.go, `/used` in used.go, `/me` in
+file of the box they open: `/chats` in chats.go, `/scope`, `/retry` and
+`/continue` in scope.go, `/attach` in attach.go, `/save` in save.go, `/used` in used.go, `/me` in
 me.go, `/folders` in folders.go, `/model` in models.go and `/usage` in usage.go.
 `/mcp`, `/skills`, `/log`, `/about` and `/help` open their box right in `command`
 and send the first request with `requestCmd` (box.go).
@@ -744,7 +763,12 @@ many questions went.
 
 Commands that only open a box, copy text or talk to `merud` run at once while a
 turn runs and never wait in the queue. `/retry` is a question, so it queues like
-one. A model switch, a reopened chat and a save wait for the turn to end: `merud`
+one. `/continue` waits for the answer to end instead: it picks up the newest
+answer, which is the one still streaming. It sends `outgoing{cont: true}`,
+which `startTurn` turns into `Continue: true` on the request, and runs only when
+`stoppedShort` holds for the newest turn: it ended `cut_off`, `window_full` or `timeout`, as the
+`done` event's `Outcome` says, or the past turn's when a chat reopens.
+`renderTurn` draws `continueHint` in amber under that turn alone. A model switch, a reopened chat and a save wait for the turn to end: `merud`
 would unload the model writing the answer, the answer would land in the wrong
 conversation, and two approval boxes could open at once. `/exit` does what Ctrl-D
 does. Any other `/word` stays in the input, so a typo can be fixed, and the bottom
@@ -968,6 +992,17 @@ set and returns `askUsage(ask, true)`: the same request with `Kind` set to
 the header, whose summary reads windows of time. The box draws
 `rpc.ModelUsageTable`: one row per model, with turns, the median time to first
 token, tokens per second, tool calls, bad calls and capped turns.
+
+A plain `/usage` sends two requests at once with `tea.Batch`: the windows,
+and `askUsageDetail`, which asks for kind `rpc.UsageDetail`. Its reply comes
+back as a `usageDetailMsg`, and `applyUsageDetail` puts it in the open box.
+`usageDetailLines` draws it under the table: tasks and tokens in for the last
+14 days as bar lines, today's tokens and time to first token, the five slowest
+tasks of the week, the tools with failed calls, and where Prometheus can read
+the metrics. `barLine` maps each value to one of eight block characters, `▁` to
+`█`, scaled to the largest, and draws a day with nothing as a space. An older
+`merud` answers the detail request with plain windows, and the box says the
+charts need a newer `merud`.
 
 `applyUsage` takes each `usageMsg`. The header keeps the windows for `lastHour`. A
 box still loading takes the first reply that comes, whichever request it answers,
@@ -1280,6 +1315,13 @@ latest 100 calls, the data `meru log` prints, and shows the marked call's argume
 and the start of its result under its row. The file is logbox.go, not log.go,
 which would read as logging.
 
+### sites.go
+
+`/sites` sends `OpTrustedSites` and lists the websites Meru reads without
+asking. `d` twice on one sends `OpTrustedSiteRemove`, as does `/sites remove
+<host>`. The box works like `/folders`: `busy` while `merud` writes, and
+`confirm` for the first `d`.
+
 ### about.go and help.go
 
 `/about` shows what `internal/about` holds for both clients: the tagline, the full
@@ -1322,6 +1364,21 @@ screen, so your shell history comes back untouched when you quit.
 `tea.WithMouseCellMotion`, added only with `[chat] mouse_copy` on, asks the terminal
 to send clicks and wheel turns to the program. That is why the chat opens links
 itself (open.go).
+
+### jobs.go
+
+`/jobs` sends `OpJobs` and lists each job: its name and schedule in words, then
+"next today 07:00", "running since …" or "paused", and the last run with its
+outcome. Enter sends `OpJobRun`, `c` sends `OpJobCancel` for a running job, and
+`o` opens the last run's chat through `OpSessionTurns` and `reopen`, as `/chats`
+does. `p` sends `OpJobSet` with the marked job's `JobSpec` and `Paused` turned
+over. `d` arms the marked job and a second `d` sends `OpJobRemove`, as `/chats`
+deletes. `a` opens a `jobWalk` for a new job and `e` one for the marked job: one
+`textinput` at a time for the name, the schedule, the prompt and the skill,
+each with the old value as its placeholder, which an empty Enter keeps. A job
+that runs a command asks only the first two. Enter on the last field sends
+`OpJobSet`, with the old name in `ID` for an edit, and Esc leaves the form, not
+the box. Each reply replaces the list.
 
 ## Go ideas used here
 

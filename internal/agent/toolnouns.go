@@ -118,6 +118,10 @@ func toolTarget(question string, specs []engine.ToolSpec) string {
 		return "names a tool server"
 	case asksToRemember(question, specs):
 		return "asks Meru to remember"
+	case asksForAppleNotes(question, specs):
+		return "names Apple Notes"
+	case asksToSchedule(question, specs):
+		return "asks for a schedule"
 	case asksForWeb(question, specs):
 		return "asks for the web"
 	case givesURL(question, specs):
@@ -126,6 +130,95 @@ func toolTarget(question string, specs []engine.ToolSpec) string {
 		return "names what a tool handles"
 	}
 	return ""
+}
+
+// asksForAppleNotes reports whether question names Apple Notes, as
+// "apple notes", "apple note" or "notes app", in any case, while specs
+// hold one of the Apple Notes tools. "my notes" alone doesn't count: it
+// may mean notes in the user's folders or an Obsidian vault. The router
+// isn't told about these tools, since adding built-ins to its prompt cut
+// its accuracy (see ConnectedTools); this rule widens the route after it.
+func asksForAppleNotes(question string, specs []engine.ToolSpec) bool {
+	if !slices.ContainsFunc(specs, func(s engine.ToolSpec) bool { return builtin.IsNotesTool(s.Name) }) {
+		return false
+	}
+	ws := words(question)
+	for i := 0; i+1 < len(ws); i++ {
+		pair := ws[i] + " " + ws[i+1]
+		if pair == "apple notes" || pair == "apple note" || pair == "notes app" {
+			return true
+		}
+	}
+	return false
+}
+
+// recurring are the words that, after "every" or "each", make a question
+// ask for something on a schedule: "every weekday", "each morning",
+// "every other Tuesday". "every file" or "each chapter" don't count.
+var recurring = map[string]bool{
+	"day": true, "days": true, "weekday": true, "weekdays": true, "weekend": true, "morning": true,
+	"evening": true, "night": true, "week": true, "weeks": true, "month": true, "hour": true,
+	"hours": true, "minute": true, "minutes": true, "other": true, "monday": true, "tuesday": true,
+	"wednesday": true, "thursday": true, "friday": true, "saturday": true, "sunday": true,
+}
+
+// repeating are words that say on their own that something repeats.
+var repeating = map[string]bool{
+	"daily": true, "weekly": true, "hourly": true, "monthly": true, "nightly": true,
+}
+
+// timeOfDay are words that name a time of day, for a question that asks
+// for a job: "a job at 8am", "a job in the morning".
+var timeOfDay = map[string]bool{
+	"morning": true, "evening": true, "night": true, "noon": true, "midnight": true,
+	"am": true, "pm": true,
+}
+
+// asksToSchedule reports whether question asks for something on a
+// schedule, while specs hold schedule_job: it says "schedule" or
+// "scheduled"; "daily", "weekly" or another word in repeating; "every" or
+// "each" before a word in recurring; or "job" or "jobs" with a time of
+// day, such as "create a job to check my calendar at 8am". "every weekday
+// at 7, brief me" and that job question both routed direct, which offers
+// no tool to schedule with, and the model said it couldn't; this rule
+// widens the route.
+func asksToSchedule(question string, specs []engine.ToolSpec) bool {
+	if !slices.ContainsFunc(specs, func(s engine.ToolSpec) bool { return s.Name == builtin.ScheduleJob }) {
+		return false
+	}
+	ws := words(question)
+	job, when := false, false
+	for i, w := range ws {
+		switch {
+		case w == "schedule" || w == "scheduled" || repeating[w]:
+			return true
+		case (w == "every" || w == "each") && i+1 < len(ws) && recurring[ws[i+1]]:
+			return true
+		case w == "job" || w == "jobs":
+			job = true
+		case timeOfDay[w] || clockTime(w):
+			when = true
+		}
+	}
+	return job && when
+}
+
+// clockTime reports whether w is a time such as "8am", "7pm" or "10am":
+// one or two digits, then "am" or "pm".
+func clockTime(w string) bool {
+	digits, ok := strings.CutSuffix(w, "am")
+	if !ok {
+		digits, ok = strings.CutSuffix(w, "pm")
+	}
+	if !ok || len(digits) == 0 || len(digits) > 2 {
+		return false
+	}
+	for _, r := range digits {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // toolNouns returns the nouns in the names of the MCP and A2A tools in

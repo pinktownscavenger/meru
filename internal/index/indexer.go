@@ -93,6 +93,7 @@ type Indexer struct {
 	foldersMu sync.RWMutex
 	folders   []string // the configured folders, "~" expanded, cleaned
 
+	images   bool          // [index] images, and the embedding model takes images
 	readOnly []string      // folders the file tools may read but Scan never indexes; see ReadAlso
 	chats    string        // the read-only folder of session transcripts, where .jsonl reads as text; see ReadChats
 	ignore   []pattern     // [index] ignore, compiled
@@ -123,6 +124,7 @@ type Indexer struct {
 func New(cfg config.Index, sink Sink, eng engine.Engine, log *slog.Logger) (*Indexer, error) {
 	ix := &Indexer{
 		maxBytes: int64(cfg.MaxFileMB) << 20,
+		images:   cfg.Images,
 		lim:      newLimits(cfg.ChunkTokens, cfg.OverlapTokens),
 		watch:    cfg.Watch,
 		debounce: debounce,
@@ -243,15 +245,17 @@ func (ix *Indexer) Scan(ctx context.Context) (Report, error) {
 }
 
 // Reembed is Scan for after a change of embedding model: it chunks and
-// embeds every file again, even one the store holds unchanged, because the
-// store has dropped the old model's vectors (store.NeedsReembed). merud
+// embeds again every file the store holds without vectors, even one that
+// hasn't changed, because the store has dropped the old model's vectors
+// (store.NeedsReembed). A file the new model has done already stays as it
+// is, so a re-embed stopped by a restart doesn't start over. merud
 // runs it at startup in place of Scan when the store asks for it.
 func (ix *Indexer) Reembed(ctx context.Context) (Report, error) {
 	return ix.scan(ctx, true)
 }
 
-// scan does the work of Scan and Reembed. force skips the "unchanged"
-// check, so every file gets chunked and embedded again.
+// scan does the work of Scan and Reembed. force embeds again an unchanged
+// file whose chunks lack vectors.
 func (ix *Indexer) scan(ctx context.Context, force bool) (Report, error) {
 	start := time.Now()
 	ctx, span := obs.Tracer().Start(ctx, "meru.index.scan",
@@ -484,7 +488,7 @@ func (ix *Indexer) pruneOutside(ctx context.Context, roots []string, rep *Report
 
 // scanTree walks the folder start, which sits inside root (or is root),
 // indexing every file the skip rules keep; force re-embeds unchanged files
-// too (see Reembed). Then it removes from the store
+// that lack vectors too (see Reembed). Then it removes from the store
 // every path under start that the walk didn't keep, except under folders it
 // couldn't read: a folder with a permission problem today shouldn't lose
 // its entries.
@@ -604,8 +608,9 @@ func (r *Report) add(res fileResult) {
 
 // indexFile brings the store's copy of the file at p up to date. It checks
 // the skip rules, reads the file, and compares its mtime and SHA-256 with
-// what the store holds; when both match it stops there, unless force is
-// set. Otherwise it chunks the file, embeds the chunks and replaces the
+// what the store holds; when both match it stops there. With force set it
+// stops there only when every chunk of the file has a vector already, so a
+// re-embed cut short by a restart picks up where it left off. Otherwise it chunks the file, embeds the chunks and replaces the
 // store's copy.
 //
 // A problem with the file itself (unreadable, unparseable PDF) comes back as
@@ -640,13 +645,18 @@ func (ix *Indexer) indexFile(ctx context.Context, root, p string, mode fs.FileMo
 // passed and fileMu is held. It also returns the file's size in bytes and
 // its kind, for the span.
 func (ix *Indexer) indexFileLocked(ctx context.Context, p string, force bool) (fileResult, int, string, error) {
-	kind, _ := kindOf(p)
+	kind, _ := ix.kindOf(p)
 	info, err := os.Lstat(p)
 	if err != nil {
 		ix.log.WarnContext(ctx, "index: can't read", "path", p, "err", err)
 		return fileResult{outcome: outFailed}, 0, kind, nil
 	}
-	if info.Size() > ix.maxBytes {
+	// An image has its own cap; max_file_mb is set for text.
+	limit := ix.maxBytes
+	if kind == KindImage {
+		limit = MaxImageBytes
+	}
+	if info.Size() > limit {
 		ix.log.DebugContext(ctx, "index: skip", "path", p, "reason", ReasonTooLarge, "bytes", info.Size())
 		return fileResult{outcome: outSkipped, reason: ReasonTooLarge}, 0, kind, nil
 	}
@@ -654,12 +664,16 @@ func (ix *Indexer) indexFileLocked(ctx context.Context, p string, force bool) (f
 		// p changed into a symlink or something stranger since the walk.
 		return fileResult{outcome: outSkipped, reason: ReasonSymlink}, 0, kind, nil
 	}
-	data, err := ix.readFile(p, info)
+	data, err := ix.readFile(p, info, limit)
 	if err != nil {
 		ix.log.WarnContext(ctx, "index: can't read", "path", p, "err", err)
 		return fileResult{outcome: outFailed}, 0, kind, nil
 	}
-	if kind != KindPDF && looksBinary(data) {
+	if kind == KindImage && !IsImageData(data) {
+		ix.log.WarnContext(ctx, "index: not an image", "path", p)
+		return fileResult{outcome: outFailed}, len(data), kind, nil
+	}
+	if kind != KindPDF && kind != KindImage && looksBinary(data) {
 		ix.log.DebugContext(ctx, "index: skip", "path", p, "reason", ReasonBinary)
 		return fileResult{outcome: outSkipped, reason: ReasonBinary}, len(data), kind, nil
 	}
@@ -670,22 +684,37 @@ func (ix *Indexer) indexFileLocked(ctx context.Context, p string, force bool) (f
 	if err != nil {
 		return fileResult{}, len(data), kind, fmt.Errorf("look up %s: %w", p, err)
 	}
-	if !force && ok && old.Hash == hash && sameMTime(old.MTime, info.ModTime()) {
+	if ok && old.Hash == hash && sameMTime(old.MTime, info.ModTime()) && (!force || old.Vectored) {
 		ix.log.DebugContext(ctx, "index: unchanged", "path", p)
 		return fileResult{outcome: outUnchanged}, len(data), kind, nil
 	}
 
-	chunks, err := chunkFile(kind, p, data, ix.lim)
-	if err != nil {
-		ix.log.WarnContext(ctx, "index: can't parse", "path", p, "kind", kind, "err", err)
-		return fileResult{outcome: outFailed}, len(data), kind, nil
-	}
-	for i := range chunks {
-		chunks[i].Ordinal = i
-	}
-	vecs, err := ix.embed(ctx, chunks)
-	if err != nil {
-		return fileResult{}, len(data), kind, fmt.Errorf("embed %s: %w", p, err)
+	var chunks []store.Chunk
+	var vecs []engine.Vector
+	if kind == KindImage {
+		// One chunk naming the file, and one vector from the picture.
+		vec, err := ix.embedImage(ctx, data)
+		if errors.Is(err, errImageRefused) {
+			ix.log.WarnContext(ctx, "index: image refused", "path", p, "err", err)
+			return fileResult{outcome: outFailed}, len(data), kind, nil
+		}
+		if err != nil {
+			return fileResult{}, len(data), kind, fmt.Errorf("embed %s: %w", p, err)
+		}
+		chunks, vecs = []store.Chunk{imageChunk(p)}, []engine.Vector{vec}
+	} else {
+		chunks, err = chunkFile(kind, p, data, ix.lim)
+		if err != nil {
+			ix.log.WarnContext(ctx, "index: can't parse", "path", p, "kind", kind, "err", err)
+			return fileResult{outcome: outFailed}, len(data), kind, nil
+		}
+		for i := range chunks {
+			chunks[i].Ordinal = i
+		}
+		vecs, err = ix.embed(ctx, chunks)
+		if err != nil {
+			return fileResult{}, len(data), kind, fmt.Errorf("embed %s: %w", p, err)
+		}
 	}
 	doc := store.Document{Path: p, MTime: info.ModTime(), Hash: hash, Kind: kind}
 	if err := ix.sink.ReplaceDocument(ctx, doc, chunks, vecs); err != nil {
@@ -718,11 +747,11 @@ func sameMTime(a, b time.Time) bool {
 }
 
 // readFile reads the file at p, which Lstat described as info. It refuses to
-// read more than maxBytes even if the file grew since the check. It also
+// read more than limit bytes even if the file grew since the check. It also
 // checks that the file it opened is the one Lstat saw: if someone swapped p
 // for a symlink in between, os.Open would follow it, and SameFile catches
 // that. This works the same on every OS, with no build tags.
-func (ix *Indexer) readFile(p string, info fs.FileInfo) ([]byte, error) {
+func (ix *Indexer) readFile(p string, info fs.FileInfo, limit int64) ([]byte, error) {
 	f, err := os.Open(p) // #nosec G304 -- a file found inside a configured folder, checked by skipReason
 	if err != nil {
 		return nil, err
@@ -737,12 +766,12 @@ func (ix *Indexer) readFile(p string, info fs.FileInfo) ([]byte, error) {
 	if !os.SameFile(info, opened) {
 		return nil, errors.New("file changed into a link or another file while being opened")
 	}
-	data, err := io.ReadAll(io.LimitReader(f, ix.maxBytes+1))
+	data, err := io.ReadAll(io.LimitReader(f, limit+1))
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(data)) > ix.maxBytes {
-		return nil, fmt.Errorf("grew past max_file_mb while being read")
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("grew past its size cap while being read")
 	}
 	return data, nil
 }
@@ -763,37 +792,35 @@ func chunkFile(kind, p string, data []byte, lim limits) ([]store.Chunk, error) {
 	}
 }
 
-// embed turns the chunks into vectors, embedBatch texts per Embed call. The
-// result has one vector per chunk, in order.
+// embed turns the chunks into vectors, embedBatch chunks per Embed call.
+// The result has one vector per chunk, in order.
 func (ix *Indexer) embed(ctx context.Context, chunks []store.Chunk) ([]engine.Vector, error) {
 	vecs := make([]engine.Vector, 0, len(chunks))
 	for i := 0; i < len(chunks); i += embedBatch {
 		end := min(i+embedBatch, len(chunks))
-		texts := make([]string, 0, end-i)
+		inputs := make([]engine.Input, 0, end-i)
 		for _, c := range chunks[i:end] {
-			texts = append(texts, embedText(c))
+			inputs = append(inputs, embedInput(c))
 		}
-		got, err := ix.eng.Embed(ctx, texts)
+		got, err := ix.eng.Embed(ctx, inputs)
 		if err != nil {
 			return nil, err
 		}
-		if len(got) != len(texts) {
-			return nil, fmt.Errorf("engine returned %d vectors for %d texts", len(got), len(texts))
+		if len(got) != len(inputs) {
+			return nil, fmt.Errorf("engine returned %d vectors for %d chunks", len(got), len(inputs))
 		}
 		vecs = append(vecs, got...)
 	}
 	return vecs, nil
 }
 
-// embedText is what gets embedded for a chunk: its heading path, then its
-// text. The second chunk of a long "Garden > Spring" section doesn't repeat the
-// heading line, and without the path its vector would lose what the section
-// is about.
-func embedText(c store.Chunk) string {
-	if c.Heading == "" {
-		return c.Text
-	}
-	return c.Heading + "\n\n" + c.Text
+// embedInput is what gets embedded for a chunk: its heading path as the
+// title, then its text. The second chunk of a long "Garden > Spring"
+// section doesn't repeat the heading line, and without the path its vector
+// would lose what the section is about. The engine puts the title where
+// the embedding model wants it.
+func embedInput(c store.Chunk) engine.Input {
+	return engine.Input{Title: c.Heading, Text: c.Text}
 }
 
 // tokens totals the estimated tokens in chunks, for the debug log.

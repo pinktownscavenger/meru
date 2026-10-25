@@ -138,6 +138,8 @@ func TestConnectedTools(t *testing.T) {
 
 func TestToolTarget(t *testing.T) {
 	specs := append(googleAndNotes(), spec("remember"))
+	appleNotes := []engine.ToolSpec{spec("search_notes"), spec("list_notes"), spec("read_note"), spec("read_file")}
+	scheduler := []engine.ToolSpec{spec("schedule_job"), spec("read_file")}
 	tests := []struct {
 		question string
 		specs    []engine.ToolSpec
@@ -152,6 +154,23 @@ func TestToolTarget(t *testing.T) {
 		{"list the folders in ~/backup", specs, ""},
 		{"search the web for the latest Go release", []engine.ToolSpec{spec("read_file")}, ""},
 		{"remember that my name is Dana", nil, ""},
+		// Apple Notes: named outright, only while its tools are offered.
+		{"search my Apple Notes for the garden plan", appleNotes, "names Apple Notes"},
+		{"what's in the Notes app about Lisbon?", appleNotes, "names Apple Notes"},
+		{"what do my notes say about Lisbon?", appleNotes, ""},
+		{"search my Apple Notes for the garden plan", []engine.ToolSpec{spec("read_file")}, ""},
+		// A schedule: "every" or "each" before a time word, or "schedule".
+		{"every weekday at 7, brief me on my calendar", scheduler, "asks for a schedule"},
+		{"each morning summarize the Go news", scheduler, "asks for a schedule"},
+		{"every other Tuesday at 9, check the release notes", scheduler, "asks for a schedule"},
+		{"schedule a backup of my notes at night", scheduler, "asks for a schedule"},
+		{"summarize every file in my work folder", scheduler, ""},
+		{"can you create a job to check my google calendar at 8am in the morning and show me my mmetings for today", scheduler, "asks for a schedule"},
+		{"set up a job for 7pm", scheduler, "asks for a schedule"},
+		{"send me a daily digest of my mail", scheduler, "asks for a schedule"},
+		{"summarize the Blue Origin job posting", scheduler, ""},
+		{"what did I do this morning?", scheduler, ""},
+		{"every weekday at 7, brief me on my calendar", []engine.ToolSpec{spec("read_file")}, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.question, func(t *testing.T) {

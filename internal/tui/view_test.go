@@ -168,7 +168,8 @@ func TestViewGolden(t *testing.T) {
 				m, _ = update(t, m, pingMsg{index: tt.index}, usageMsg{windows: tt.usage, answered: true})
 			}
 			if tt.usageBox {
-				m, _ = update(t, m, typeText("/usage"), press(tea.KeyEnter), usageMsg{windows: tt.usage, answered: true})
+				m, _ = update(t, m, typeText("/usage"), press(tea.KeyEnter), usageMsg{windows: tt.usage, answered: true},
+					usageDetailMsg{detail: detailFixture()})
 			}
 			if tt.meBox {
 				m, _ = update(t, m, typeText("/me"), press(tea.KeyEnter), meMsg{memories: profileFixture})
@@ -451,5 +452,36 @@ func TestStatsLine(t *testing.T) {
 				t.Errorf("statsLine = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestQuietLine checks the line under a streaming answer: nothing while
+// merud keeps sending, and how long it has been quiet once it stops for
+// quietSeconds, as when the model writes a long tool call.
+func TestQuietLine(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name string
+		last time.Time
+		want string
+	}{
+		{"news a second ago", now.Add(-time.Second), ""},
+		{"quiet for 52 s", now.Add(-52 * time.Second), "still working · 52 s"},
+		{"no clock reading", time.Time{}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := quietLine(&exchange{lastNews: tt.last}, now)
+			if (tt.want == "") != (got == "") || !strings.Contains(got, tt.want) {
+				t.Errorf("quietLine = %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	m := testModel(nil, newFakeSender())
+	m.width, m.height = 100, 30
+	m.turns = []exchange{{question: "make a page", state: stateActive, answer: "Let me write it.", lastNews: now.Add(-30 * time.Second)}}
+	if view := m.renderTurn(&m.turns[0]); !strings.Contains(view, "still working · 30 s") {
+		t.Errorf("a quiet streaming turn lacks the line:\n%s", view)
 	}
 }

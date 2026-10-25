@@ -45,7 +45,7 @@ const DefaultSystemPrompt = "You are Meru, a personal assistant that runs entire
 // says it plainly.
 const citeRule = "Below, under \"From your files\", are numbered excerpts from the user's own files. " +
 	"When they help answer the question, answer from them and cite each excerpt you use by its number " +
-	"in square brackets, like [1]. Cite only the numbers listed there. " +
+	"in square brackets, like [1]. Cite only numbers Meru gave you, there or in a tool's results. " +
 	"Never invent a file, a quote or a citation. If the excerpts don't answer the question, say so."
 
 // whoIsWho joins the system prompt on every turn, whatever prompt config
@@ -142,6 +142,7 @@ type Agent struct {
 	machine     string        // describes the user's computer; set by UseMachine
 	maxRounds   int           // model calls per turn, at most; see converse
 	maxTokens   int           // tokens one main-model call may write, thinking included
+	window      int           // [ollama] context_length, the tokens a prompt and answer share; 0 is Ollama's own
 	turnTimeout time.Duration // how long one turn may run; see Handle
 	agentic     bool          // [index] retrieval = "agentic": no search before the answer
 	models      config.Models // the models as config named them at startup; Main says which model answers now
@@ -156,10 +157,20 @@ type Agent struct {
 	sessionsDir string       // where transcripts live, usually ~/.meru/sessions
 	home        string       // the home folder, for showing paths as ~/...; "" if unknown
 	log         *slog.Logger // merud's logger; lines carry the turn's trace ID
+	// windowOf, set by UseWindow, returns the window the engine gives a
+	// model, which can be larger than window; nil means window for all.
+	windowOf func(model string) int
 	// readImage and vision, set by UseImages, read a question's images
 	// and say whether a model can look at them; see images.go.
 	readImage func(path string) ([]byte, error)
 	vision    func(ctx context.Context, model string) (bool, error)
+	// visionSets, set by UseVisionSets, lists the model sets whose answer
+	// model can look at pictures and call tools, for the suggestion a
+	// model without vision gets. nil suggests none.
+	visionSets func(ctx context.Context) []VisionSet
+	// imageSearch, set by UseImageSearch, finds indexed images like an
+	// attached one; nil turns that off. See similar.go.
+	imageSearch ImageSearcher
 	// canCallTools, set by UseToolCheck, says whether a model can call
 	// tools; see notools.go.
 	canCallTools func(ctx context.Context, model string) (bool, error)
@@ -227,6 +238,7 @@ func New(cfg config.Config, eng engine.Engine, router Router, search Searcher, t
 		profile:     profile,
 		maxRounds:   cfg.Agent.MaxRounds,
 		maxTokens:   cfg.Agent.MaxOutputTokens,
+		window:      cfg.Ollama.ContextLength,
 		turnTimeout: timeout,
 		agentic:     agentic,
 		models:      cfg.Models,
@@ -308,8 +320,14 @@ func (a *Agent) SetMain(model string, noThink bool) {
 func (a *Agent) Handle(ctx context.Context, req rpc.Request, emit func(rpc.Event) error, approve rpc.ApproveFunc) (err error) {
 	start := time.Now()
 	question := strings.TrimSpace(req.Text)
+	if question == "" && req.Continue {
+		question = continueWords
+	}
 	if question == "" {
 		return errors.New("empty question")
+	}
+	if req.Continue && req.Session == "" {
+		return errors.New("continue needs the chat's session")
 	}
 	source, err := sourceOf(req.Source)
 	if err != nil {
@@ -346,6 +364,8 @@ func (a *Agent) Handle(ctx context.Context, req rpc.Request, emit func(rpc.Event
 			attribute.String("meru.session.id", sessionID),
 			attribute.Int("meru.turn.iterations", t.rounds),
 			attribute.Int("meru.turn.repeated_calls", t.repeats),
+			attribute.Int("meru.turn.shortened_results", t.shortened),
+			attribute.Bool("meru.turn.window_full", t.windowFull),
 			attribute.Bool("meru.turn.empty_retry", t.emptyRetry),
 			attribute.Bool("meru.turn.output_retry", t.outputRetry),
 			attribute.Bool("meru.turn.unbacked_claim", unbacked),
@@ -393,18 +413,41 @@ func (a *Agent) Handle(ctx context.Context, req rpc.Request, emit func(rpc.Event
 	if err := emit(rpc.Event{Type: rpc.EventSession, Session: sessionID, Incognito: sess.Incognito()}); err != nil {
 		return err
 	}
+	// A scheduled job's run goes in the Jobs folder, as a chat of its own
+	// (ARCHITECTURE.md, "Scheduler"). The scheduler starts each run in a
+	// new session, so this meta line comes first.
+	if req.Job != "" {
+		if err := sess.SetMeta(transcript.Meta{Folder: config.JobsFolder}); err != nil {
+			return fmt.Errorf("file the job's run in %s: %w", config.JobsFolder, err)
+		}
+	}
+	t.job, t.skill = req.Job, req.Skill
 
 	traceID := traceIDOf(span)
 	t.sess, t.source, t.traceID = sess, rpc.Source(source), traceID
-	t.question = userWords(question, history)
+	// asked is the question the turn routes, searches and recalls on. For
+	// Continue it is the last turn's question, and t.handoff holds what
+	// the model reads in its place. See continue.go. The last turn has to
+	// be read before the user line below starts a new one.
+	asked := question
+	if req.Continue {
+		last, err := sess.LastTurn()
+		if err != nil {
+			return err
+		}
+		if asked, t.handoff, err = continuation(last); err != nil {
+			return err
+		}
+	}
+	t.question = userWords(asked, history)
 	// The user line carries start as its time, so a turns row rebuilt from
 	// the transcript gets the same time as the row written live. It names
 	// the question's images by path and never holds their bytes.
-	if err := a.appendLine(ctx, sess, transcript.Line{TS: start, Type: transcript.TypeUser, Text: question, Images: imagePaths, TraceID: traceID}); err != nil {
+	if err := a.appendLine(ctx, sess, transcript.Line{TS: start, Type: transcript.TypeUser, Text: question, Images: imagePaths, Job: req.Job, TraceID: traceID}); err != nil {
 		return err
 	}
 
-	res, err := a.respond(tctx, t, question, history)
+	res, err := a.respond(tctx, t, asked, history)
 	route, rep = res.route, res.rep
 	// badOutput is true when the rounds ended on output Ollama couldn't
 	// read, even after the retry. The turn answers with badOutputAnswer
@@ -420,6 +463,12 @@ func (a *Agent) Handle(ctx context.Context, req rpc.Request, emit func(rpc.Event
 		return err
 	}
 	ended = endOf(err, rep)
+	// A whole answer from a turn that lost its tools to a full window
+	// still says so, so the user knows why it read so little and can
+	// Continue.
+	if ended == "" && t.windowFull {
+		ended = endWindowFull
+	}
 	// A turn that used every round max_rounds allows and still wrote no
 	// text hit the cap; `/usage by model` counts these per model.
 	capped := ended == endGaveUp && t.rounds >= a.maxRounds
@@ -466,6 +515,11 @@ func (a *Agent) Handle(ctx context.Context, req rpc.Request, emit func(rpc.Event
 	if t.noTools != "" {
 		notice = strings.TrimSpace(noToolsText(t.noTools) + " " + notice)
 	}
+	// A full answer that names pictures the answer model can't look at
+	// says so, and how to switch to a model that can. See images.go.
+	if ended == "" && t.blind != "" && namesImages(rep.text, rpc.Cited(rep.text, t.sources)) {
+		notice = strings.TrimSpace(notice + " " + noVisionText(t.blind, a.suggestSets(ctx)))
+	}
 	if notice != "" {
 		if err := emit(rpc.Event{Type: rpc.EventNotice, Text: notice}); err != nil {
 			return err
@@ -507,8 +561,27 @@ func (a *Agent) Handle(ctx context.Context, req rpc.Request, emit func(rpc.Event
 	if err := a.appendLine(ctx, sess, answer); err != nil {
 		return err
 	}
-	a.recordUsage(ctx, sessionID, source, start, model, answer, t.calls, sess.Incognito())
-	return emit(doneEvent(start, rep))
+	a.recordUsage(ctx, sessionID, source, t.job, start, model, answer, t.calls, sess.Incognito())
+	done := doneEvent(start, rep)
+	done.Outcome = ended
+	return emit(done)
+}
+
+// UseWindow gives the agent the engine's window for each model, which
+// fitWindow and windowNote read for the answer model in place of [ollama]
+// context_length. merud passes the engine's Window, which knows the
+// window it sized for the answer model.
+func (a *Agent) UseWindow(windowOf func(model string) int) {
+	a.windowOf = windowOf
+}
+
+// answerWindow returns the context window of the answer model now: the
+// one UseWindow's function gives it, or [ollama] context_length.
+func (a *Agent) answerWindow() int {
+	if a.windowOf == nil {
+		return a.window
+	}
+	return a.windowOf(a.Main())
 }
 
 // noteModel writes a model_switch line to the session before an answer
@@ -561,15 +634,26 @@ type response struct {
 func (a *Agent) respond(ctx context.Context, t *turn, question string, history []engine.Message) (response, error) {
 	var res response
 	if len(t.images) > 0 {
+		// Images like the attached one, found before the vision check, so a
+		// model that can't look at pictures still gets an answer: the list.
+		if a.imageSearch != nil {
+			t.similar = a.findSimilar(ctx, t.images[0])
+			res.docs = t.similar.docs
+		}
 		if err := a.checkVision(ctx, t); err != nil {
 			res.route = "direct"
+			if errors.Is(err, errNoVision) && len(t.similar.sources) > 0 {
+				if eerr := a.emitSimilar(t); eerr != nil {
+					return res, eerr
+				}
+			}
 			return res, err
 		}
 	}
 	if t.scope != rpc.ScopeAuto || len(t.images) > 0 {
 		return a.respondScoped(ctx, t, question, history)
 	}
-	dec, picked, err := a.routeAndPick(ctx, question, history)
+	dec, picked, err := a.routeAndPick(ctx, question, history, t.skill)
 	if err != nil {
 		return res, err
 	}
@@ -628,15 +712,28 @@ func (a *Agent) respond(ctx context.Context, t *turn, question string, history [
 			dec.Route = r
 		}
 	}
+	// A "tools" turn whose picked skill brings web_search, and no file
+	// tool, is about the web: the router and the pick both said so. It
+	// skips the search of the files. Before, "can you search for things
+	// from the last 2 days", a follow-up in a chat about a rocket launch,
+	// put nine unrelated excerpts and 43,000 tokens in the prompt, and
+	// the answer's web citations matched the excerpts' numbers (#174).
+	if dec.Route == "tools" && fileTurn && webSkill(skillTools) {
+		a.log.DebugContext(ctx, "no search first: a picked skill searches the web",
+			"skills", strings.Join(picked.names, ","))
+		fileTurn = false
+	}
 	t.skills = picked.reg
-	if dec.Route == "tools" && !fileTurn {
+	if dec.Route == "tools" && !fileTurn && target != "" {
 		a.log.DebugContext(ctx, "no search first: the question points at a connected tool", "target", target)
 	}
 	// A question that asks for the web, or gives a URL, goes to the web
 	// before the model's first round. toolTarget has already given its
 	// route the tools. See webfirst.go.
+	// A Continue turn has its earlier turn's web results in the hand-off,
+	// so it doesn't go to the web first again.
 	var webCalls []webCall
-	if a.askedWebFirst(ctx, question) {
+	if t.handoff == "" && a.askedWebFirst(ctx, question) {
 		webCalls = askedCalls(question, history, a.tools.Tools())
 		t.webFirst = webFirstAsked
 	}
@@ -666,7 +763,7 @@ func (a *Agent) respond(ctx context.Context, t *turn, question string, history [
 	// first too, and its route gains the tools, so the model can search
 	// again. The search runs before the route event for this reason: the
 	// rule needs its excerpts.
-	if t.webFirst == "" {
+	if t.webFirst == "" && t.handoff == "" {
 		if name, ok := a.namedWebFirst(question, target, searched, found.results); ok {
 			webCalls = namedCalls(name, question, a.tools.Tools())
 			t.webFirst = webFirstNamed
@@ -718,6 +815,14 @@ func (a *Agent) respond(ctx context.Context, t *turn, question string, history [
 	if err != nil {
 		return res, err
 	}
+	// A job's own run never sees the tools that change Meru, configure and
+	// schedule_job, so no job makes or changes jobs, whatever a page it
+	// reads tells it (ARCHITECTURE.md, "Scheduler"). dispatch would
+	// decline them in a job anyway; leaving them out spares the model a
+	// tool it can't use.
+	if t.job != "" {
+		specs = slices.DeleteFunc(specs, func(s engine.ToolSpec) bool { return builtin.AlwaysAsks(s.Name) })
+	}
 	res.rep, err = a.finishPrompt(ctx, t, question, history, picked, files, web, specs, fileTurn)
 	return res, err
 }
@@ -730,6 +835,8 @@ func (a *Agent) finishPrompt(ctx context.Context, t *turn, question string, hist
 	picked pickedSkills, files, web string, specs []engine.ToolSpec, fileTurn bool) (reply, error) {
 	// An answer model that can't call tools gets none; see notools.go.
 	specs = a.offerable(ctx, t, specs)
+	// One that can't look at pictures doesn't get view_image.
+	specs = a.withoutViewing(ctx, t, specs)
 	if t.sess.Incognito() {
 		specs = withoutRemember(specs)
 	}
@@ -740,6 +847,11 @@ func (a *Agent) finishPrompt(ctx context.Context, t *turn, question string, hist
 		}
 	}
 	skillList, skillBodies := a.skillsSection(ctx, picked, specs)
+	// A Continue turn's model reads the hand-off, not the question it
+	// routed and searched on.
+	if t.handoff != "" {
+		question = t.handoff
+	}
 	msgs := a.prompt(ctx, history, question, sections{
 		memories: memories, skillList: skillList, skillBodies: skillBodies,
 		files: files, web: web, toolsNote: noteFor(specs), fileTools: a.fileToolsNoteFor(specs, fileTurn),
@@ -759,7 +871,11 @@ func (a *Agent) finishPrompt(ctx context.Context, t *turn, question string, hist
 const (
 	endTimeout = "timeout" // [agent] turn_timeout ran out
 	endCutOff  = "cut_off" // the last model call hit [agent] max_output_tokens
-	endGaveUp  = "gave_up" // the rounds ended with no text, such as only tool calls
+	// endWindowFull: the turn's tool results filled the context window, so
+	// later rounds offered no tools and the answer uses what it read so
+	// far (see window.go).
+	endWindowFull = "window_full"
+	endGaveUp     = "gave_up" // the rounds ended with no text, such as only tool calls
 	// endBadOutput: Ollama couldn't read what the model wrote, even after
 	// the one retry (see retriesOutput).
 	endBadOutput = "bad_output"
@@ -783,6 +899,11 @@ const (
 const (
 	timeoutNote = "[Meru stopped the answer here: the question took longer than its time limit.]"
 	cutOffNote  = "[Meru stopped the answer here: it reached the length limit.]"
+	// windowNote follows an answer whose turn ended endWindowFull; %d is
+	// [ollama] context_length.
+	windowNote = "[Meru stopped reading partway: the prompt filled most of the model's context window " +
+		"([ollama] context_length, %d tokens), so this answer uses only what it read so far. " +
+		"Continue picks it up with room to read more.]"
 )
 
 // endOf says how a turn ended: endNoVision when err is errNoVision,
@@ -826,7 +947,11 @@ func (a *Agent) endTurn(ctx context.Context, t *turn, ended, text string) (strin
 	var add string
 	switch {
 	case ended == endNoVision:
-		add = noVisionAnswer(a.Main())
+		sets := a.suggestSets(ctx)
+		add = similarAnswer(a.Main(), t.similar, sets)
+		if add == "" {
+			add = noVisionAnswer(a.Main(), sets)
+		}
 	case ended == endBadOutput:
 		add = badOutputOnce
 		if t.outputRetry {
@@ -835,6 +960,10 @@ func (a *Agent) endTurn(ctx context.Context, t *turn, ended, text string) (strin
 		if streamed {
 			add = "\n\n" + add
 		}
+	case ended == endWindowFull && streamed:
+		add = "\n\n" + fmt.Sprintf(windowNote, a.answerWindow())
+	case ended == endWindowFull:
+		add = sorry + "\n\n" + fmt.Sprintf(windowNote, a.answerWindow())
 	case !streamed:
 		add = sorry
 	case ended == endTimeout:
@@ -859,7 +988,7 @@ func (a *Agent) endTurn(ctx context.Context, t *turn, ended, text string) (strin
 // turn, and the next rebuild of meru.db brings the row back. The insert
 // runs even when the client hung up after the answer: WithoutCancel keeps
 // ctx's values (the trace) and drops its cancel.
-func (a *Agent) recordUsage(ctx context.Context, sessionID, source string, start time.Time, model string, answer transcript.Line, calls int, incognito bool) {
+func (a *Agent) recordUsage(ctx context.Context, sessionID, source, job string, start time.Time, model string, answer transcript.Line, calls int, incognito bool) {
 	obs.RecordTurnUsage(ctx, obs.TurnUsage{
 		Route: answer.Route, Source: source,
 		TokensIn: answer.TokensIn, TokensOut: answer.TokensOut, Docs: len(answer.Sources),
@@ -872,6 +1001,7 @@ func (a *Agent) recordUsage(ctx context.Context, sessionID, source string, start
 		TokensIn: int64(answer.TokensIn), TokensOut: int64(answer.TokensOut),
 		DurationMillis: answer.Ms, ToolCalls: calls, Docs: answer.Sources, TraceID: answer.TraceID,
 		Model: model, TTFTMillis: answer.TTFTMs, EvalMillis: answer.EvalMs, BadCalls: answer.BadCalls, Capped: answer.Capped,
+		Job: job,
 	})
 	if err != nil {
 		a.log.WarnContext(ctx, "turn row not written; the transcript still has the turn", "err", err)
@@ -1077,6 +1207,12 @@ func aboutFiles(route, target string) bool {
 		return target == ""
 	}
 	return false
+}
+
+// webSkill reports whether tools, the tools the turn's picked skills
+// name, hold web_search and no file tool.
+func webSkill(tools []string) bool {
+	return slices.Contains(tools, builtin.WebSearch) && !slices.ContainsFunc(tools, builtin.IsFileTool)
 }
 
 // searchesFirst reports whether a turn searches the user's files before
@@ -1301,6 +1437,7 @@ func (a *Agent) searchFiles(ctx context.Context, query string, web bool) (fileHi
 		sources[i] = rpc.Citation{
 			N: i + 1, Path: r.Path, Heading: r.Heading,
 			StartLine: r.StartLine, EndLine: r.EndLine, Page: r.Page, Score: r.Score,
+			Kind: r.CitationKind(),
 		}
 	}
 	span.SetAttributes(attribute.Int("meru.search.results", len(results)))
@@ -1399,7 +1536,7 @@ func (a *Agent) prompt(ctx context.Context, history []engine.Message, question s
 // stablePart returns the opening of the system prompt, the parts that stay
 // the same from turn to turn: the configured prompt with whoIsWho and
 // honestyRule, today's date, the line on the user's computer, the user's
-// profile, filesNote, canDoNote, chatsNote, then toolsNote and skillList,
+// profile, filesNote, canDoNote, seeNote, chatsNote, then toolsNote and skillList,
 // the tools note and the list of skills for the tools the turn offers. It
 // returns the profile on its own as well, for the memory metric. prompt
 // builds on it, and so does the startup warm-up (see warm.go), so the warm-up
@@ -1418,6 +1555,7 @@ func (a *Agent) stablePart(ctx context.Context, toolsNote, skillList string) (sy
 	add(profile)
 	add(a.currentFilesNote())
 	add(a.canDo())
+	add(a.seeNote(ctx))
 	add(a.chatsNote())
 	add(toolsNote)
 	add(skillList)

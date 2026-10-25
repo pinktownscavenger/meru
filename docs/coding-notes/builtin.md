@@ -2,10 +2,10 @@
 
 **Code:** `internal/builtin/` (`doc.go`, `builtin.go`, `datetime.go`,
 `about.go`, `remember.go`, `writefile.go`, `files.go`, `chats.go`, `search.go`,
-`web.go`, `webguard.go`, `webdownload.go`, `upload.go`, `images.go`, and the
+`web.go`, `webguard.go`, `webdownload.go`, `upload.go`, `images.go`, `notes.go`, and the
 tests `builtin_test.go`, `about_test.go`, `writefile_test.go`, `files_test.go`,
 `chats_test.go`, `search_test.go`, `web_test.go`, `webfetch_test.go`,
-`webrender_test.go`, `upload_test.go` and
+`webrender_test.go`, `upload_test.go`, `notes_test.go` and
 `images_test.go`, with the PDF in `testdata/`)
 **Milestone:** v0.3 (`configure`, `web_search`, `web_fetch`), v0.4
 (`remember`, `write_file`, `read_file`, `list_folder`, `grep`,
@@ -25,8 +25,8 @@ Some tools live inside `merud` instead of an MCP server. This package holds them
 behind the same `dispatch.Backend` interface the MCP pool and the A2A client use,
 so every call still goes through `dispatch` (AGENTS.md, non-negotiable 4).
 
-There are eleven built-ins, and `[builtin] tools` in `config.toml` lists the ones
-the model may use: all eleven by default. When you say "connect my Gmail" in chat, the model calls
+There are seventeen built-ins, and `[builtin] tools` in `config.toml` lists the ones
+the model may use: all seventeen by default. When you say "connect my Gmail" in chat, the model calls
 `configure` with `{"action": "add_mcp_server", "catalog": "google"}`, and
 `configure` adds the `google` entry to `config.toml`. You still start that server
 yourself; `merud` connects to it on the next turn on a tools route. It can also add a server outside
@@ -556,6 +556,66 @@ leaves room for its text.
 With no `[index] folders`, `merud` passes no indexer, the file tools are off,
 and `AttachmentText` returns "".
 
+### searchimages.go
+
+`search_images` finds pictures in the indexed folders. It takes `query`, words
+for what a picture shows, or `image`, the path of a picture to find others like,
+and `limit`, 8 by default. `merud` turns it on with `UseImageSearch` only when
+the index reads images; until then `missing` says why it is off. Like
+`search_files`, it defines the one method it calls, `ImageSearcher.SearchImages`,
+and `merud` passes the adapter around `retrieve.SearchImages`.
+
+An `image` path goes through `readImageFile`. The path must pass `Check`, the
+file tools' rules, which also covers attached images in the output folder;
+`Check` calls an image media, since `read_file` reads text, so here media counts
+as allowed and any other reason, such as a secret's name, refuses it. Then the
+name must end like an image, the size must be under `imageCap`, `SameFile`
+catches a swap between the check and the open, and `index.IsImageData` checks the
+bytes. The result is a numbered list from `dispatch.CiteNumbers`, each line from
+`retrieve.Cite`, with citations whose `Kind` is `"image"`. The text holds only
+paths, so it tells the model to name and cite them; a model with vision can open
+one with `view_image`.
+
+`readImageFile` takes the calling tool's name first, `search_images` or
+`view_image`, and starts each of its errors with it, so the model reads which
+tool refused.
+
+### viewimage.go
+
+`view_image` shows the answer model one picture. It takes `path`, reads the file
+through `readImageFile` under the same rules as `search_images`, and returns a
+`dispatch.Result` that carries the bytes in `Images`, beside a one-line `Text`
+that names the file and its size, and the file as an image source numbered
+through `dispatch.CiteNumbers`. Every other built-in returns text, so `Call`
+runs `view_image` before its usual switch and hands back its whole `Result`.
+
+The bytes never go in `Text`. `dispatch` logs `Text` to the transcript and the
+`tool_calls` row, and a picture as base64 would fill both with a blob nobody
+reads. The agent puts `Images` on the tool's message, and the model looks at the
+picture on its next round (see [agent](agent.md)).
+
+A turn may open at most eight pictures. The tool can't count a turn's calls, so
+the agent counts them and marks a call past the limit with `WithViewCapped`,
+which puts a value on the call's context. The tool reads it with `viewCapped`
+and refuses before it touches the file. The key is an unexported struct type,
+`viewCappedKey`, so no other package can set or read the mark by accident; that
+is the usual Go way to keep a context value private.
+
+Before it returns, `shrinkImage` scales a PNG, JPEG or GIF whose longest side
+passes `maxSide`, 1,536 pixels, down to it and sends it as a JPEG. The model's
+prompt cost grows with the pixels. Eight full-size phone photos overflowed
+`qwen3.6:35b`'s 32,768-token prompt, and at 1,536 pixels a bill costs about
+1,800 tokens and still reads line by line. `boxScale` does the scaling with the
+standard library alone: each new pixel averages the block of source pixels it
+covers, which keeps a receipt's thin digits. A 12-megapixel photo takes about a
+quarter of a second. A WebP file, which the standard library can't decode, goes
+as it is. `TestShrinkImage` checks a large picture, a small one and bytes it
+can't decode.
+
+`view_image` needs only `[index] folders`, like `read_file`; it reads the file
+itself and needs no image index. The agent, not this package, hides it from an
+answer model that can't look at pictures.
+
 ### search.go
 
 `search_files` needs the store and the embedding model, which live in `merud`.
@@ -626,7 +686,17 @@ and passes it on:
 | SearXNG found nothing | `results` is empty | `SearXNG found no results for "…"` |
 | the search ran long | `isTimeout` | try again, or search with fewer words |
 
-`formatResults` writes a header line that tells the model to cite by URL, then
+`webSearch` reserves one citation number per result shown with
+`dispatch.CiteNumbers`, so the results number on from the turn's file excerpts:
+with four excerpts in the prompt, the first result is `[5]`. It returns one
+`rpc.Citation` per result as `Result.Sources`, with `Kind` `rpc.SourceWeb`, the URL
+in `URL` and in `Path` (which a client from before web sources shows) and the
+title as `Heading`; `webSource` builds each. The agent adds them to the turn's
+`sources` event, so the list under the answer names the pages the answer cites.
+Before, the results numbered from `[1]` with no sources, and the answer's web
+citations matched the numbers of unrelated file excerpts (#174).
+
+`formatResults` writes a header line that tells the model to cite by number, then
 for each result `[n] title — url`, the snippet with its white space collapsed and
 cut to 300 characters, and `Published 2026-02-10.` when SearXNG sends a date.
 `PublishedDate` is a `*string`, a pointer, because SearXNG sends `null` for a
@@ -679,6 +749,11 @@ serves both modes with the same dialer and redirect rule.
 | `url` and `prompt` | `fetchPage`, then `answerFromPage` asks the fast model |
 | `url` and `save: true` | `download` saves the body in the downloads folder |
 
+A read or a prompt answer takes one citation number, says "Cite this page as
+[n]." in its text, and returns the page as a web source, as `web_search` does
+for its results. A download returns no source: the model reads the file with
+`read_file` next.
+
 `fetchPage` checks the `Content-Type` header before it reads the body, so a
 refused type costs no download, then `pageText` picks the reader:
 
@@ -689,7 +764,7 @@ refused type costs no download, then `pageText` picks the reader:
 | `text/plain` | as it is |
 | anything else | refused, naming the type and pointing at `save` |
 
-The body stops at 5 MiB. Each call fetches the page again, because a cache would
+The body stops at 16 MiB, `pageBodyCap`. It was 5 MiB until CNN's world page, 5.5 MB of mostly scripts, came back refused. Each call fetches the page again, because a cache would
 be one more thing to keep fresh and to size.
 
 **Pages that need JavaScript.** Some pages, such as a Workday job posting,
@@ -697,7 +772,7 @@ send an empty shell and fill in the text with a script. `fetchPage` returns
 the body along with the text, so `needsRender` can spot such a shell without
 a second GET: an HTML page with under 500 characters of text and a
 `<script>` in it. It searches the body for `<script` and `<SCRIPT` as they
-are, since lowercasing a copy of up to 5 MiB to search once costs more. When
+are, since lowercasing a copy of up to 16 MiB to search once costs more. When
 `[web] render` is `"auto"` (see [config](config.md)) and `merud` has called
 `UseRenderer`, `renderPage` hands the URL to the page reader:
 
@@ -764,12 +839,23 @@ one (see [dispatch](dispatch.md)). For `web_fetch`, it answers:
 
 | The call | Answer | Choices the user sees |
 | --- | --- | --- |
-| a URL the session doesn't know | `ConfirmAlways` | once, deny |
+| a URL the session doesn't know, on a host it doesn't trust | `ConfirmAlways` | once, this website for this chat, always this website, deny |
+| `save` on a URL the session doesn't know | `ConfirmAlways` | once, deny |
 | `save` on a known URL | `ConfirmAsk` | once, session, deny |
-| a known URL, no `save` | `ok = false`: `Confirm` decides | none, unless `[builtin] confirm` lists `web_fetch` |
+| a known URL, or any URL on a trusted host, no `save` | `ok = false`: `Confirm` decides | none, unless `[builtin] confirm` lists `web_fetch` |
 
 An unknown URL never gets a session choice: after one yes, every later made-up
-URL would pass. A scheduled job has nobody to ask, so `dispatch` declines the
+URL would pass. The website choices are narrower: they cover one host, written
+out in full.
+
+**Trusted websites.** `CallSite` returns the host of a `web_fetch` read, or ""
+for a save, another tool, or a host `config.CheckTrustedSite` refuses, such as an
+IP address, so the prompt never offers what `merud` couldn't save. `TrustSite`
+marks the host in the session's set under the key `trust:<host>`, which no URL can
+match, since every URL there starts with a scheme. With `always`, it also calls
+the saver `merud` set with `UseSiteSaver`, which writes `[web] trusted_sites` and
+calls `UseTrustedSites` with the new list. `knownURLs.always` holds that list,
+and `trusted` checks it before the session's own marks. A scheduled job has nobody to ask, so `dispatch` declines the
 first two rows there.
 
 `normalizeURL` makes the comparison fair: scheme and host in lower case, the
@@ -792,7 +878,7 @@ history, and a search-result URL asks once.
 
 `download` uses the same `get` as a fetch, so the dial check, the redirect cap
 and the no-cookie rule hold, with a 50 MiB cap and a 2-minute deadline instead
-of 5 MiB and 20 seconds:
+of 16 MiB and 20 seconds:
 
 1. `downloadName` picks the name: the `filename` in `Content-Disposition`, parsed
    with `mime.ParseMediaType`, or the URL's last path part. `safeName` then keeps
@@ -809,7 +895,7 @@ of 5 MiB and 20 seconds:
    over a file. It copies at most the limit it gets, 50 MiB here, plus one byte;
    one byte over means the file is too large, and a deferred function removes
    it.
-4. `previewText` reads back an HTML, PDF or text file of 5 MiB or less and returns
+4. `previewText` reads back an HTML, PDF or text file of 16 MiB or less and returns
    its first 2,000 characters for the result.
 
 `New` calls `index.ReadAlso` on the output folder, which holds the downloads
@@ -844,16 +930,74 @@ file in its attachments folder an hour after it was written, by modified time,
 whoever wrote it.
 
 An image takes a different path through the same function. Before step 1,
-`IsImageName` looks at the name's ending: `.png`, `.jpg`, `.jpeg`, `.gif` or
+`index.IsImageName` looks at the name's ending: `.png`, `.jpg`, `.jpeg`, `.gif` or
 `.webp`, in any case. For an image, step 1 checks only the output folder, since
 the model looks at the image and never calls `read_file` on it; step 4 uses
-`imageCap`, 20 MiB; and in place of steps 6 and 7, `uploadImage` reads the
+`imageCap`, 20 MiB, which is `index.MaxImageBytes`; and in place of steps 6 and 7, `uploadImage` reads the
 first 512 bytes, asks `http.DetectContentType` what they are, and refuses
 anything but a PNG, JPEG, GIF or WebP before a copy exists. So a text file
 renamed `notes.png` stays out. Then it seeks back to the start and copies the
 file under `imageName`, which is `safeName` with the ending kept, in lower
 case, even when a long name is cut. `Upload` returns an `Uploaded`, the copy's
 path and its kind: `rpc.AttachImage` or `rpc.AttachFile`.
+
+### notes.go
+
+`search_notes`, `list_notes` and `read_note` read your Apple Notes through
+[applenotes](applenotes.md). `merud` calls `UseNotes` with the database's
+path once at startup, on a Mac only; with no path, `notesOff` keeps the three
+tools off and gives the reason `Off` logs, "Apple Notes is only on macOS" on
+Linux and Windows. Whether macOS lets `merud` read the file is checked on each
+call, not at startup, so a user who grants Full Disk Access doesn't have to
+restart `merud`.
+
+`callNotes` opens the database, runs the tool, and closes it with `defer`. When
+`applenotes.Open` returns `ErrNoAccess`, `notesError` hands the model
+`NotesNoAccess`, a sentence that says where in System Settings to turn on Full
+Disk Access for `merud`. A real turn showed why the words matter: told only
+"unable to open database file", the model guessed that Notes was syncing.
+
+`read_note` pages a long note the way `read_file` pages a file: 12,000
+characters per call, and a line that names the offset to pass next. A locked
+note gives its title and says it's locked. `NotesAccess`, which opens and
+closes the database once, is what `merud` logs at startup and what the
+Settings screen checks before it shows `NotesNoAccess`.
+
+The three tools only read, so `Confirm` gives them `ConfirmNever`. They aren't
+on `EveryRoute`: they join the tools routes, and the agent's
+`asksForAppleNotes` rule gives a question that says "Apple Notes" or "Notes
+app" those routes (see [agent](agent.md)).
+
+### schedulejob.go
+
+`schedule_job` saves a scheduled job when the user asks for one in chat, such
+as "every other Tuesday at 9, summarize the Go release notes". `merud` hands it
+its job service's `add` through `UseJobs`; without it, the tool stays off and
+`Off` says "merud runs no scheduler". `add` writes the job through
+`catalog.SetJob` under the config lock and gives the scheduler the new list, the
+same path the Jobs screens take.
+
+The model sends a name, a cron schedule, `every_weeks` and `from` when the job
+runs every few weeks, and either a prompt with an optional skill or a declared
+command with its `args`, plus an optional `output`. `parseScheduleArgs` refuses
+an unknown key, as `configure` does, so the model can't slip in an `allow`
+list: what a job may do unwatched is the user's call, made in Settings.
+`scheduleJob` checks the schedule first with `when`, which parses it and says it
+in words with the next run; `add` then makes every other check `config.toml`
+makes. A refusal comes back as an error result that ends "Nothing was saved".
+
+`AlwaysAsks` names `configure` and `schedule_job`: both change Meru itself, so
+`Confirm` gives them `ConfirmAlways`, Settings never lets them run without
+asking, and the agent leaves them out of a job's run.
+
+The approval card has to show what the model understood, since "0 9 * * 2" is
+easy to misread. `Tools` has an `AuditArgs` method, which makes it a
+`dispatch.Auditor`, as the commands backend is. For `schedule_job` it adds a
+`when` key to the arguments, such as "9:00 on Tuesdays, every other week from
+27 October 2026; next run Tue 27 Oct 2026 09:00"; for any other tool it returns
+`nil`, and dispatch keeps the arguments as they are. Dispatch writes the result
+on the `tool_call` line and shows it on the card, so the user reads the words
+before saying yes.
 
 ### images.go
 
@@ -873,8 +1017,9 @@ trusts none of it:
    `Lstat` saw, as in `Upload`.
 6. `io.ReadAll` behind an `io.LimitReader` of `imageCap` plus one byte reads the
    file; one byte past the cap means it grew after `Lstat`.
-7. The first bytes must pass `isImageData`, the same `DetectContentType` test
-   `Upload` runs.
+7. The first bytes must pass `index.IsImageData`, the same `DetectContentType`
+   test `Upload` and the indexer run. The image rules live in `index` so the
+   two can't drift.
 
 It returns the bytes, and the agent puts them on the question's message.
 
@@ -943,7 +1088,7 @@ and `TestWebSearchRefused` points the tool at a closed port.
 `allowAddr` so that this one address and port count as public; every other
 address still goes through the real `checkPublic`. It covers HTML with its title,
 a PDF, plain text, paging, a redirect, a cookie that mustn't come back, a refused
-content type, the 5 MiB cap, a 404, a redirect loop, and refusals of a second
+content type, the 16 MiB cap, a 404, a redirect loop, and refusals of a second
 server on `127.0.0.1`, of a redirect to it, of `::1`, `192.168.1.1` and
 `169.254.169.254`. `TestWebFetchNameToLoopback` keeps the real check and asks
 for `http://localhost:<port>/`, a DNS name that resolves to `127.0.0.1`, and
@@ -1007,12 +1152,18 @@ the cases with one readable file it also calls `read_file` on the same file
 and checks that a built-in's result gets nothing added.
 
 `TestBuiltinToolsSwitch` builds `Tools` three times. With every setting there,
-the eleven names from `config.BuiltinTools()` are exactly what `Tools` offers and
+the seventeen names from `config.BuiltinTools()` are exactly what `Tools` offers and
 `Status` lists, which also proves the config list and this package agree. With
 `[builtin] tools` cut to `datetime` and `grep`, only those two show up, and a
 call to any other built-in fails. With no settings, `Off` names `about_meru`,
-`remember`, `write_file`, the four file tools and `web_search`, each with a
+`remember`, `write_file`, the six file tools and `web_search`, each with a
 reason.
+
+`TestViewImage` runs `view_image` on a picture in the folder and checks that the
+bytes come back in `Images` and the file as an image source, then on the paths it
+refuses: none, outside the folders, a secret's name, a link, a file that isn't an
+image by name and one that isn't by content. `TestViewImageCapped` checks that a
+call marked with `WithViewCapped` reads nothing and names the limit.
 
 `about_test.go` feeds `aboutText` a setup like the one behind the tool:
 `qwen3.6:35b` as the main model, the lite fast model, one folder and two MCP
@@ -1094,7 +1245,7 @@ tool stays off without a searcher or without `[index] folders`.
   about it, and turning `read_file` off shouldn't stop a photo.
 
 - **One switch per built-in.** `[builtin] tools` turns each tool on or off, the
-  same way for all eleven. `web_fetch` had its own key under `[web]` before; two
+  same way for all seventeen. `web_fetch` had its own key under `[web]` before; two
   places to look for one question made the config harder to read.
 
 - **Facts from `merud`, text from here.** `merud` owns the engine, the store,

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
@@ -90,6 +91,9 @@ const (
 type exchange struct {
 	question string
 	state    turnState
+	// lastNews is when merud last sent anything for the turn, so the turn
+	// can say how long the model has gone quiet; see quietLine.
+	lastNews time.Time
 
 	route      string   // empty until merud's "route" event
 	confidence float64  // the router's confidence in route
@@ -169,6 +173,9 @@ type outgoing struct {
 	text   string
 	scope  string
 	images []string
+	// cont marks /continue, which merud answers by picking up the chat's
+	// last answer; text is then the word the chat shows.
+	cont bool
 }
 
 // link says whether merud answered last time we heard from it.
@@ -269,13 +276,15 @@ type Model struct {
 	mcpBox *mcpBox
 	// modelBox is the open /model box, or nil, and works the same way.
 	modelBox *modelBox
-	// So do the /chats, /used, /folders, /skills and /log boxes. The
+	// So do the /chats, /used, /folders, /skills, /sites, /jobs and /log boxes. The
 	// /about and /help boxes only scroll.
 
 	chatsBox   *chatsBox
 	usedBox    *usedBox
 	foldersBox *foldersBox
 	skillsBox  *skillsBox
+	sitesBox   *sitesBox
+	jobsBox    *jobsBox
 	logBox     *logBox
 	aboutBox   *scrollBox
 	helpBox    *scrollBox
@@ -404,6 +413,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case usageMsg:
 		m.applyUsage(msg)
+		return m, nil
+	case usageDetailMsg:
+		m.applyUsageDetail(msg)
 		return m, nil
 	case meMsg:
 		m.applyMe(msg)
@@ -561,7 +573,7 @@ func (m *Model) startTurn(q outgoing) tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 
-	m.turns = append(m.turns, exchange{question: q.text, state: stateActive, scope: q.scope, images: q.images})
+	m.turns = append(m.turns, exchange{question: q.text, state: stateActive, scope: q.scope, images: q.images, lastNews: time.Now()})
 	m.refresh()
 	req := rpc.Request{
 		Op:      rpc.OpAsk,
@@ -572,6 +584,7 @@ func (m *Model) startTurn(q outgoing) tea.Cmd {
 		// Only the first question starts an incognito chat; the next ones
 		// continue it by the ID merud sent.
 		Incognito: m.session == "" && m.incognito,
+		Continue:  q.cont,
 	}
 	if len(q.images) > 0 {
 		req.Images = &rpc.Images{Paths: q.images}
@@ -587,6 +600,7 @@ func (m *Model) handleEvent(msg eventMsg) {
 	}
 	m.link = linkUp // an event means merud is there
 	cur := m.current()
+	cur.lastNews = time.Now()
 	ev := msg.ev
 	switch ev.Type {
 	case rpc.EventSession:

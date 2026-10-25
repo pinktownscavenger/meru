@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -163,6 +164,17 @@ func serve(ctx context.Context, cfg config.Config, configPath, socketPath string
 		return err
 	}
 	log.Info("listening", "socket", socketPath)
+	// The /metrics port is claimed next, for the same reason: a port another
+	// program holds stops merud now, with the key to change, rather than
+	// after the models load.
+	var metricsLn net.Listener
+	if addr := cfg.Observability.Prometheus; addr != "" {
+		if metricsLn, err = listenMetrics(addr); err != nil {
+			_ = ln.Close()
+			return err
+		}
+		log.Info("metrics page", "addr", metricsURL(metricsLn))
+	}
 
 	// An errgroup runs each function in its own goroutine and Wait waits
 	// for all of them. gctx is cancelled when ctx is, when stop is
@@ -175,6 +187,9 @@ func serve(ctx context.Context, cfg config.Config, configPath, socketPath string
 	g, gctx := errgroup.WithContext(ctx)
 	requests := newGate(ollama)
 	g.Go(func() error { return rpc.Serve(gctx, ln, requests.handle, log) })
+	if metricsLn != nil {
+		serveMetrics(gctx, g, metricsLn, log)
+	}
 	// fail stops the server and returns err, for a startup step that
 	// fails once the server runs.
 	fail := func(err error) error {
@@ -206,7 +221,11 @@ func serve(ctx context.Context, cfg config.Config, configPath, socketPath string
 	sessionsDir := filepath.Join(cfg.Dir, "sessions")
 	replayTurns(gctx, st, sessionsDir, log)
 	replaySessions(gctx, st, sessionsDir, log)
-	ix, err := index.New(cfg.Index, st, eng, log)
+	// The indexer reads images only when config asks and the embedding
+	// model can embed them; nomic-embed-text, say, reads text alone.
+	ixCfg := cfg.Index
+	ixCfg.Images = cfg.Index.Images && config.FindEmbedModel(cfg.Models.Embed).Images
+	ix, err := index.New(ixCfg, st, eng, log)
 	if err != nil {
 		return fail(fmt.Errorf("index: %w", err))
 	}
@@ -248,6 +267,11 @@ func serve(ctx context.Context, cfg config.Config, configPath, socketPath string
 	// A question's images come from the uploads folder through the
 	// built-in tools' Image, which refuses any other path.
 	a.UseImages(tools.bt.Image, capabilityCheck(eng, engine.Vision))
+	// With images in the index, search_images and a turn with an attached
+	// image can find pictures like it; see internal/agent/similar.go.
+	if ix.ReadsImages() {
+		a.UseImageSearch(search)
+	}
 	// An answer model that can't call tools, such as gemma3:12b, answers
 	// with none; see internal/agent/notools.go.
 	a.UseToolCheck(capabilityCheck(eng, engine.ToolUse))
@@ -263,6 +287,7 @@ func serve(ctx context.Context, cfg config.Config, configPath, socketPath string
 	// whole.
 	home, _ := os.UserHomeDir()
 	hist := newHistoryService(sessionsDir, home, st, a.ForgetIncognito, log)
+	hist.configPath = configPath
 	// about_meru reads every source above, so merud hands it them last. It
 	// reads them on each call, so it reports the setup as it is then.
 	tools.bt.UseAbout(aboutService{
@@ -274,7 +299,7 @@ func serve(ctx context.Context, cfg config.Config, configPath, socketPath string
 	outputDir, _ := expandHome(cfg.Skills.OutputDir)
 	svc := services{
 		agent: a, idx: idx, tools: tools, mems: mems, skills: sk, hist: hist, st: st, configPath: configPath,
-		ollama: ollama,
+		ollama: ollama, metrics: metricsURL(metricsLn),
 		save:   saveService{dispatcher: tools.dispatcher, sessionsDir: sessionsDir, outputDir: outputDir, home: home, now: time.Now},
 		models: newModelService(cfg, configPath, outputDir, eng, a, tools.bt.EditConfig, log),
 	}
@@ -284,6 +309,27 @@ func serve(ctx context.Context, cfg config.Config, configPath, socketPath string
 	// over, so a question that comes during the load waits for it instead
 	// of starting another. newModelService has already told the agent
 	// which model answers and whether it thinks.
+	// A model that can't look at pictures suggests a set whose model can.
+	a.UseVisionSets(svc.models.visionSets)
+	// The answer model gets a context window sized for it before it
+	// warms, so it loads once with it; see window.go. The agent reads the
+	// same window for its check on the prompt's size.
+	if fit := windowFitter(eng, cfg.Ollama.ContextLength, memoryGB(gctx), log); fit != nil {
+		fit(gctx, a.Main())
+		svc.models.fitWindow = fit
+		a.UseWindow(eng.(*engine.OllamaEngine).Window)
+	}
+	// The scheduler runs [[jobs]] through the same agent, in a loop beside
+	// the server; see jobs.go.
+	jobSvc, err := newJobService(gctx, cfg, configPath, tools.bt.EditConfig, a, tools.dispatcher, st, hist, log)
+	if err != nil {
+		return fail(err)
+	}
+	svc.jobs = jobSvc
+	// schedule_job saves the jobs the user approves in chat through the
+	// same checked edit as the clients' Jobs screens.
+	tools.bt.UseJobs(jobSvc.add)
+	g.Go(func() error { jobSvc.sched.Loop(gctx); return nil })
 	warmAnswer := a.StartWarm()
 	g.Go(func() error { warmAnswer(gctx); return nil })
 	requests.open(handler(svc))
@@ -297,15 +343,18 @@ func serve(ctx context.Context, cfg config.Config, configPath, socketPath string
 
 // openStore opens the search index at meru.db in the Meru home. It asks the
 // embedding model for one vector to learn the vector size first. When the
-// model or size changed since the last run, the store drops the old
-// vectors and the startup scan embeds every file again.
+// model, its task prefixes or size changed since the last run, the store
+// drops the old vectors and the startup scan embeds every file again.
 func openStore(ctx context.Context, cfg config.Config, eng engine.Engine, log *slog.Logger) (*store.Store, error) {
 	dims, err := embedDims(ctx, eng)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", cfg.Models.Embed, err)
 	}
+	em := config.FindEmbedModel(cfg.Models.Embed)
 	path := filepath.Join(cfg.Dir, "meru.db")
-	st, err := store.Open(ctx, store.Options{Path: path, EmbedModel: cfg.Models.Embed, Dims: dims})
+	st, err := store.Open(ctx, store.Options{
+		Path: path, EmbedModel: cfg.Models.Embed, EmbedPrefixHash: em.PrefixFingerprint(), Dims: dims,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -336,7 +385,17 @@ func replayTurns(ctx context.Context, st *store.Store, sessionsDir string, log *
 // handleUsage answers OpUsage with one "usage" event: the turns table added
 // up over each usage window, with today, week and month in merud's local
 // time, or, when req.Kind is rpc.UsageByModel, added up per answer model.
-func handleUsage(ctx context.Context, st *store.Store, req rpc.Request, emit func(rpc.Event) error) error {
+// When req.Kind is rpc.UsageDetail it answers with one "usage_detail"
+// event instead: the dashboard, with metrics, the /metrics address or "".
+func handleUsage(ctx context.Context, st *store.Store, req rpc.Request, metrics string, emit func(rpc.Event) error) error {
+	if req.Kind == rpc.UsageDetail {
+		detail, err := st.UsageDetail(ctx, time.Now())
+		if err != nil {
+			return err
+		}
+		detail.Metrics = metrics
+		return emit(rpc.Event{Type: rpc.EventUsageDetail, UsageDetail: &detail})
+	}
 	var windows []rpc.UsageWindow
 	var err error
 	if req.Kind == rpc.UsageByModel {
@@ -362,8 +421,12 @@ type services struct {
 	st         *store.Store
 	save       saveService
 	models     *modelService
+	jobs       *jobService
 	ollama     *ollamaWatch
 	configPath string
+	// metrics is the /metrics address the Usage page shows, or "" when
+	// [observability] prometheus is off.
+	metrics string
 }
 
 // handler returns the rpc.Handler merud serves: questions go to the agent,
@@ -371,7 +434,8 @@ type services struct {
 // connection ops to the tool service, the memory ops to the memory
 // service, the skill ops to the skill service, the session ops and the
 // chat folder ops to the history service, save_file to the save service,
-// attach_file to the tool service, which holds the built-in tools, the
+// attach_file to the tool service, which holds the built-in tools,
+// transcribe to the tool service too, which holds the connectors, the
 // model ops to the model service, and the usage op to the store. The rpc
 // server answers pings itself.
 func handler(svc services) rpc.Handler {
@@ -403,7 +467,7 @@ func handler(svc services) rpc.Handler {
 		case rpc.OpConnectorFix:
 			return tools.handleConnectorFix(ctx, req, svc.ollama, emit)
 		case rpc.OpUsage:
-			return handleUsage(ctx, st, req, emit)
+			return handleUsage(ctx, st, req, svc.metrics, emit)
 		case rpc.OpMemoryList:
 			return mems.handleList(emit)
 		case rpc.OpMemoryAdd:
@@ -464,6 +528,22 @@ func handler(svc services) rpc.Handler {
 			return svc.models.handleModelUse(ctx, req, emit)
 		case rpc.OpModelSave:
 			return svc.models.handleModelSave(ctx, emit)
+		case rpc.OpTranscribe:
+			return tools.handleTranscribe(ctx, req, emit)
+		case rpc.OpTrustedSites:
+			return tools.handleTrustedSites(emit)
+		case rpc.OpTrustedSiteRemove:
+			return tools.handleTrustedSiteRemove(ctx, req, emit)
+		case rpc.OpJobs:
+			return svc.jobs.handleJobs(emit)
+		case rpc.OpJobRun:
+			return svc.jobs.handleJobRun(req, emit)
+		case rpc.OpJobCancel:
+			return svc.jobs.handleJobCancel(req, emit)
+		case rpc.OpJobSet:
+			return svc.jobs.handleJobSet(ctx, req, emit)
+		case rpc.OpJobRemove:
+			return svc.jobs.handleJobRemove(ctx, req, emit)
 		default:
 			return fmt.Errorf("unknown op %q", req.Op)
 		}
@@ -496,13 +576,17 @@ type engineBuilder func(config.Config, *slog.Logger) (engine.Engine, error)
 // loopback address from config, which also knows the embed model for Embed.
 // A nil *http.Client makes the engine use its own default client. The
 // engine asks Ollama for [ollama] context_length tokens of room on every
-// chat call.
+// chat call, and gives the embed model the prefixes and context that
+// config.FindEmbedModel lists for it, or none for a model it doesn't know.
 func newEngine(cfg config.Config, log *slog.Logger) (engine.Engine, error) {
 	e, err := engine.NewOllama(cfg.Ollama.BaseURL, cfg.Ollama.KeepAlive, cfg.Models.Embed, nil, log)
 	if err != nil {
 		return nil, err
 	}
 	e.ContextLength = cfg.Ollama.ContextLength
+	em := config.FindEmbedModel(cfg.Models.Embed)
+	e.EmbedPrompts = engine.Prompts{Query: em.Query, Document: em.Document}
+	e.EmbedContext = em.Context
 	return e, nil
 }
 

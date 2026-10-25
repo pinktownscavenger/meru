@@ -1,7 +1,7 @@
 # store
 
 **Code:** `internal/store/` (`doc.go`, `store.go`, `schema.go`, `documents.go`, `search.go`,
-`toolcalls.go`, `turns.go`, `sessions.go`, `memories.go`)
+`toolcalls.go`, `turns.go`, `usagedetail.go`, `sessions.go`, `memories.go`)
 **Milestone:** v0.2; `tool_calls` and `turns` in v0.3; past conversations and `memories` in v0.4
 **Architecture:** [Storage](../../ARCHITECTURE.md#storage) and
 [How hybrid search works](../../ARCHITECTURE.md#how-hybrid-search-works)
@@ -54,7 +54,8 @@ key, so a hit from either search names a chunk the same way.
 
 `Open` does four things in order:
 
-1. Checks the options: a path, an embedding model name, and a vector size.
+1. Takes a path, an embedding model name, a prefix fingerprint and a vector
+   size as options. It checks the path, model and size.
 2. Calls `createPrivate`, which creates `meru.db`, `meru.db-wal` and
    `meru.db-shm` with mode `0600` (owner read and write only) if they don't
    exist, and sets that mode if they do. SQLite would otherwise create them
@@ -126,17 +127,23 @@ apart from `chunks` so a search reads IDs and vectors and never touches text.
 the `heading` and `text` columns of `chunks` without keeping its own copy of
 the text, and its `rowid` is the chunk ID.
 
-`checkVectors` compares the embedding model name and vector size in `meta`
-with the ones `Open` got. When either differs, it deletes every row of
-`chunk_vec`, `memory_vec` and `session_vec` and records the new pair. Vectors
-from two models can't be compared, so all of them go. Documents, chunks,
-memories and summaries stay, so keyword search keeps working while the indexer
-and the memory syncer re-embed and the summarizer embeds the summaries again.
+`checkVectors` compares the embedding model name, prefix fingerprint and vector
+size in `meta` with the ones `Open` got. When the model or size changes, or a
+stored prefix fingerprint differs, it deletes every row of `chunk_vec`,
+`memory_vec` and `session_vec` in one transaction and records the new values.
+An older database without a prefix fingerprint keeps its vectors when the model
+and size match; `Open` records the current fingerprint. A later prefix change
+makes the vectors incomparable, so the store deletes them.
+Documents, chunks, memories and summaries stay, so keyword search keeps working
+while the indexer and memory syncer re-embed and the summarizer embeds the
+summaries again.
 
 `NeedsReembed` reports that gap. It counts rows instead of keeping a flag:
 some chunks lack a vector exactly when the model changed and the indexer
 hasn't finished. The count stays right if `merud` crashes halfway through
-re-embedding.
+re-embedding. `Document` reports the same gap for one file: its `Vectored`
+field is true when no chunk of the file lacks a row in `chunk_vec`, which
+lets the indexer skip the files a re-embed has done already.
 
 ### documents.go: writing documents
 
@@ -174,6 +181,12 @@ path; the indexer's startup scan uses that to find files whose folder left
 `substr` rule as `Paths`, for the desktop app's Folders section.
 
 ### search.go: the two searches
+
+`SearchVectorKind` and `SearchKeywordKind` are the same two searches limited to
+documents of one kind, such as `"image"`. Each is one query that joins `chunks`
+and `documents` and filters on `d.kind`, so no lookup runs per hit. In the
+keyword query the table's own name, `chunk_fts`, goes before `MATCH`: FTS5 reads
+it as the whole-row column, and an alias doesn't work there.
 
 `SearchVector` computes the distance from the query to every stored vector
 and keeps the `k` nearest:
@@ -323,6 +336,35 @@ first token in rising order and takes the middle one in Go; with an even count i
 takes the lower of the two middle values, so the number is always the time of
 one real turn. Turns that wrote no text have a time of 0 and stay out.
 
+### usagedetail.go: the Usage screen's numbers
+
+`UsageDetail(ctx, now)` returns what the Usage screen and the `/usage` box draw
+under the windows table, in an `rpc.UsageDetailReply`. It runs three queries,
+none of them once per day, tool or task:
+
+1. `detailTurns` reads each turn of the last 30 days: its time, tokens and time
+   to first token. Go sorts them into local days, by `now`'s location, and
+   fills the days with no turn as zeros, so the charts always get 30 bars. The
+   `ts` column holds UTC text in one format, so `ts >= ?` with the window's
+   start in the same format compares correctly as text.
+2. `detailSlowest` takes the ten longest turns of the last 7 days, `ORDER BY
+   duration_ms DESC LIMIT 10`.
+3. `detailTools` counts `tool_calls` rows by tool, kind and outcome with
+   `GROUP BY`. Go folds the outcomes into one row per tool and keeps the
+   twelve busiest. Rows of incognito and deleted chats count too: they keep
+   the tool and the outcome, which is all this reads.
+
+Each day's p50 and p95 time to first token come from `nearestRank`: sort the
+day's times, and take the smallest one with at least p percent of the times at
+or below it. The answer is always one real turn's time, and p50 matches the
+median `UsageByModel` reports. SQLite has no percentile function, and a day
+holds a few dozen turns, so Go does it.
+
+Why sort days in Go and not with SQLite's `date(ts, 'localtime')`? The
+SQLite inside `ncruces/go-sqlite3` runs as WebAssembly, and its idea of local
+time may differ from Go's. Doing it in Go uses the same calendar the usage
+windows use, and a test can pass any `time.Location`.
+
 `DiskBytes` adds up the sizes of `meru.db`, `meru.db-wal` and `meru.db-shm`;
 a missing file counts as 0. The store keeps its own path for it.
 
@@ -438,6 +480,14 @@ digits of fraction. RFC 3339 trims trailing zeros from the fraction, so
 value the same width, `ORDER BY` on the text sorts by time. A memory with no
 created date stores `''`, which sorts after every dated one in `DESC` order.
 
+### Each job's last run (turns.job)
+
+Step 9 of `migrations` adds `job` to `turns`, with an index on `(job, ts)` for
+the rows that have one. A row written live gets it from the turn; a rebuilt row
+gets it from the transcript's user line, so `turnsOf` carries the open
+question's job to its answer's row. `LastJobRuns` answers each job's newest run
+with one `GROUP BY` query; the scheduler reads it once at startup.
+
 ## Go ideas used here
 
 - **`database/sql`** — Go's standard interface to SQL databases: a pool, queries,
@@ -465,8 +515,9 @@ go test -run '^$' -bench . -benchtime 20x ./internal/store/
 ```
 
 `memories_test.go` covers `ReplaceMemory` and `DeleteMemory` with the FTS5
-integrity check, the order of each memory search with and without `exclude`, and
-an embedding model change that drops the memory vectors.
+integrity check and the order of each memory search with and without `exclude`.
+`store_test.go` checks that a model or prefix change drops chunk, memory and
+session vectors and keeps their source text.
 
 `TestSearchKeyword` feeds FTS5 syntax, quotes and SQL fragments as queries.
 `TestSearchVector` checks the distances are true cosine distances for vectors

@@ -63,6 +63,10 @@ type Line struct {
 	// user line: copies in the uploads folder under [skills] output_dir.
 	// The line keeps the paths, never the bytes.
 	Images []string `json:"images,omitempty"`
+	// Job names the scheduled job a run belongs to, on its user line; ""
+	// for a question someone asked. The turns table keeps it, so each
+	// job's last run survives a rebuild (ARCHITECTURE.md, "Scheduler").
+	Job string `json:"job,omitempty"`
 
 	// The fields below belong to the tool lines (v0.3): "tool_call",
 	// "approval" and "tool_result". CallID ties the three lines of one call
@@ -83,7 +87,7 @@ type Line struct {
 	// "denied", "declined", "cancelled" or "timeout". OK repeats
 	// Outcome == "ok" so the line reads plainly with grep. On an
 	// assistant line, Outcome says how a turn ended without a full
-	// answer: "timeout", "cut_off", "gave_up" or "bad_output"; it is empty
+	// answer: "timeout", "cut_off", "window_full", "gave_up" or "bad_output"; it is empty
 	// otherwise.
 	Outcome string `json:"outcome,omitempty"`
 	OK      bool   `json:"ok,omitempty"`
@@ -259,9 +263,9 @@ func (s *Session) Append(l Line) error {
 // oldest first. A turn is a user line and the assistant line that answered
 // it. An answer that carries a notice gets it after its text, in square
 // brackets, so the model reads that its claim didn't happen. An answer
-// whose turn read the web gets one line per web note after that, such as
-// "[from the web: Acme Flow https://example.com/flow — Acme Flow is a
-// ...]", so a follow-up still knows what the pages said: see webNotes. A
+// whose turn read the web gets its web notes after that, under a line
+// that says they aren't part of the answer, so a follow-up still knows
+// what the pages said: see webNotes. A
 // question
 // that carried images gets one note per image after its text, such as
 // "[image: receipt.jpg]", and never the image itself: see imageNotes. A
@@ -350,6 +354,24 @@ func (s *Session) CalledTools(maxTurns int) ([]string, error) {
 	return tools, nil
 }
 
+// LastTurn returns the lines of the session's last turn, from its last
+// user line to the end of the file, oldest first: the question, the tool
+// lines and the answer. It returns nothing for a session with no question.
+// The agent reads it to continue an answer that stopped short. It fails
+// only when the file can't be read.
+func (s *Session) LastTurn() ([]Line, error) {
+	lines, err := s.read()
+	if err != nil {
+		return nil, err
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		if lines[i].Type == TypeUser {
+			return lines[i:], nil
+		}
+	}
+	return nil, nil
+}
+
 // Model returns the main model the session's answers come from now: the
 // To of its last model_switch line for the main tier, or "" when it has
 // none, as a new session or one written before the line existed has. It
@@ -374,24 +396,30 @@ func LastModel(lines []Line) string {
 	return model
 }
 
-// webNotes returns one line per note, "[from the web: <title> <url> —
-// <gist>]", after a blank line, or "" for none. A real session showed why
-// history needs them: a turn read a product's page and answered well, and
-// the next three answers, whose history held only the question and answer
-// text, made up the product's features instead of searching again.
+// webNotesHead opens the web notes after an answer in history. It says
+// who wrote them and that they aren't for the user: with the notes as
+// bare "[from the web: ...]" lines, a model answering a follow-up copied
+// them, run together, onto the end of its answer.
+const webNotesHead = "(Meru's notes on the pages this turn read, for later questions. " +
+	"They aren't part of the answer above; never copy them into an answer, and cite pages by number as usual.)"
+
+// webNotes returns the notes after a blank line, webNotesHead, then one
+// line per note, "- <title> <url> — <gist>", or "" for none. A real
+// session showed why history needs them: a turn read a product's page and
+// answered well, and the next three answers, whose history held only the
+// question and answer text, made up the product's features instead of
+// searching again.
 func webNotes(notes []WebNote) string {
 	if len(notes) == 0 {
 		return ""
 	}
 	var s strings.Builder
-	s.WriteString("\n")
+	s.WriteString("\n\n" + webNotesHead)
 	for _, n := range notes {
-		head := strings.TrimSpace(n.Title + " " + n.URL)
-		s.WriteString("\n[from the web: " + head)
+		s.WriteString("\n- " + strings.TrimSpace(n.Title+" "+n.URL))
 		if n.Gist != "" {
 			s.WriteString(" — " + n.Gist)
 		}
-		s.WriteString("]")
 	}
 	return s.String()
 }

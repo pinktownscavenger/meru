@@ -197,8 +197,15 @@ func serveConn(ctx context.Context, conn net.Conn, h Handler, log *slog.Logger) 
 		OpFolderRemove, OpSaveFile, OpAttachFile, OpSkillEnable, OpSkillDisable, OpModels,
 		OpModelSet, OpModelUse, OpModelSave, OpSessionDelete, OpSessionMove, OpSessionTag, OpChatFolders,
 		OpChatFolderAdd, OpChatFolderRename, OpChatFolderRemove, OpConnectorAdopt, OpConnectorUnadopt,
-		OpConnectorSet, OpConnectorFix:
+		OpConnectorSet, OpConnectorFix, OpTranscribe, OpTrustedSites, OpTrustedSiteRemove,
+		OpJobs, OpJobRun, OpJobCancel, OpJobSet, OpJobRemove:
 		// Handled below.
+		// A job's fields come only from merud's own scheduler, in
+		// process; from a client they would let an ask pass as a job.
+		if req.Job != "" || req.Skill != "" {
+			_ = write(Event{Type: EventError, Error: "job and skill are set only by merud's scheduler"})
+			return
+		}
 	default:
 		_ = write(Event{Type: EventError, Error: fmt.Sprintf("unknown op %q", req.Op)})
 		return
@@ -277,7 +284,7 @@ func serveConn(ctx context.Context, conn net.Conn, h Handler, log *slog.Logger) 
 }
 
 // readRequest reads and decodes the first line from r. It fails on a line
-// longer than maxLine, bad JSON, or a connection that closes first.
+// longer than MaxRequestLine, bad JSON, or a connection that closes first.
 func readRequest(r *bufio.Reader) (Request, error) {
 	var line []byte
 	for {
@@ -286,7 +293,7 @@ func readRequest(r *bufio.Reader) (Request, error) {
 			return Request{}, fmt.Errorf("read request: %w", err)
 		}
 		line = append(line, chunk...)
-		if len(line) > maxLine {
+		if len(line) > MaxRequestLine {
 			return Request{}, errors.New("read request: line too long")
 		}
 		if !isPrefix {

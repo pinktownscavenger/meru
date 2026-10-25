@@ -236,6 +236,50 @@ const (
 	// The reply is one "models" event, as OpModels sends, with a Warning
 	// when the model can't call tools, and "done".
 	OpModelSet Op = "model_set"
+	// OpTranscribe turns the recording in Request.Audio, a WAV file of at
+	// most 60 seconds, into text with the whisper connector, starting its
+	// server when it isn't running. The reply is one "transcript" event,
+	// whose Text is the words, empty when the recording held none, and
+	// "done". It fails when the connector is off, still installing or
+	// failed, with the connector's sentence, and when the file isn't WAV
+	// or runs too long. merud keeps neither the audio nor the text.
+	OpTranscribe Op = "transcribe"
+	// OpTrustedSites lists [web] trusted_sites, the websites web_fetch
+	// reads without asking in every session. The reply is one
+	// "trusted_sites" event, whose Sites lists them, and "done".
+	OpTrustedSites Op = "trusted_sites"
+	// OpTrustedSiteRemove takes the host in Request.ID out of [web]
+	// trusted_sites, so web_fetch asks again before it reads that site in
+	// a new session. The reply is one "trusted_sites" event with the list
+	// left, and "done". It fails for a host the list doesn't hold.
+	OpTrustedSiteRemove Op = "trusted_site_remove"
+	// OpJobs lists the scheduled jobs: one "jobs" event, whose Jobs holds
+	// each with its schedule in words, next and last run, and whether it
+	// runs now, and "done" (ARCHITECTURE.md, "Scheduler").
+	OpJobs Op = "jobs"
+	// OpJobRun runs the job named in Request.ID now, outside its schedule,
+	// and replies with the "jobs" event. It fails for an unknown job or one
+	// already running.
+	OpJobRun Op = "job_run"
+	// OpJobCancel stops the run in progress of the job named in Request.ID;
+	// the run ends "cancelled" and the job's schedule stays. It replies
+	// with the "jobs" event, and fails when the job has no run going.
+	OpJobCancel Op = "job_cancel"
+	// OpJobSet saves Request.JobSpec as a [[jobs]] entry in config.toml:
+	// in place of the job named in Request.ID, so an edit can rename it,
+	// or as a new job when ID is empty. Pausing and resuming are a set
+	// with Paused changed. merud checks the job as config.toml would, and
+	// the scheduler takes the new list at once. The reply is the "jobs"
+	// event and "done". With Request.DryRun, merud saves nothing and the
+	// "jobs" event holds only the job as it would be, with its schedule in
+	// words and its next run, for a form to show as the user types; an
+	// error event says what's wrong with it.
+	OpJobSet Op = "job_set"
+	// OpJobRemove takes the job named in Request.ID out of config.toml,
+	// with the comment above it, and replies with the "jobs" event. A run
+	// in progress goes on to its end; the job's past runs stay in the Jobs
+	// folder.
+	OpJobRemove Op = "job_remove"
 )
 
 // Source says where a question came from. It becomes a metric attribute, so
@@ -301,6 +345,33 @@ type Request struct {
 	// Connector is the change OpConnectorSet makes. A pointer, as Policy
 	// is.
 	Connector *ConnectorChange `json:"connector,omitempty"`
+	// Audio is the recording OpTranscribe turns into text. A pointer, as
+	// Policy is.
+	Audio *Audio `json:"audio,omitempty"`
+	// Continue, on an OpAsk with a Session, picks up the session's last
+	// answer where it stopped short: at the length limit ("cut_off"), with
+	// the context window full ("window_full"), or
+	// the turn's deadline ("timeout"). Text may be empty; merud then
+	// records "Continue" as what the user typed.
+	Continue bool `json:"continue,omitempty"`
+	// Job and Skill belong to an ask merud's own scheduler makes for a
+	// job's run: the job's name, which goes on the user line and files the
+	// chat in the Jobs folder, and a skill to load without the pick step.
+	// The socket server refuses either from a client, so no client can
+	// make an ask that counts as a job.
+	Job   string `json:"job,omitempty"`
+	Skill string `json:"skill,omitempty"`
+	// JobSpec is the job OpJobSet saves. A pointer, as Policy is. DryRun
+	// makes OpJobSet check it and save nothing.
+	JobSpec *JobSpec `json:"job_spec,omitempty"`
+	DryRun  bool     `json:"dry_run,omitempty"`
+}
+
+// Audio is one recording for OpTranscribe. WAV holds the whole file;
+// encoding/json writes a []byte as base64, so 60 seconds of 16 kHz mono
+// 16-bit audio, 1.9 MB, travels as 2.6 MB, under MaxRequestLine.
+type Audio struct {
+	WAV []byte `json:"wav"`
 }
 
 // TagChange says which tags OpSessionTag adds to a chat and which it
@@ -350,9 +421,10 @@ const (
 	// in the prompt, numbered as the answer cites them ([1], [2], ...). It
 	// comes after "route" and before the first "token", and only on a turn
 	// whose search found something. A round whose tool calls returned
-	// excerpts, such as search_files, sends it again after its
-	// "tool_result" events, with every source so far: each "sources" event
-	// replaces the one before it.
+	// sources, such as search_files' excerpts or web_search's results,
+	// sends it again after its "tool_result" events, with every source so
+	// far: each "sources" event replaces the one before it. A web page has
+	// Kind SourceWeb and its URL.
 	EventSources EventType = "sources"
 	// EventToken carries the next piece of the answer text.
 	EventToken EventType = "token"
@@ -381,6 +453,10 @@ const (
 	EventLog EventType = "log"
 	// EventUsage answers OpUsage, in Usage.
 	EventUsage EventType = "usage"
+	// EventUsageDetail answers OpUsage with Kind UsageDetail, in
+	// UsageDetail. An older merud answers that request with "usage"
+	// instead, which a client takes as "charts need a newer merud".
+	EventUsageDetail EventType = "usage_detail"
 	// EventMemories answers OpMemoryList and OpMemoryAdd, in Memories. On
 	// an OpAsk reply it lists the memories recall put in this turn's
 	// prompt, before the first "token"; a turn that recalled none sends
@@ -430,6 +506,12 @@ const (
 	EventReport EventType = "report"
 	// EventStatus answers OpIndexStatus, in Status.
 	EventStatus EventType = "status"
+	// EventTrustedSites carries [web] trusted_sites, in Sites.
+	EventTrustedSites EventType = "trusted_sites"
+	// EventJobs carries the scheduled jobs, in Jobs.
+	EventJobs EventType = "jobs"
+	// EventTranscript carries the words OpTranscribe heard, in Text.
+	EventTranscript EventType = "transcript"
 	// EventDone ends a successful reply. After an ask it carries the turn's
 	// stats: TTFTMillis, DurationMillis, TokensIn, TokensOut and EvalMillis.
 	// After a ping
@@ -470,6 +552,8 @@ type Event struct {
 	Log     []LogEntry   `json:"log,omitempty"`
 	// Usage is set on a "usage" event.
 	Usage []UsageWindow `json:"usage,omitempty"`
+	// UsageDetail is set on a "usage_detail" event.
+	UsageDetail *UsageDetailReply `json:"usage_detail,omitempty"`
 	// Memories is set on a "memories" event.
 	Memories []MemoryInfo `json:"memories,omitempty"`
 	// Skills is set on a "skills" event, and on a "route" event that
@@ -494,6 +578,13 @@ type Event struct {
 	Folders     []FolderInfo   `json:"folders,omitempty"`
 	Suggested   []FolderInfo   `json:"suggested,omitempty"`
 	Models      *ModelsInfo    `json:"models,omitempty"`
+
+	// Sites is set on a "trusted_sites" event: the websites web_fetch
+	// reads without asking in every session. An empty list is left out of
+	// the JSON, so a client reads a missing Sites as none.
+	Sites []string `json:"sites,omitempty"`
+	// Jobs is the "jobs" event's list, by name.
+	Jobs []JobInfo `json:"jobs,omitempty"`
 
 	// Connectors is set on a "connectors" event.
 	Connectors []ConnectorStatus `json:"connectors,omitempty"`
@@ -527,6 +618,11 @@ type Event struct {
 	// TokensOut, in milliseconds. It measures how fast the model writes,
 	// with no network or routing time in it.
 	TPOTMillis float64 `json:"tpot_ms,omitempty"`
+	// Outcome, on the "done" event, says how a turn ended without a full
+	// answer: "cut_off", "window_full", "timeout", "gave_up", "bad_output" or "no_vision",
+	// as the transcript's assistant line holds it; empty for a full
+	// answer. A client offers Continue after "cut_off", "window_full" and "timeout".
+	Outcome string `json:"outcome,omitempty"`
 }
 
 // Citation is one excerpt a turn's prompt held, as the "sources" event lists
@@ -545,7 +641,19 @@ type Citation struct {
 	// Score is the excerpt's search score (reciprocal-rank fusion); higher
 	// is better.
 	Score float64 `json:"score,omitempty"`
+	// Kind is "image" when the source is an image file, SourceWeb for a
+	// web page, and empty for text, so a client that predates images shows
+	// it as any other source.
+	Kind string `json:"kind,omitempty"`
+	// URL is a web page's address, for a SourceWeb source. Path holds it
+	// too, so a client from before web sources still shows where the
+	// answer came from.
+	URL string `json:"url,omitempty"`
 }
+
+// SourceWeb is Citation.Kind for a web page: a web_search result or a
+// page web_fetch read. Heading holds its title.
+const SourceWeb = "web"
 
 // IndexReport says what one OpIndex run, or merud's startup scan, did.
 type IndexReport struct {
@@ -599,6 +707,13 @@ const (
 	ChoiceSession Choice = "session"
 	// ChoiceDeny doesn't run the call.
 	ChoiceDeny Choice = "deny"
+	// ChoiceSite runs this call and every later call that reaches the
+	// approval's Site in the same session without asking. Only web_fetch
+	// offers it, on a URL no search result or question gave.
+	ChoiceSite Choice = "site"
+	// ChoiceSiteAlways is ChoiceSite in every session: merud adds the Site
+	// to [web] trusted_sites.
+	ChoiceSiteAlways Choice = "site_always"
 )
 
 // ToolEvent describes one tool call on a "tool_call" or "tool_result" event.
@@ -638,6 +753,10 @@ type Approval struct {
 	// Choices lists the answers the client may offer, in order. The
 	// configure tool offers only "once" and "deny".
 	Choices []Choice `json:"choices"`
+	// Site is the host the call reaches, such as
+	// "raw.githubusercontent.com", when Choices hold ChoiceSite and
+	// ChoiceSiteAlways; the client names it on those buttons.
+	Site string `json:"site,omitempty"`
 }
 
 // Reply is the line a client writes to answer an "approval" event.
@@ -736,6 +855,78 @@ const (
 // UsageByModel is the Request.Kind that asks OpUsage for one window per
 // answer model.
 const UsageByModel = "model"
+
+// UsageDetail is the Request.Kind that asks OpUsage for the dashboard: the
+// last UsageDays days day by day, the slowest questions of the last
+// SlowestDays days, tool calls by outcome, and use by model. merud answers
+// with one "usage_detail" event.
+const UsageDetail = "detail"
+
+// The dashboard's windows and list sizes.
+const (
+	UsageDays      = 30               // days the per-day numbers cover, today included
+	SlowestDays    = 7                // days the slowest questions come from
+	SlowestCount   = 10               // how many slowest questions the reply holds
+	ToolsCount     = 12               // how many tools the reply holds, busiest first
+	MetricsExample = "127.0.0.1:9464" // the [observability] prometheus value the clients suggest
+)
+
+// UsageDetailReply is the dashboard: every number comes from meru.db's
+// turns and tool_calls, which rebuild from the transcripts, so it needs
+// nothing else running.
+type UsageDetailReply struct {
+	// Days holds the last UsageDays local days, oldest first, a day with
+	// no questions included as zeros.
+	Days []UsageDay `json:"days"`
+	// Slowest holds the slowest answered questions of the last SlowestDays
+	// days, slowest first.
+	Slowest []SlowQuestion `json:"slowest"`
+	// Tools holds each tool's calls of the last UsageDays days by outcome,
+	// busiest first.
+	Tools []ToolOutcomes `json:"tools"`
+	// Models is what a UsageByModel request returns.
+	Models []UsageWindow `json:"models"`
+	// Metrics is the address merud serves Prometheus metrics at, such as
+	// "http://127.0.0.1:9464/metrics", or "" when [observability]
+	// prometheus is off.
+	Metrics string `json:"metrics"`
+}
+
+// UsageDay is one local calendar day's answered questions.
+type UsageDay struct {
+	// Date is the local date, "2026-10-09".
+	Date      string `json:"date"`
+	Questions int    `json:"questions"`
+	TokensIn  int64  `json:"tokens_in"`
+	TokensOut int64  `json:"tokens_out"`
+	// TTFTp50Millis and TTFTp95Millis are the day's times to first token
+	// at the 50th and 95th percentile, by nearest rank; 0 on a day with
+	// none.
+	TTFTp50Millis int64 `json:"ttft_p50_ms"`
+	TTFTp95Millis int64 `json:"ttft_p95_ms"`
+}
+
+// SlowQuestion is one slow answered question. It holds no question text:
+// a client names it from its own chat list, by Session.
+type SlowQuestion struct {
+	Session string `json:"session"`
+	// At is when the question came, RFC 3339.
+	At       string `json:"at"`
+	Route    string `json:"route"`
+	Model    string `json:"model"`
+	Millis   int64  `json:"ms"`
+	TTFT     int64  `json:"ttft_ms"`
+	TokensIn int64  `json:"tokens_in"`
+}
+
+// ToolOutcomes counts one tool's calls by outcome: "ok", "error",
+// "denied", "declined", "cancelled" or "timeout".
+type ToolOutcomes struct {
+	Tool     string         `json:"tool"`
+	Kind     string         `json:"kind"`
+	Calls    int            `json:"calls"`
+	Outcomes map[string]int `json:"outcomes"`
+}
 
 // UsageWindow is how much Meru was used in one window of time, counting
 // answered questions only: a turn that failed or was cancelled has no
@@ -890,4 +1081,49 @@ type ProbeTool struct {
 	// overwrite. MCP says both are hints from the server, not promises.
 	ReadOnly    *bool `json:"read_only,omitempty"`
 	Destructive *bool `json:"destructive,omitempty"`
+}
+
+// JobSpec is one [[jobs]] entry as config.toml holds it, for the Jobs
+// forms to show and OpJobSet to save. See config.Job for each key.
+type JobSpec struct {
+	Name string `json:"name"`
+	// Schedule is the cron expression; EveryWeeks, above 1, runs it only
+	// every that many weeks from the week of From, as "2026-10-27".
+	Schedule   string `json:"schedule"`
+	EveryWeeks int    `json:"every_weeks,omitempty"`
+	From       string `json:"from,omitempty"`
+	// A run asks Prompt, loading Skill when one is named, or runs the
+	// [[commands]] entry Command with Args.
+	Prompt  string            `json:"prompt,omitempty"`
+	Skill   string            `json:"skill,omitempty"`
+	Command string            `json:"command,omitempty"`
+	Args    map[string]string `json:"args,omitempty"`
+	// Allow lists the tools a run may use without asking once, and Output
+	// a file under [skills] output_dir the answer also goes to.
+	Allow  []string `json:"allow,omitempty"`
+	Output string   `json:"output,omitempty"`
+	// Paused is true for enabled = false.
+	Paused bool `json:"paused,omitempty"`
+}
+
+// JobInfo is one scheduled job for the clients' Jobs lists: its JobSpec
+// and how it runs. Times are RFC 3339; an empty one means none.
+type JobInfo struct {
+	// JobSpec is embedded: its fields read as JobInfo's own, j.Name for
+	// one, and its JSON keys sit at the top level of a JobInfo.
+	JobSpec
+	// When says the schedule in words, such as "7:00 on weekdays".
+	When string `json:"when"`
+	// Next is the next scheduled run.
+	Next string `json:"next,omitempty"`
+	// Last is the latest run's scheduled time, LastOutcome how it ended
+	// ("ok", "cancelled", ...), and LastSession its chat; the outcome and
+	// chat are known for runs since merud started.
+	Last        string `json:"last,omitempty"`
+	LastOutcome string `json:"last_outcome,omitempty"`
+	LastSession string `json:"last_session,omitempty"`
+	// Running is true while a run goes or waits its turn; Started is when
+	// it started.
+	Running bool   `json:"running,omitempty"`
+	Started string `json:"started,omitempty"`
 }

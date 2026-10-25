@@ -30,7 +30,7 @@ app: the full paths of the copies in `~/meru-output/uploads/`. The line names
 them and never holds their bytes.
 
 An assistant line also carries `outcome` when the turn ended without a full
-answer: `timeout`, `cut_off`, `gave_up`, `bad_output` or `no_vision`. The text then holds
+answer: `timeout`, `cut_off`, `window_full`, `gave_up`, `bad_output` or `no_vision`. The text then holds
 the apology, or the text so far and a note that Meru stopped it. A full answer leaves the
 field out (`omitempty`).
 
@@ -123,13 +123,19 @@ keeps the last `n` pairs. An answer with a `notice` gets it after its text, in
 square brackets, so on the next turn the model reads that its claim didn't
 happen instead of building on it.
 
-An answer with web notes gets one line per note after that, from `webNotes`:
+An answer with web notes gets them after that, from `webNotes`: the line
+`webNotesHead`, then one line per note:
 
 ```text
 It moves notes between apps.
 
-[from the web: Acme Flow https://acme.example/flow — Acme Flow moves notes between apps.]
+(Meru's notes on the pages this turn read, for later questions. They aren't part of the answer above; never copy them into an answer, and cite pages by number as usual.)
+- Acme Flow https://acme.example/flow — Acme Flow moves notes between apps.
 ```
+
+The head line says who wrote the notes and that they never go in an answer.
+The notes used to be bare `[from the web: …]` lines, and a model answering a
+follow-up copied them, run together, onto the end of its answer.
 
 A real session showed why. A turn read a product's page and answered well, and
 the next three answers, whose history held only the question and answer text,
@@ -191,6 +197,15 @@ tool", to check that a call backs the claim, in this turn or an earlier one the
 model reads in its history. The names are as `dispatch` wrote them, so an MCP
 tool shows by its own name, such as `search` for `notes.search`.
 `TestCalledTools` checks the turn counting.
+
+### LastTurn
+
+`Session.LastTurn()` returns the lines from the session's last `user` line to
+the end: the question, its tool lines and its answer. Continue reads it to hand
+the model the work the last answer did (see [agent](agent.md), "Continue"). It
+walks back from the end to the last `user` line and returns that part of the
+slice, with no copy. It reads an incognito session from memory, as every other
+reader does, so Continue works there too.
 
 ### Model switch lines
 
@@ -272,6 +287,12 @@ if errors.Is(err, io.EOF) {
 newline. At the end of the file it returns the rest with `io.EOF`. A line with
 no newline yet is still being written, or a crash tore it, so `ReadFrom`
 leaves it for next time and doesn't move the offset past it.
+
+### A job's run
+
+A user line may carry `Job`, the scheduled job a run belongs to. `infoOf` titles
+such a session by the job and its time, "morning-brief · Fri 24 Oct 07:00",
+instead of the prompt, so a job's runs read as a log in the Jobs folder.
 
 ## Go ideas used here
 

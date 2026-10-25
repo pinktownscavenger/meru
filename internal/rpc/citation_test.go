@@ -18,6 +18,7 @@ func TestCitationString(t *testing.T) {
 		{Citation{N: 2, Path: "~/notes/a.md", StartLine: 7, EndLine: 7}, `[2] ~/notes/a.md, line 7`},
 		{Citation{N: 3, Path: "/srv/paper.pdf", Page: 4}, `[3] /srv/paper.pdf, page 4`},
 		{Citation{N: 4, Path: "~/x.txt"}, `[4] ~/x.txt`},
+		{Citation{N: 5, Path: "~/img/shot.png", Heading: "shot.png", Kind: "image"}, `[5] ~/img/shot.png (image)`},
 	}
 	for _, tt := range tests {
 		if got := tt.c.String(); got != tt.want {
@@ -98,5 +99,28 @@ func TestHyperlink(t *testing.T) {
 	}
 	if got := Hyperlink("", "[1] a.md"); got != "[1] a.md" {
 		t.Errorf("Hyperlink with no URL = %q, want the text alone", got)
+	}
+}
+
+// TestWebCitation checks how a web source prints and where it links: its
+// title and URL, the URL alone when it has no title, and the URL as its
+// link, while a file links to its file:// URL.
+func TestWebCitation(t *testing.T) {
+	web := Citation{N: 5, Path: "https://go.dev/doc/devel/release", URL: "https://go.dev/doc/devel/release",
+		Heading: "Release History", Kind: SourceWeb}
+	if got, want := web.String(), "[5] Release History — https://go.dev/doc/devel/release"; got != want {
+		t.Errorf("String = %q, want %q", got, want)
+	}
+	bare := web
+	bare.Heading = ""
+	if got, want := bare.String(), "[5] https://go.dev/doc/devel/release"; got != want {
+		t.Errorf("String with no title = %q, want %q", got, want)
+	}
+	if got := web.Link("/Users/dana"); got != web.URL {
+		t.Errorf("Link = %q, want the page's URL", got)
+	}
+	file := Citation{N: 1, Path: "/notes/garden.md"}
+	if got := file.Link(""); got != "file:///notes/garden.md" {
+		t.Errorf("file Link = %q", got)
 	}
 }

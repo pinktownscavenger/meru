@@ -17,6 +17,7 @@ export const bridge = {
   // The chat (bridge.go, history.go, status.go).
   send: (session, question, scope, incognito) => call("Send", session, question, scope, !!incognito),
   retry: (session, question, scope, images, incognito) => call("Retry", session, question, scope, images, !!incognito),
+  continueAnswer: (session, scope, incognito) => call("Continue", session, scope, !!incognito),
   stop: () => call("Stop"),
   unqueue: (index) => call("Unqueue", index),
   approve: (id, choice) => call("Approve", id, choice),
@@ -41,6 +42,19 @@ export const bridge = {
   attachFile: () => call("AttachFile"),
   detach: (index) => call("Detach", index),
   detachAll: () => call("DetachAll"),
+  // The websites web_fetch reads without asking (sites.go).
+  trustedSites: () => call("TrustedSites"),
+  // Scheduled jobs (jobs.go).
+  jobs: () => call("Jobs"),
+  runJob: (name) => call("RunJob", name),
+  cancelJob: (name) => call("CancelJob", name),
+  saveJob: (was, spec) => call("SaveJob", was, spec),
+  checkJob: (was, spec) => call("CheckJob", was, spec),
+  removeJob: (name) => call("RemoveJob", name),
+  removeTrustedSite: (host) => call("RemoveTrustedSite", host),
+  // The microphone (speech.go).
+  speechStatus: () => call("SpeechStatus"),
+  transcribe: (wavBase64) => call("Transcribe", wavBase64),
   // Settings and Setup (settings.go).
   connections: () => call("Connections"),
   setPolicy: (kind, server, tool, policy) => call("SetPolicy", kind, server, tool, policy),
@@ -67,6 +81,9 @@ export const bridge = {
   saveModels: () => call("SaveModels"),
   activity: () => call("Activity"),
   usage: () => call("Usage"),
+  usageDetail: () => call("UsageDetail"),
+  // A preview of an image source, or "" (thumbs.go).
+  sourceThumb: (path) => call("SourceThumb", path),
   // The About section of Settings (about.go).
   about: () => call("About"),
   // Slash commands (commands.go).

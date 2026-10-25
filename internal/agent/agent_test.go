@@ -53,6 +53,9 @@ type fakeRound struct {
 	pieces []string
 	calls  []engine.ToolCall
 	usage  engine.Usage
+	// done is the round's done_reason; "" means "stop". "length" stands
+	// for a round Ollama cut off.
+	done string
 }
 
 // streamCall records one Stream call.
@@ -81,7 +84,11 @@ func (f *fakeEngine) Stream(ctx context.Context, msgs []engine.Message, tools []
 			if len(r.calls) > 0 && !yield(engine.Delta{ToolCalls: r.calls}, nil) {
 				return
 			}
-			yield(engine.Delta{Done: true, DoneReason: "stop", Usage: r.usage}, nil)
+			reason := r.done
+			if reason == "" {
+				reason = "stop"
+			}
+			yield(engine.Delta{Done: true, DoneReason: reason, Usage: r.usage}, nil)
 		}, nil
 	}
 	return func(yield func(engine.Delta, error) bool) {
@@ -112,7 +119,7 @@ func (f *fakeEngine) Generate(context.Context, []engine.Message, []engine.ToolSp
 	return f.gen, nil
 }
 
-func (f *fakeEngine) Embed(context.Context, []string) ([]engine.Vector, error) {
+func (f *fakeEngine) Embed(context.Context, []engine.Input) ([]engine.Vector, error) {
 	return nil, errors.New("not used")
 }
 

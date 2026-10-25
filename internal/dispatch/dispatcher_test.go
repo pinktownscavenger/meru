@@ -204,7 +204,22 @@ func TestDispatchOutcomes(t *testing.T) {
 			wantLines: []string{"tool_call", "approval", "tool_result"}},
 		{name: "nobody to ask", tool: "web.search", confirm: ConfirmAsk, wantOutcome: OutcomeDeclined,
 			wantLines: []string{"tool_call", "tool_result"}, wantText: "nobody can give it"},
-		{name: "a job never asks", tool: "web.search", confirm: ConfirmAsk, ap: &approver{choice: rpc.ChoiceOnce},
+		// A job's approver answers from its allow list, for a call that
+		// asks once.
+		{name: "a job's approver allows a call that asks once", tool: "web.search", confirm: ConfirmAsk,
+			ap: &approver{choice: rpc.ChoiceOnce}, edit: func(c *Call) { c.Source = rpc.SourceJob },
+			wantOutcome: OutcomeOK, wantRan: true, wantAsks: 1, wantApprove: "once",
+			wantLines: []string{"tool_call", "approval", "tool_result"}},
+		{name: "a job's approver can decline", tool: "web.search", confirm: ConfirmAsk,
+			ap: &approver{choice: rpc.ChoiceDeny}, edit: func(c *Call) { c.Source = rpc.SourceJob },
+			wantOutcome: OutcomeDeclined, wantAsks: 1, wantApprove: "deny",
+			wantLines: []string{"tool_call", "approval", "tool_result"}, wantText: "said no"},
+		// A call that asks every time stays declined in a job, whatever the
+		// job's approver would say: it isn't even asked.
+		{name: "a job never runs a call that asks every time", tool: "web.search", confirm: ConfirmAlways,
+			ap: &approver{choice: rpc.ChoiceOnce}, edit: func(c *Call) { c.Source = rpc.SourceJob },
+			wantOutcome: OutcomeDeclined, wantLines: []string{"tool_call", "tool_result"}},
+		{name: "a job with no approver declines", tool: "web.search", confirm: ConfirmAsk,
 			edit: func(c *Call) { c.Source = rpc.SourceJob }, wantOutcome: OutcomeDeclined,
 			wantLines: []string{"tool_call", "tool_result"}},
 		{name: "client gone while asking", tool: "web.search", confirm: ConfirmAsk,
@@ -712,6 +727,48 @@ func TestCallConfirmer(t *testing.T) {
 	c.Source = rpc.SourceJob
 	if _, out := d.Dispatch(context.Background(), c); out.Outcome != OutcomeDeclined || a.askCount() != 1 {
 		t.Errorf("job call: outcome %q after %d prompts; want declined with no new prompt", out.Outcome, a.askCount())
+	}
+}
+
+// siteBackend is a callConfirmBackend that also trusts websites: CallSite
+// names "go.dev" for every call, and TrustSite records what it got.
+type siteBackend struct {
+	callConfirmBackend
+	trusted []string // "host" or "host always", per TrustSite call
+}
+
+// CallSite names the host every call reaches.
+func (b *siteBackend) CallSite(c Call) string { return "go.dev" }
+
+// TrustSite records host, with " always" when always is set.
+func (b *siteBackend) TrustSite(ctx context.Context, c Call, host string, always bool) error {
+	if always {
+		host += " always"
+	}
+	b.trusted = append(b.trusted, host)
+	return nil
+}
+
+// TestSiteChoices checks that a call which asks every time, on a backend
+// that names its website, offers the two website choices with the host,
+// and that each answer reaches TrustSite and runs the call.
+func TestSiteChoices(t *testing.T) {
+	b := &siteBackend{callConfirmBackend: callConfirmBackend{fakeBackend: fakeBackend{kind: KindBuiltin, tools: []string{"fetch"}}}}
+	d := New([]Backend{b}, nil, Options{})
+	for _, choice := range []rpc.Choice{rpc.ChoiceSite, rpc.ChoiceSiteAlways} {
+		a := &approver{choice: choice}
+		c := newCall("fetch", &sink{}, a)
+		c.Args = json.RawMessage(`{"url":"ask"}`)
+		if _, out := d.Dispatch(context.Background(), c); out.Outcome != OutcomeOK {
+			t.Fatalf("%s: outcome %q", choice, out.Outcome)
+		}
+		want := []rpc.Choice{rpc.ChoiceOnce, rpc.ChoiceSite, rpc.ChoiceSiteAlways, rpc.ChoiceDeny}
+		if got := a.asked[0]; !slices.Equal(got.Choices, want) || got.Site != "go.dev" {
+			t.Errorf("%s: choices %v site %q", choice, got.Choices, got.Site)
+		}
+	}
+	if !slices.Equal(b.trusted, []string{"go.dev", "go.dev always"}) {
+		t.Errorf("trusted = %v", b.trusted)
 	}
 }
 

@@ -427,7 +427,7 @@ tool that saves, and the model then says it will remember and saves nothing. So 
 question holds `remember` as a whole word, the route lacks the full set of tools, and the
 tools on offer include `remember`, `withTools` adds them, as for a tool server.
 `asksToRemember` makes the check with `namesFolder`, so "remembered" doesn't
-count. It is one of the five signs `toolTarget` checks, so a `tools` turn that
+count. It is one of the seven signs `toolTarget` checks, so a `tools` turn that
 asks Meru to remember also skips the search of your files. A wrong guess, such as "do you remember the trip?", costs a prompt
 that holds the tool schemas; the model need not call any.
 
@@ -493,8 +493,9 @@ space but no wrong answer.
 
 **Scoring the pick.** `make pick-eval` runs `TestPickEval`, which asks the pick
 each question in `testdata/picks.jsonl` three times and prints the share it got
-right, by kind and overall. The file holds 21 invented questions of four kinds:
-how to use a program, current facts, the user's own files, and plain chat.
+right, by kind and overall. The file holds 25 invented questions of five kinds:
+how to use a program, current facts, the user's own files, plain chat, and
+pictures in the user's folders.
 `pickRight` in `pickeval_test.go` decides what counts: the pick names every
 wanted skill and no research skill (`file-research` or `web-research`) the
 question doesn't want. An extra `writing` or `explainer` still counts, since it
@@ -599,6 +600,15 @@ tools shouldn't do that, so `fileTurn` changes only when the added tools
 include a file tool. `slices.ContainsFunc` reports whether any item passes the
 function.
 
+The same goes for a turn the router already sent to `tools`. When the picked
+skills bring `web_search` and no file tool (`webSkill`), the turn is about the
+web, and `fileTurn` turns false, so it doesn't search your files first. The
+case that led here: "can you search for things from the last 2 days", a
+follow-up in a chat about a rocket launch, named no web phrase, routed to
+`tools`, picked `web-research`, and still put nine unrelated excerpts and
+43,000 tokens in the prompt (#174). `TestWebSkillSkipsFileSearch` runs the turn
+with the skill picked and with none.
+
 ### Scopes (scope.go)
 
 The desktop app's "Where Meru looks" switch sends `Request.Scope`. `Handle` checks
@@ -621,6 +631,17 @@ scope promises what the turn may touch. That is also why `files` drops the
 web tools the search route offers in `auto` (`builtin.IsWebTool` names them). Skills are still picked, since the
 writing skill shapes an answer without a tool. The `route` event carries
 confidence 1, because nothing guessed.
+
+The offer is also a fence. `runCalls` (`tools.go`) puts the names of the round's
+offered tools on each of the model's calls as `dispatch.Call.Offered` when the
+scope isn't `auto`, and `dispatch` denies any other tool. Without it, a model on
+"My files" that wrote a `web_search` call from memory would search the web, since
+config allows the tool. The fence is built before the goroutines start, from
+`t.offer`, so every call of a round shares it; `make([]string, 0, n)` keeps it
+non-nil even when the round offered nothing. Meru's own web-first calls
+(`caller == dispatch.CallerMeru`) get no fence: the scope chose them. An `auto`
+turn passes nil and fences nothing, because a route offers fewer tools to keep
+the prompt short, not as a promise.
 
 `mailServers` groups the tools by server (`serverOf`) and keeps a server when one
 of its tool names holds a noun ending in "mail", or "calendar" or "event", read
@@ -697,6 +718,30 @@ over a fake engine whose answer model loads until the test lets it go: a ping
 answers during the load, a question waits for it, the model loads once, and
 the load carries thinking off and the system prompt.
 
+### Images like an attached one (similar.go)
+
+When the index reads images, `merud` calls `UseImageSearch`, and a turn with an
+attached image runs `findSimilar` first, in `respond`, before `checkVision`. It
+embeds the first image through `ImageSearcher.SearchImages` and keeps the eight
+nearest indexed images in `t.similar`, a `fileHits` like the one `searchFiles`
+returns. The order matters: a model without vision answers with that list, so
+the search must run before the vision check stops the turn.
+
+- **No vision:** `checkVision` sends the route event, `emitSimilar` sends the
+  images as the `sources` event, and `endTurn` answers with `similarAnswer`: the
+  list as `[1]`, `[2]`, a line saying the model can't look at pictures, and
+  `visionSuggestion`. The numbers let `rpc.Cited` show them under the answer in
+  both clients.
+- **Vision:** `respondScoped` sends the sources after its route event and puts
+  the list in the prompt. It skips the text search, so the answer's numbers point
+  at one list. `similarSection` writes that list under its own header, which
+  tells the model Meru ran the search already. Under the usual "Excerpts from
+  the user's files", a model asked to "find similar images" missed the list,
+  said it had no tool for that, and offered a web search.
+
+A failed or empty search logs a warning and leaves `t.similar` empty, and the
+turn runs as it did before image search.
+
 ### Images (images.go)
 
 A question from the desktop app can carry images in `Request.Images`: the full
@@ -716,9 +761,8 @@ two functions, and `merud` decides where they come from.
    sends a `route` event, `direct` with confidence 1, and returns
    `errNoVision`. `Handle` treats that error as an ending, as it treats the
    turn's deadline: `endOf` maps it to `endNoVision`, and `endTurn` sends
-   `noVisionAnswer`, which names the model and says to check another with
-   `ollama show <model>`. No model runs, and the assistant line's outcome is
-   `no_vision`.
+   `noVisionAnswer`, which names the model and ends with `visionSuggestion`.
+   No model runs, and the assistant line's outcome is `no_vision`.
 4. Otherwise `respond` hands the turn to `respondScoped` even in `auto`. The
    router's fast model reads only text, so its guess about a photo would be
    noise. `scopeRoute` gives `auto` the route `direct`, and `scopeSpecs` the
@@ -731,6 +775,57 @@ two functions, and `merud` decides where they come from.
 
 Logs and spans get counts: `meru.turn.images` on the span, `images` on the info
 line, and a debug line `images attached` with the count and total bytes.
+
+### Looking at a picture in the folders (images.go, tools.go)
+
+The answer model sees a picture from the user's folders through the built-in
+`view_image`, which returns the bytes in `dispatch.Result.Images` (see
+[builtin](builtin.md)). Three pieces here make that work.
+
+1. **Only a model that can see gets the tool.** `finishPrompt` calls
+   `withoutViewing` beside `offerable`. It asks `a.vision` about the main model,
+   through the engine's cached `/api/show` answer, and drops `view_image` from
+   the specs when the model lacks `vision`, or when the check fails. It then
+   records the model's name in `t.blind`. `slices.Clone` copies the specs first,
+   because `slices.DeleteFunc` works in place and the caller's slice may be
+   shared.
+2. **The picture rides on the tool message.** `runCalls` builds each call's
+   message as `engine.Message{Role: RoleTool, Content: res.Text, Images:
+   res.Images}`. The engine already sends `images` for any role, so Ollama shows
+   the picture to the model on its next round. The repeat cache, `t.seen`, keeps
+   `Text` alone, so a repeated call never sends the bytes twice.
+3. **At most `maxViewed` pictures a turn.** Eight: `view_image` shrinks each to
+   about 1,800 prompt tokens, and the prompt holds 32,768. `runCalls` hands out the slots in
+   its first loop, in call order, before any goroutine starts, and marks each
+   call past the limit in `capped`. The goroutines only read their own mark, so
+   they need no lock. A marked call still goes through `dispatch`, with
+   `builtin.WithViewCapped` on its context, so it gets its `tool_calls` row and
+   the tool refuses it with text the model reads.
+
+**Telling the model.** `stablePart` adds `seeNote`, which returns
+`pictureNote` when config allows `view_image` and the main model has vision.
+A turn showed why: asked to itemize "these receipts" a turn after listing them,
+`qwen3.6:35b` was offered the tool, called nothing, and said it couldn't read
+text in images, as its own earlier answer had said. With the line, it opened
+all eight. A model without vision never gets the line.
+
+**The text-only notice.** When the turn ends with a full answer, `t.blind` is
+set, and `namesImages` finds a picture in the answer, `Handle` adds
+`noVisionText` to the `notice` event, after `noToolsText` and the unbacked-claim
+warning. `namesImages` looks for a cited source of kind `"image"`, or a file name
+that ends in `.png`, `.jpg`, `.jpeg`, `.gif` or `.webp` in the answer's text,
+with the regular expression `imagePath`. The second test catches an answer that
+names pictures it found through `list_folder` or a command, which it doesn't
+cite.
+
+**The suggestion.** `noVisionText`, `noVisionAnswer` and `similarAnswer` all end
+with `visionSuggestion(sets)`, so the sentence lives in one place. `merud` passes
+`UseVisionSets` a function that lists the model sets in config whose `main` lists
+both `vision` and `tools`: a model needs tools to call `view_image`. The
+suggestion names the first, as in "qwen3.6:35b can: switch to it with `/model
+qwen-4bit` in meru chat, or Use for answers in Settings, Models." With none, it
+points to `/model` and Settings, Models. The names come from config, never from
+code.
 
 ### Handle
 
@@ -955,13 +1050,15 @@ question that `aboutPastChats` accepts becomes `search` too, while search or
 the file tools are on (see [Earlier conversations](#earlier-conversations-earliergo)).
 
 A second rule does the same for tools. `toolTarget` (toolnouns.go) looks for
-five signs that a question points at a connected tool, and returns the first
+seven signs that a question points at a connected tool, and returns the first
 it finds as words for the log line, or `""` for none:
 
 | Sign | Example | Found by |
 | --- | --- | --- |
 | names a tool server | "search my obsidian vault" | `namesFolder` over `toolServers` |
 | asks Meru to remember | "remember that my name is Dana" | `asksToRemember` |
+| names Apple Notes | "search my Apple Notes for the garden plan" | `asksForAppleNotes`, the word pairs "apple notes", "apple note" and "notes app", while the Apple Notes tools are on |
+| asks for a schedule | "every weekday at 7, brief me on my calendar" | `asksToSchedule`: "schedule" or "scheduled"; a word in `repeating` ("daily", "weekly"...); "every" or "each" before a word in `recurring` ("weekday", "morning", "other", "tuesday"...); or "job" with a time of day ("8am" by `clockTime`, or a word in `timeOfDay`), while `schedule_job` is on. "every file" and "the Blue Origin job posting" don't count |
 | asks for the web | "search the web: what is SearXNG?" | `asksForWeb`, with the phrases in `webPhrases` |
 | gives a web address | "what does https://acme.example/flow say?" | `givesURL` |
 | names what a tool handles | "what was the last email I sent?" | `asksAboutToolNoun` |
@@ -1005,9 +1102,10 @@ fileTurn := aboutFiles(dec.Route, target)
 
 Before this rule, "search the web for the latest Go release" searched your
 folders too. The excerpts crowded the prompt and cost time, and `web_search`
-numbers its results from `[1]` as the excerpts are, so a `[1]` meant for a web
+numbered its results from `[1]` as the excerpts are, so a `[1]` meant for a web
 page also named the first excerpt, and the Sources list under a web answer
-showed one of your files. The file tools stay
+showed one of your files. Web results now take the numbers after the excerpts,
+from the turn's counter (see [builtin](builtin.md)). The file tools stay
 on offer on such a turn, so the model can still look at your files when it
 has to. `search` and `search+tools` keep their search whatever the question
 says: the router, or the folder rule, saw files in it. So "search my obsidian
@@ -1166,14 +1264,17 @@ and hands the list to `runCalls` with `dispatch.CallerMeru`. That is the same
 function the model's calls go through, so each call gets its events,
 transcript lines and `tool_calls` row, with `caller` set. A call that failed or
 returned nothing stays out of the section. The rest go under `webCiteRule` and
-"From the web", each cut to an equal share of `maxWebChars`:
+"From the web", each cut to an equal share of `maxWebChars`. Each result carries
+its own numbers from the turn's counter, and its sources join the turn's
+`sources` event through `addSources`, as a model call's would; `webCiteRule`
+asks the model to cite them by number:
 
 ```text
 Below, under "From the web", is what Meru found on the web for this question before you started. ...
 
 From the web
 
-Web results for "Acme Flow pricing", 2 of 2. Cite each result you use by its URL.
+Web results for "Acme Flow pricing", 2 of 2. Cite each result you use by its number, such as [1].
 
 [1] Acme Flow — https://acme.example/flow
 Acme Flow moves notes between apps.
@@ -1390,8 +1491,8 @@ ToolRunner offers on `tools` and `search+tools`. Every other route keeps the
 tools `everyRoute` names: `datetime` and `about_meru`, which
 `builtin.EveryRoute` names, and `web_search` and `web_fetch`, which
 `builtin.IsWebTool` names, while `web_search` is on. On `search` it also keeps
-the four read-only file tools, `read_file`, `list_folder`, `grep` and
-`search_files`, which `builtin.IsFileTool` names, and the local commands
+the six read-only file tools, `read_file`, `list_folder`, `grep`,
+`search_files`, `search_images` and `view_image`, which `builtin.IsFileTool` names, and the local commands
 (`cmd.<name>`) for which `Asks` says no:
 
 ```go
@@ -1422,10 +1523,13 @@ it hasn't seen, and the prompt stays shorter.
 
 Two functions pick the notes `prompt` adds to the system prompt.
 `noteFor(specs)` gives `toolsNote` to a turn that offers any tool but the file
-tools and commands, `datetime` included: the model may call the tools, and
-some calls ask you first. A turn whose tools are only file tools and
-commands gets `commandsNote` when it has commands (it may run the `cmd.`
-tools). A turn with no tools gets none.
+tools, local commands and `datetime` included: the model may call the tools,
+and some calls ask you first. A turn that offers only file tools, or none,
+gets no tools note. A local command needs no note of its own: its description
+says what program it runs. A separate note for the `cmd.` tools never reached a
+prompt with the default config, because every route offers `datetime`, and
+turning it on changed no answer on the benchmark's command questions, so it
+went (issue #135).
 
 When the turn offers `web_search`, on any route, `noteFor` adds `webNote`
 after `toolsNote`:
@@ -1661,6 +1765,114 @@ dispatch may call `approve` from them too.
 The rpc server's `emit` takes a lock around each write, so that is safe; the
 tests' collector takes a lock too.
 
+### The context window (window.go)
+
+Every round sends the whole turn so far: the system prompt, the history, the
+question, and each earlier call and result. A turn that reads twenty web pages
+sends the first page twenty times, and the prompt grows past `[ollama]
+context_length`. Ollama then has no room left to write in, and stops the answer
+with `done_reason = "length"` after a few hundred tokens. That is what Meru's
+"it reached the length limit" note meant in a real turn that wrote 650 tokens.
+
+`converse` calls `fitWindow` after it appends a round's results:
+
+```go
+newest := len(msgs) // where this round's assistant message goes
+msgs = append(msgs, engine.Message{Role: engine.RoleAssistant, ...})
+// ... run the calls, append their results ...
+if a.fitWindow(ctx, t, msgs, base, newest, rep.usage.PromptTokens, specs) {
+    t.windowFull = true // later rounds offer no tools
+}
+```
+
+`fitWindow` starts from Ollama's own count of the prompt the round that just
+ran sent, `rep.usage.PromptTokens`, and adds the new messages' characters
+divided by `charsPerToken` (3). Only those messages need a guess. When the
+engine reports no count, as the tests' fake doesn't, it falls back to every
+character in the prompt and the tool schemas, divided by 3.
+
+An earlier version took the larger of the two, and that broke a real turn. Tool
+schemas and skills are JSON and Markdown, which pack more characters into a
+token than prose, so the character count came out far above Ollama's 18,000
+tokens and past 80% of the window. With only one round, nothing could be
+shortened, so the turn lost its tools after one `web_search`. The model's next
+`web_fetch` call had no tool to go to, and its "I need to fetch the pages" became
+the answer. `TestFitWindowTrustsOllamasCount` holds that case.
+
+Past `windowShare` (80%) of the window, it walks `msgs[base:newest]`, this
+turn's earlier rounds, oldest first. Each tool result longer than `keepChars`
+(400) becomes its first 400 characters plus `shortenedNote`, which tells the
+model to call the tool again if it needs the whole thing. It stops once the
+estimate fits. Three things stay whole:
+
+- the newest round's results, which the model hasn't read yet;
+- everything before `base`, which `budget.go` sizes;
+- the transcript, since `dispatch` wrote each result there as it ran.
+
+A shortened call also leaves `t.seen`, the map the repeat check reads, so a call
+to fetch the page again runs instead of handing back the stub as a "repeat".
+`for key, result := range t.seen` walks a map's keys and values, and `delete`
+inside that loop is safe in Go.
+
+`m := &msgs[i]` takes a pointer to the slice's element, so `m.Content = short`
+changes the message in the slice. `m := msgs[i]` would copy it, and the change
+would be lost. The slice belongs to `converse`, and the earlier rounds' calls
+already went out, so changing it in place is safe.
+
+When `fitWindow` returns true, `converse` sets `t.windowFull`, and later rounds
+offer no tools. The model doesn't know that, and may call a tool anyway, with a
+plan in its text such as "I'll read the top four articles". `retriesDropped`
+catches a round that offered no tools and still called some, and `retryEmpty`
+asks once more with `droppedNudge` in place of `emptyNudge`: tools are off, so
+answer now. The two retries share `t.emptyRetry`, so a turn makes at most one.
+`retryEmpty` takes the nudge as a parameter, so one function serves both.
+`Handle` then ends the turn `endWindowFull`, and `endTurn` adds `windowNote`
+with the window's size, so the user reads why the answer used so little and
+that Continue picks it up.
+
+`answerWindow` gives the window: the engine's window for the answer model, from
+the function `UseWindow` set, which `merud` sizes per model (see
+[engine](engine.md), "Windows per model"), or `a.window`, `[ollama]
+context_length`, when none is set. `a.window` is 0 when config sets
+`context_length = 0`. Meru then doesn't know
+the window Ollama uses, and `fitWindow` does nothing. The turn span records
+`meru.turn.shortened_results` and `meru.turn.window_full`.
+
+### Continue (continue.go)
+
+A turn that ends `cut_off`, `window_full` or `timeout` did work worth keeping: the pages it
+read and the calls it made. Continue picks the answer up without doing that
+work again. The client sends an `ask` with `Continue: true` and the chat's
+session.
+
+`Handle` reads the session's last turn with `sess.LastTurn()` before it writes
+the new user line, which would start a new last turn. `continuation` turns
+those lines into two strings:
+
+- `question`, the last turn's question. The new turn routes, searches and
+  recalls memories on it, and `userWords` gives its URLs to the URL guard.
+- `message`, what the model reads in its place: the question quoted, each tool
+  call as `name {args}` with the first `resultChars` (600) characters of its
+  result, or ` → error` for a failed one, and a request to pick up where the
+  answer stopped without repeating it.
+
+`continuation` pairs each `tool_result` line with its `tool_call` by
+`CallID`, through a map from ID to the call's place in the list. Past
+`handoffChars` (8,000) it keeps the newest calls and says how many earlier ones
+it left out, since a long summary would fill the window that may have cut the
+answer off. The partial answer stays out of the message: `History` already
+gives it to the model as the last assistant message.
+
+`continuation` fails with `errNothingToContinue` when the last answer ended
+whole, or when the session has no answer yet. It returns three values,
+`(question, message string, err error)`, and the named results say what each
+is. `t.handoff` holds the message. `respond` skips the web-first step when it is
+set, and `finishPrompt` swaps it in for the question just before it builds the
+prompt. The user line holds what the client sent, "Continue" when it sent no
+text, so the transcript and a later turn's history show what the user did.
+
+The `done` event carries `Outcome`, so a client knows when to offer Continue.
+
 ### Cancellation
 
 The turn's own deadline ends `tctx` and gets an answer (see Handle). When the
@@ -1724,6 +1936,22 @@ log handler from `obs` adds the turn's `trace_id`. The lines carry lengths
 (`question_chars`, `answer_chars`) and never the text. With
 `capture_content = true`, `turn started` and `answer finished` add the first
 200 characters, and the `meru.turn` span gets the whole question and answer.
+
+### A scheduled job's run
+
+`merud`'s scheduler asks with `Source: job`, `Job` set to the job's name and,
+when the job names one, `Skill`. `Handle` then writes a meta line that files the
+new session in the Jobs folder before anything else, puts the job on the user
+line and on the turns row, and keeps `t.job` and `t.skill`. `routeAndPick` takes
+the skill: with one named, it skips the pick call and loads that skill, and the
+skill's tools join the route as a picked skill's do. The socket server refuses
+`Job` and `Skill` from a client, so only the scheduler sets them.
+
+Just before `finishPrompt`, a job's turn drops the tools `builtin.AlwaysAsks`
+names, `configure` and `schedule_job`, from `specs`. Both change Meru itself,
+and a page or a mail a job reads could tell the model to call them. dispatch
+would decline them in a job anyway, since nobody can answer the card; leaving
+them out means the model never tries.
 
 ## Go ideas used here
 
@@ -1927,7 +2155,7 @@ failed pick that still answers, a failed route, `parsePick` and the cap in
 
 ```sh
 go test -tags integration -v -run Integration ./internal/agent/
-make pick-eval   # TestPickEval: 21 labelled questions, three asks each
+make pick-eval   # TestPickEval: 25 labelled questions, three asks each
 ```
 
 `pickeval_test.go` holds `loadPicks`, `pickRight` and two plain tests, so a

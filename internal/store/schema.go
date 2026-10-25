@@ -17,8 +17,8 @@ import (
 // step; never edit one that has shipped, because existing databases have
 // already run it. Later milestones add messages and memories this way, as
 // v0.3 added tool_calls and turns, step 6 added the answer model's
-// numbers to turns, step 7 added the caller to tool_calls, and step 8
-// added the tags to sessions.
+// numbers to turns, step 7 added the caller to tool_calls, step 8
+// added the tags to sessions, and step 9 the job to turns.
 //
 // It is a function rather than a package-level variable so nothing can
 // change the list at run time.
@@ -213,6 +213,12 @@ func migrations() []string {
 		// summary_fts beside the new summary. Rows written before this
 		// step get '': no transcript had a meta line then.
 		`ALTER TABLE sessions ADD COLUMN tags TEXT NOT NULL DEFAULT '';`,
+
+		// 9: the scheduled job a turn ran for, from its transcript's user
+		// line, and an index for each job's last run. Rows before this
+		// step get '': no job had run.
+		`ALTER TABLE turns ADD COLUMN job TEXT NOT NULL DEFAULT '';
+		CREATE INDEX turns_job ON turns (job, ts) WHERE job != '';`,
 	}
 }
 
@@ -257,15 +263,16 @@ func (s *Store) migrate(ctx context.Context) error {
 	return nil
 }
 
-// checkVectors makes sure the stored vectors came from model with dims
-// numbers each. Vectors from two models don't compare, so when either
-// changed since the last run, it deletes every vector: of chunks, of
-// memories and of session summaries. Documents, chunks, memories and
-// summaries stay, so keyword search still works. NeedsReembed reports the
-// gap in chunks, MemoryIDs reports each memory with no vector, so the
-// syncer embeds it again, and SummariesWithoutVector does the same for the
-// summarizer.
-func (s *Store) checkVectors(ctx context.Context, model string, dims int) error {
+// checkVectors makes sure the stored vectors match the model, its task
+// prefixes and its vector size. Vectors from different embedding inputs
+// don't compare, so a change deletes every vector: of chunks, memories and
+// session summaries. A legacy database with no prefix hash keeps its vectors
+// when its model and size match; those vectors use the current prefixes.
+// Documents, chunks, memories and summaries stay when vectors are deleted, so
+// keyword search still works. NeedsReembed reports the chunk gap, MemoryIDs
+// reports memories without vectors, and SummariesWithoutVector reports
+// summaries for their existing rebuild paths.
+func (s *Store) checkVectors(ctx context.Context, model, prefixHash string, dims int) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
 		oldModel, err := getMeta(ctx, tx, "embed_model")
 		if err != nil {
@@ -275,14 +282,22 @@ func (s *Store) checkVectors(ctx context.Context, model string, dims int) error 
 		if err != nil {
 			return err
 		}
-		if oldModel == model && oldDims == strconv.Itoa(dims) {
-			return nil
+		oldPrefixHash, err := getMeta(ctx, tx, "embed_prefix_hash")
+		if err != nil {
+			return err
+		}
+		sameModelAndDims := oldModel == model && oldDims == strconv.Itoa(dims)
+		if sameModelAndDims && (oldPrefixHash == prefixHash || oldPrefixHash == "") {
+			return setMeta(ctx, tx, "embed_prefix_hash", prefixHash)
 		}
 		if _, err := tx.ExecContext(ctx,
 			`DELETE FROM chunk_vec; DELETE FROM memory_vec; DELETE FROM session_vec`); err != nil {
 			return fmt.Errorf("drop old vectors: %w", err)
 		}
 		if err := setMeta(ctx, tx, "embed_model", model); err != nil {
+			return err
+		}
+		if err := setMeta(ctx, tx, "embed_prefix_hash", prefixHash); err != nil {
 			return err
 		}
 		return setMeta(ctx, tx, "dims", strconv.Itoa(dims))

@@ -72,6 +72,10 @@ func (f *fakeMerud) handler(ctx context.Context, req rpc.Request, emit func(rpc.
 	case rpc.OpLog:
 		return emit(rpc.Event{Type: rpc.EventLog, Log: []rpc.LogEntry{{Tool: "search_gmail_messages", Outcome: "ok"}}})
 	case rpc.OpUsage:
+		if req.Kind == rpc.UsageDetail {
+			return emit(rpc.Event{Type: rpc.EventUsageDetail, UsageDetail: &rpc.UsageDetailReply{
+				Days: []rpc.UsageDay{{Date: "2026-10-09", Questions: 3}}, Metrics: "http://127.0.0.1:9464/metrics"}})
+		}
 		return emit(rpc.Event{Type: rpc.EventUsage, Usage: []rpc.UsageWindow{{Name: rpc.UsageToday, Turns: 3}}})
 	case rpc.OpIndexStatus:
 		return emit(rpc.Event{Type: rpc.EventStatus, Status: &rpc.IndexStatus{Folders: []string{"~/Notes"}, Documents: 12, Profile: 1}})
@@ -133,6 +137,7 @@ func TestSettingsCalls(t *testing.T) {
 		{"save the models", func() (any, error) { return b.SaveModels(ctx) }, rpc.Request{Op: rpc.OpModelSave}},
 		{"activity", func() (any, error) { return b.Activity(ctx) }, rpc.Request{Op: rpc.OpLog, Limit: defaultActivity}},
 		{"usage", func() (any, error) { return b.Usage(ctx) }, rpc.Request{Op: rpc.OpUsage}},
+		{"usage detail", func() (any, error) { return b.UsageDetail(ctx) }, rpc.Request{Op: rpc.OpUsage, Kind: rpc.UsageDetail}},
 	}
 	for _, st := range steps {
 		t.Run(st.name, func(t *testing.T) {
@@ -439,6 +444,25 @@ func TestSendScope(t *testing.T) {
 	}
 }
 
+func TestContinue(t *testing.T) {
+	var got rpc.Request
+	b, r := newBridge(startServer(t, func(ctx context.Context, req rpc.Request, emit func(rpc.Event) error, _ rpc.ApproveFunc) error {
+		got = req
+		return nil
+	}))
+	defer b.ServiceShutdown()
+	if err := b.Continue("", "", false); err == nil {
+		t.Error("Continue with no chat went to merud")
+	}
+	if err := b.Continue("2026-10-19T234933-aea8", rpc.ScopeWeb, false); err != nil {
+		t.Fatal(err)
+	}
+	r.waitFor(t, "end", isEnd(1))
+	if !got.Continue || got.Session != "2026-10-19T234933-aea8" || got.Text != continueText || got.Scope != rpc.ScopeWeb {
+		t.Errorf("request = %+v, want a continue of the chat", got)
+	}
+}
+
 func TestQuit(t *testing.T) {
 	if err := (&Bridge{}).Quit(); err == nil {
 		t.Error("Quit with no quit function = nil")
@@ -447,5 +471,32 @@ func TestQuit(t *testing.T) {
 	b := New(Options{Quit: func() { quit = true }})
 	if err := b.Quit(); err != nil || !quit {
 		t.Errorf("Quit = %v, quit %v", err, quit)
+	}
+}
+
+// TestUsageDetailBridge checks what UsageDetail hands the page: the
+// dashboard with empty lists where merud sent none, and, from an older
+// merud that answers with plain usage windows, the error that says to
+// update.
+func TestUsageDetailBridge(t *testing.T) {
+	ctx := context.Background()
+	b, _ := newBridge(startServer(t, (&fakeMerud{}).handler))
+	d, err := b.UsageDetail(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.Days) != 1 || d.Metrics != "http://127.0.0.1:9464/metrics" {
+		t.Errorf("detail = %+v", d)
+	}
+	if d.Slowest == nil || d.Tools == nil || d.Models == nil {
+		t.Errorf("detail = %+v; want empty lists rather than null", d)
+	}
+
+	old := func(ctx context.Context, req rpc.Request, emit func(rpc.Event) error, approve rpc.ApproveFunc) error {
+		return emit(rpc.Event{Type: rpc.EventUsage, Usage: []rpc.UsageWindow{{Name: rpc.UsageToday}}})
+	}
+	b, _ = newBridge(startServer(t, old))
+	if _, err := b.UsageDetail(ctx); !errors.Is(err, errOldMerud) {
+		t.Errorf("against an older merud: %v, want errOldMerud", err)
 	}
 }

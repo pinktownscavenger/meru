@@ -10,6 +10,7 @@ package desktop
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"time"
 
@@ -180,6 +181,7 @@ func (b *Bridge) SessionTurns(ctx context.Context, id string) ([]TurnView, error
 			v.Sources = append(v.Sources, rpc.Citation{N: i + 1, Path: p})
 		}
 		v.Cited = rpc.Cited(v.Answer, v.Sources)
+		b.allowThumbs(v.Sources)
 		for _, s := range t.Tools {
 			step := stepOf("", s.Kind, s.Name, s.Args)
 			step.Outcome, step.DurationMillis = s.Outcome, s.DurationMillis
@@ -221,8 +223,9 @@ const changeTimeout = 90 * time.Second
 const switchTimeout = 3 * time.Minute
 
 // one sends req and returns the reply event of type want, waiting at most
-// requestTimeout, changeTimeout for an op that changes a setting, or
-// switchTimeout for a model switch. It
+// requestTimeout, changeTimeout for an op that changes a setting,
+// switchTimeout for a model switch, or transcribeTimeout for speech to
+// text. It
 // fails when merud can't be reached, answers with an error event, or sends
 // no event of that type.
 func (b *Bridge) one(ctx context.Context, req rpc.Request, want rpc.EventType) (rpc.Event, error) {
@@ -230,6 +233,8 @@ func (b *Bridge) one(ctx context.Context, req rpc.Request, want rpc.EventType) (
 	switch {
 	case req.Op == rpc.OpModelUse || req.Op == rpc.OpModelSet:
 		timeout = switchTimeout
+	case req.Op == rpc.OpTranscribe:
+		timeout = transcribeTimeout
 	case changes(req.Op):
 		timeout = changeTimeout
 	}
@@ -250,7 +255,9 @@ func (b *Bridge) one(ctx context.Context, req rpc.Request, want rpc.EventType) (
 		}
 	}
 	if got == nil {
-		return rpc.Event{}, errors.New("merud sent no " + string(want) + " reply")
+		// %w wraps errNoReply, so a caller can tell with errors.Is that an
+		// older merud answered with some other event.
+		return rpc.Event{}, fmt.Errorf("merud sent no %s reply: %w", want, errNoReply)
 	}
 	return *got, nil
 }
@@ -270,7 +277,7 @@ func changes(op rpc.Op) bool {
 		rpc.OpModelSet, rpc.OpModelUse, rpc.OpModelSave, rpc.OpConnectorAdopt,
 		// Renaming or removing a chat folder rewrites every chat in it.
 		rpc.OpSessionDelete, rpc.OpSessionMove, rpc.OpSessionTag,
-		rpc.OpChatFolderAdd, rpc.OpChatFolderRename, rpc.OpChatFolderRemove:
+		rpc.OpChatFolderAdd, rpc.OpChatFolderRename, rpc.OpChatFolderRemove, rpc.OpTrustedSiteRemove:
 		return true
 	}
 	return false

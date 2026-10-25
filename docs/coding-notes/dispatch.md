@@ -141,7 +141,33 @@ func confirmFor(b Backend, c Call) Confirm {
 }
 ```
 
-The built-ins are the one `CallConfirmer` (see [builtin](builtin.md)). Nothing
+**A scheduled job's calls.** Nobody watches a job, so `approve` treats its calls
+by how they ask. A call that asks once goes to the job's approver, which `merud`
+builds from the job's `allow` list (see [merud](merud.md), jobs.go). A call that
+asks every time is declined without asking anyone: `configure`, `web_fetch` on a
+URL nobody gave, a download, an MCP tool in `always_confirm`. The test is one
+condition: `c.Approve == nil || (c.Source == rpc.SourceJob && confirm != ConfirmAsk)`.
+
+**SiteTruster.** A call that asks every time offers no session choice, since
+that would cover every later call. `web_fetch` can offer something narrower:
+trust for one host. A backend that knows hosts has two more methods:
+
+```go
+type SiteTruster interface {
+    CallSite(c Call) string
+    TrustSite(ctx context.Context, c Call, host string, always bool) error
+}
+```
+
+When `approve` reaches a `ConfirmAlways` call, it asks `CallSite` for the host.
+A host adds the choices `site` and `site_always` between `once` and `deny`, and
+goes in `Approval.Site` so the client can name it. On either answer, `approve`
+calls `TrustSite`, then runs the call. A failed save of `site_always` only logs
+a warning: the user said yes to this call, and the session's trust still holds.
+The interface sits in `dispatch` because `dispatch` calls it, and the URL rules
+stay in the built-ins.
+
+The built-ins are the one `CallConfirmer` and the one `SiteTruster` (see [builtin](builtin.md)). Nothing
 else in `Dispatch` changed: the answer feeds the same `approve`, with the same
 job rule and the same lines.
 
@@ -175,6 +201,16 @@ outside a call.
 `Sources`: the excerpts from your files that `Text` holds, as `rpc.Citation`
 values. `search_files` fills it; every other tool leaves it `nil`. `Dispatch`
 passes it through untouched, and the agent adds it to the turn's sources.
+
+**Result.Images.** `view_image` returns a picture for the model to look at, as
+raw bytes in `Images`, a `[][]byte`: a list of byte slices, one per picture.
+`Dispatch` changes only `Text`, field by field, so `Images` comes back as the
+backend gave it, and it never logs `Images`: the `tool_result` line and the
+`tool_calls` row take `Text` alone. A picture is the user's own file, already on
+disk, and as base64 it would turn every log line into a blob. The agent puts
+`Images` on the tool's message for the model's next round. `TestDispatchImages`
+checks both halves, in an ordinary chat and an incognito one: the result keeps
+the picture, and no line or row holds it, raw or as base64.
 
 Each excerpt needs a number that no other excerpt in the turn has, and only the
 agent knows how many it has handed out. So the agent puts a counter on the
@@ -288,7 +324,7 @@ matter:
 | --- | --- | --- |
 | `ConfirmNever` | never | none |
 | `ConfirmAsk` | unless approved for this session | once, session, deny |
-| `ConfirmAlways` | every time | once, deny |
+| `ConfirmAlways` | every time | once, deny; with a website, once, this website for this chat, always this website, deny |
 
 A job (`Source == "job"`) and a client with no `Approve` function can't say yes, so
 those calls end `declined` without a prompt. An answer the prompt didn't offer
@@ -324,6 +360,17 @@ when the agent set one. The agent sets it for a call named after a skill, such
 as "web-research is a skill, not a tool. Call web_search or web_fetch.", so the
 model can recover in its next round. The call is still denied, with the same
 lines and row as any other.
+
+**A fenced call.** `Call.Offered`, when it isn't nil, lists the tools the call
+may reach. The agent sets it to the round's offer on a turn whose scope the user
+picked, such as "My files". `Dispatch` denies a call to any other tool, even one
+a backend offers and config allows, and the model reads "The tool ... isn't
+offered for this question", or `Call.Hint`. A model can name a tool it wasn't
+shown, from its history or a guess, and the scope promised the user what the
+turn may touch. The check sits in `Dispatch`, with the allowlist, so no second
+place decides what runs (AGENTS.md, non-negotiable 4). Go tells a nil slice from
+an empty one: nil, the zero value, fences nothing, which is what an auto turn
+and every older caller want, while an empty, non-nil slice denies every tool.
 
 **Who made the call.** `Call.Caller` is `CallerMeru` for a call `merud` made
 itself before the model's first round, such as the web search for a question
@@ -363,6 +410,8 @@ be a secret.
 
 ## Go ideas used here
 
+- **Byte slices** — `Result.Images` is a `[][]byte`, and `encoding/json` writes
+  each `[]byte` as base64. More in [go-basics/byte-slices.md](go-basics/byte-slices.md).
 - **Interfaces** — `Backend`, `Auditor`, `Refresher` and `Recorder`, and type
   assertions to find an `Auditor` or a `Refresher`. More in [go-basics/interfaces.md](go-basics/interfaces.md).
 - **`sync.Mutex`** — guards the backend list and the session approvals.

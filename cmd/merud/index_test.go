@@ -19,6 +19,7 @@ import (
 	"github.com/aarora79/meru/internal/config"
 	"github.com/aarora79/meru/internal/engine"
 	"github.com/aarora79/meru/internal/rpc"
+	"github.com/aarora79/meru/internal/store"
 )
 
 // daemon is one merud started by startDaemon.
@@ -141,7 +142,7 @@ func notesDir(t *testing.T, dir string, files map[string]string) string {
 func TestQuestionsDuringStartupScan(t *testing.T) {
 	dir := shortDir(t)
 	notes := notesDir(t, dir, map[string]string{"slow.md": "# Slow\n\n" + holdMarker + " garden plan"})
-	eng := &fakeEngine{version: "0.13.0", hold: make(chan struct{})}
+	eng := &fakeEngine{version: "0.40.5", hold: make(chan struct{})}
 	d := startDaemon(t, dir, indexConfig(notes), eng)
 
 	// The scan starts beside the server and then waits inside Embed, so
@@ -194,7 +195,7 @@ func TestReembedAfterEmbedModelChange(t *testing.T) {
 	dir := shortDir(t)
 	notes := notesDir(t, dir, map[string]string{"a.md": "# A\n\nalpha", "b.md": "# B\n\nbeta", "empty.md": ""})
 
-	d := startDaemon(t, dir, indexConfig(notes), &fakeEngine{version: "0.13.0", dims: 2})
+	d := startDaemon(t, dir, indexConfig(notes), &fakeEngine{version: "0.40.5", dims: 2})
 	waitUntil(t, "the first scan ends", func() bool { return status(t, d.sock).LastScan != nil })
 	first := status(t, d.sock)
 	if first.Documents != 3 || first.Chunks != 2 || first.Vectors != 2 {
@@ -204,19 +205,67 @@ func TestReembedAfterEmbedModelChange(t *testing.T) {
 
 	// The same files, but the embedding model now gives 3 numbers per
 	// vector: the store drops the old vectors, and the startup scan must
-	// embed every file again even though none changed.
-	d = startDaemon(t, dir, indexConfig(notes), &fakeEngine{version: "0.13.0", dims: 3})
+	// embed every file again even though none changed. The empty file has
+	// no chunks, so no vectors to redo, and counts as unchanged.
+	d = startDaemon(t, dir, indexConfig(notes), &fakeEngine{version: "0.40.5", dims: 3})
 	waitUntil(t, "the second scan ends", func() bool { return status(t, d.sock).LastScan != nil })
 	st := status(t, d.sock)
-	if st.Vectors != st.Chunks || st.Chunks != 2 || st.LastScan.Indexed != 3 || st.LastScan.Unchanged != 0 {
+	if st.Vectors != st.Chunks || st.Chunks != 2 || st.LastScan.Indexed != 2 || st.LastScan.Unchanged != 1 {
 		t.Errorf("status after the model change = %+v, last scan %+v; want every file embedded again", st, st.LastScan)
+	}
+}
+
+// TestOpenStorePreservesVectorsAfterLegacyPrefixMetadata checks that openStore
+// records the current prefix hash without rebuilding matching vectors.
+func TestOpenStorePreservesVectorsAfterLegacyPrefixMetadata(t *testing.T) {
+	ctx := context.Background()
+	dir := shortDir(t)
+	cfg := config.Config{Dir: dir, Models: config.Models{Embed: "embeddinggemma-2:440m"}}
+	path := filepath.Join(dir, "meru.db")
+
+	// The old database has vectors but no prefix hash, as it would before
+	// merud recorded the model's query and document prefixes.
+	legacy, err := store.Open(ctx, store.Options{Path: path, EmbedModel: cfg.Models.Embed, Dims: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.ReplaceDocument(ctx,
+		store.Document{Path: filepath.Join(dir, "legacy.md"), MTime: time.Now(), Hash: "legacy", Kind: "markdown"},
+		[]store.Chunk{{Text: "legacy searchable text"}}, []engine.Vector{{1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := openStore(ctx, cfg, &fakeEngine{version: "0.40.5"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := st.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
+	stats, err := st.Stats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := stats, (store.Stats{Documents: 1, Chunks: 1, Vectors: 1}); got != want {
+		t.Errorf("stats after openStore = %+v, want %+v", got, want)
+	}
+	if need, err := st.NeedsReembed(ctx); err != nil || need {
+		t.Errorf("NeedsReembed = %v, %v; want false for matching legacy vectors", need, err)
+	}
+	if hits, err := st.SearchKeyword(ctx, "legacy", 5); err != nil || len(hits) != 1 {
+		t.Errorf("SearchKeyword = %v, %v; want old text retained", hits, err)
 	}
 }
 
 func TestIndexOps(t *testing.T) {
 	dir := shortDir(t)
 	notes := notesDir(t, dir, map[string]string{"a.md": "# A\n\nalpha"})
-	d := startDaemon(t, dir, indexConfig(notes), &fakeEngine{version: "0.13.0"})
+	d := startDaemon(t, dir, indexConfig(notes), &fakeEngine{version: "0.40.5"})
 	waitUntil(t, "the first scan ends", func() bool { return status(t, d.sock).LastScan != nil })
 
 	if err := os.WriteFile(filepath.Join(notes, "b.md"), []byte("# B\n\nbeta"), 0o600); err != nil {
@@ -265,7 +314,7 @@ func TestIndexOps(t *testing.T) {
 
 func TestIndexOpsWithoutFolders(t *testing.T) {
 	dir := shortDir(t)
-	d := startDaemon(t, dir, "", &fakeEngine{version: "0.13.0"})
+	d := startDaemon(t, dir, "", &fakeEngine{version: "0.40.5"})
 	evs := call(t, d.sock, rpc.Request{Op: rpc.OpIndex})
 	if last := evs[len(evs)-1]; last.Type != rpc.EventError || !strings.Contains(last.Error, "no folders to index") {
 		t.Errorf("index without folders = %+v, want an error naming the fix", last)

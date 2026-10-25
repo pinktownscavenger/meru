@@ -34,8 +34,15 @@ func openTest(t *testing.T) *Store {
 
 // openAt opens the store at path and closes it when the test ends.
 func openAt(t *testing.T, path, model string, dims int) *Store {
+	return openAtWithPrefixHash(t, path, model, "", dims)
+}
+
+// openAtWithPrefixHash opens the store with the supplied embedding-prefix hash.
+func openAtWithPrefixHash(t *testing.T, path, model, prefixHash string, dims int) *Store {
 	t.Helper()
-	s, err := Open(context.Background(), Options{Path: path, EmbedModel: model, Dims: dims})
+	s, err := Open(context.Background(), Options{
+		Path: path, EmbedModel: model, EmbedPrefixHash: prefixHash, Dims: dims,
+	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -446,7 +453,7 @@ func TestSearchKeyword(t *testing.T) {
 		{"q3 plan", []int64{1, 2}},
 		{"KESTREL", []int64{3}},
 		{"kestrel", []int64{3}},
-		{"what did I write about the q3 plan?", []int64{1, 2, 3}}, // "the" matches chunk 3 too, ranked last
+		{"what did I write about the q3 plan?", []int64{1, 2}}, // "the" is filler, so chunk 3 no longer matches
 		{"東京", []int64{4}},
 		{"résumé", []int64{4}},
 		{"", nil},
@@ -456,7 +463,7 @@ func TestSearchKeyword(t *testing.T) {
 		{`"`, nil},
 		{`"plan`, []int64{1, 2}},
 		{`plan"`, []int64{1, 2}},
-		{`plan AND`, []int64{2, 1}}, // "and" is a plain word: chunk 2 holds it
+		{`plan AND`, []int64{1, 2}}, // "and" is filler, not FTS5 syntax: "plan" alone ranks them
 		{`OR`, nil},
 		{`NOT plan`, []int64{1, 2}},
 		{`NEAR(plan q3, 2)`, []int64{3, 1, 2}}, // "near" is a plain word too
@@ -500,7 +507,11 @@ func TestFTSQuery(t *testing.T) {
 		{"", ""},
 		{"hello", `"hello"`},
 		{"Q3 plan", `"Q3" OR "plan"`},
-		{`a "quoted" AND b`, `"a" OR "quoted" OR "AND" OR "b"`},
+		{`a "quoted" AND b`, `"quoted" OR "b"`},
+		// Filler words drop out, so a rare name carries the search.
+		{"I think I did some work for Fruitstand, what was it?", `"think" OR "work" OR "Fruitstand"`},
+		// A query of filler alone keeps it all.
+		{"what is it", `"what" OR "is" OR "it"`},
 		{"plan PLAN Plan", `"plan"`},
 		{"NEAR(x*, 2)", `"NEAR" OR "x" OR "2"`},
 		{"e-mail", `"e" OR "mail"`},
@@ -609,6 +620,130 @@ func TestEmbedModelChange(t *testing.T) {
 				t.Error("NeedsReembed still true after re-embedding")
 			}
 		})
+	}
+}
+
+// TestEmbedPrefixChange checks that a new prefix hash drops vectors and keeps
+// keyword search available until the indexer stores new vectors.
+func TestEmbedPrefixChange(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "meru.db")
+	old := openAtWithPrefixHash(t, path, "m1", "old-prefix-hash", testDims)
+	put(t, old, "/n/a.md", []string{"apple", "banana"}, []engine.Vector{unit(0), unit(1)})
+	putMemory(t, old, "people/sam.md", "people", "Sam manages the registry", 20, 0, unit(0))
+	sessionDir := t.TempDir()
+	sessionID := newSession(t, old, sessionDir, at(9, 0, 0), "q", "Planned the garden.")
+	if err := old.SetSessionVector(ctx, sessionID, "Planned the garden.", unit(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A changed prefix invalidates the old vectors but keeps the text searchable.
+	s := openAtWithPrefixHash(t, path, "m1", "new-prefix-hash", testDims)
+	if got, want := stats(t, s), (Stats{Documents: 1, Chunks: 2}); got != want {
+		t.Errorf("stats = %+v, want %+v", got, want)
+	}
+	if need, err := s.NeedsReembed(ctx); err != nil || !need {
+		t.Errorf("NeedsReembed = %v, %v; want true after a prefix change", need, err)
+	}
+	if hits, err := s.SearchKeyword(ctx, "banana", 5); err != nil || len(hits) != 1 {
+		t.Errorf("SearchKeyword = %v, %v; want text kept during re-embedding", hits, err)
+	}
+	if memories, err := s.MemoryIDs(ctx); err != nil || len(memories) != 1 || memories["people/sam.md"].HasVector {
+		t.Errorf("MemoryIDs after prefix change = %+v, %v; want retained memory without its old vector", memories, err)
+	}
+	if hits, err := s.SearchMemoryKeyword(ctx, "registry", 5, nil); err != nil || len(hits) != 1 {
+		t.Errorf("SearchMemoryKeyword = %v, %v; want memory text retained", hits, err)
+	}
+	if summaries, err := s.SummariesWithoutVector(ctx, 10); err != nil || len(summaries) != 1 || summaries[0].Session != sessionID {
+		t.Errorf("SummariesWithoutVector after prefix change = %+v, %v; want retained summary without its old vector", summaries, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopening after an interrupted re-embed must leave the missing vectors
+	// discoverable so the existing sync path can resume.
+	s = openAtWithPrefixHash(t, path, "m1", "new-prefix-hash", testDims)
+	if need, err := s.NeedsReembed(ctx); err != nil || !need {
+		t.Errorf("NeedsReembed after restart = %v, %v; want true", need, err)
+	}
+	if memories, err := s.MemoryIDs(ctx); err != nil || memories["people/sam.md"].HasVector {
+		t.Errorf("MemoryIDs after interrupted re-embed = %+v, %v; want memory still pending", memories, err)
+	}
+	if summaries, err := s.SummariesWithoutVector(ctx, 10); err != nil || len(summaries) != 1 {
+		t.Errorf("SummariesWithoutVector after interrupted re-embed = %+v, %v; want summary still pending", summaries, err)
+	}
+
+	if err := s.ReplaceDocument(ctx, doc("/n/a.md"),
+		[]Chunk{{Text: "apple"}, {Text: "banana"}}, []engine.Vector{unit(0), unit(1)}); err != nil {
+		t.Fatal(err)
+	}
+	putMemory(t, s, "people/sam.md", "people", "Sam manages the registry", 20, 0, unit(0))
+	if err := s.SetSessionVector(ctx, sessionID, "Planned the garden.", unit(1)); err != nil {
+		t.Fatal(err)
+	}
+	if need, err := s.NeedsReembed(ctx); err != nil || need {
+		t.Errorf("NeedsReembed after re-embedding = %v, %v; want false", need, err)
+	}
+	if memories, err := s.MemoryIDs(ctx); err != nil || !memories["people/sam.md"].HasVector {
+		t.Errorf("MemoryIDs after re-embedding = %+v, %v; want memory vector restored", memories, err)
+	}
+	if summaries, err := s.SummariesWithoutVector(ctx, 10); err != nil || len(summaries) != 0 {
+		t.Errorf("SummariesWithoutVector after re-embedding = %+v, %v; want no pending summaries", summaries, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The same prefix fingerprint must preserve the completed vectors on the
+	// next restart instead of scheduling another full re-embed.
+	s = openAtWithPrefixHash(t, path, "m1", "new-prefix-hash", testDims)
+	if got, want := stats(t, s), (Stats{Documents: 1, Chunks: 2, Vectors: 2}); got != want {
+		t.Errorf("stats after restart = %+v, want %+v", got, want)
+	}
+	if need, err := s.NeedsReembed(ctx); err != nil || need {
+		t.Errorf("NeedsReembed after completed restart = %v, %v; want false", need, err)
+	}
+	if memories, err := s.MemoryIDs(ctx); err != nil || !memories["people/sam.md"].HasVector {
+		t.Errorf("MemoryIDs after completed restart = %+v, %v; want memory vector preserved", memories, err)
+	}
+	if summaries, err := s.SummariesWithoutVector(ctx, 10); err != nil || len(summaries) != 0 {
+		t.Errorf("SummariesWithoutVector after completed restart = %+v, %v; want no pending summaries", summaries, err)
+	}
+}
+
+func TestLegacyMissingPrefixHashKeepsVectors(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "meru.db")
+	legacy, err := Open(ctx, Options{Path: path, EmbedModel: "m1", Dims: testDims})
+	if err != nil {
+		t.Fatal(err)
+	}
+	put(t, legacy, "/n/a.md", []string{"apple", "banana"}, []engine.Vector{unit(0), unit(1)})
+	if _, err := legacy.db.ExecContext(ctx, `DELETE FROM meta WHERE key = 'embed_prefix_hash'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	const prefixHash = "current-prefix-hash"
+	s := openAtWithPrefixHash(t, path, "m1", prefixHash, testDims)
+	if got, want := stats(t, s), (Stats{Documents: 1, Chunks: 2, Vectors: 2}); got != want {
+		t.Errorf("stats after opening legacy database = %+v, want %+v", got, want)
+	}
+	if need, err := s.NeedsReembed(ctx); err != nil || need {
+		t.Errorf("NeedsReembed = %v, %v; want false", need, err)
+	}
+	var gotPrefixHash string
+	if err := s.db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = 'embed_prefix_hash'`).Scan(&gotPrefixHash); err != nil {
+		t.Fatal(err)
+	}
+	if gotPrefixHash != prefixHash {
+		t.Errorf("stored prefix hash = %q, want %q", gotPrefixHash, prefixHash)
 	}
 }
 

@@ -43,11 +43,11 @@ const (
 // attachment tool reports, as it stands.
 const attachmentsFolder = "attachments"
 
-// IsFileTool reports whether name is one of the four file tools: the three
-// here and search_files. The agent offers these alone on the "search"
-// route.
+// IsFileTool reports whether name is one of the six file tools: the three
+// here, search_files, search_images and view_image. The agent offers these
+// alone on the "search" route.
 func IsFileTool(name string) bool {
-	return name == ReadFile || name == ListFolder || name == Grep || name == SearchFiles
+	return name == ReadFile || name == ListFolder || name == Grep || name == SearchFiles || name == SearchImages || name == ViewImage
 }
 
 // Limits on what one call returns. dispatch cuts any result at 16,000

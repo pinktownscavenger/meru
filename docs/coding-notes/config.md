@@ -1,6 +1,6 @@
 # config
 
-**Code:** `internal/config/` (`config.go`, `load.go`, `template.go`, `template.toml`, `known.go`, `recommend.go`, `loopback.go`)
+**Code:** `internal/config/` (`config.go`, `load.go`, `template.go`, `template.toml`, `known.go`, `embed.go`, `recommend.go`, `ollama.go`, `loopback.go`)
 **Milestone:** v0.1
 **Architecture:** [Model tiers](../../ARCHITECTURE.md#model-tiers), [Observability](../../ARCHITECTURE.md#observability), [Web search](../../ARCHITECTURE.md#web-search), [Approving a tool call](../../ARCHITECTURE.md#approving-a-tool-call), [Skills](../../ARCHITECTURE.md#skills), [First run and setup](../../ARCHITECTURE.md#first-run-and-setup)
 
@@ -46,9 +46,12 @@ type Ollama struct {
 }
 ```
 
-`ContextLength` defaults to 32768, the context the benchmark ran with; `Load`
+`ContextLength` defaults to 32768, the context the benchmark ran with. It is the
+least the answer model gets, since `merud` gives it more when Ollama reports its
+size and memory allows, and what every other model gets. `Load`
 refuses a value from 1 to 2047, too small for even the system prompt, and 0
-leaves Ollama's own setting.
+leaves Ollama's own setting. The agent reads it too: past 80% of it, a turn
+shortens its oldest tool results (see [agent](agent.md), "The context window").
 
 A **struct** is a named group of fields, like a Python dataclass. The text in
 backticks is the tag. More in [go-basics/struct-tags.md](go-basics/struct-tags.md).
@@ -96,8 +99,15 @@ type Web struct {
     SearXNGURL string `toml:"searxng_url"` // default "http://127.0.0.1:8888"; "" turns web_search off
     MaxResults int    `toml:"max_results"` // default 8, at most MaxWebResults (20)
     Render     string `toml:"render"`      // RenderAuto ("auto", the default) or RenderOff ("off")
+    TrustedSites []string `toml:"trusted_sites"` // hosts web_fetch reads without asking; default none
 }
 ```
+
+`[observability] prometheus` is a `host:port`, not a URL, since `merud` listens
+there rather than connects. `checkPrometheus` splits it with
+`net.SplitHostPort`, wants a port from 1 to 65535 and a host, and runs
+`http://` plus the address through `loopback.CheckURL`, so `0.0.0.0:9464` or a
+LAN address stops `merud` with the key named. An empty value turns the page off.
 
 `validate` runs `searxng_url` through the same `loopback.CheckURL` as the Ollama
 and OTLP addresses, because `merud` connects to it. It skips the check for an
@@ -112,6 +122,16 @@ JavaScript. With `"auto"`, it loads such a page in a headless Chrome that
 HTML alone (see [builtin](builtin.md)). `web_fetch` and `validate` both use
 the constants `RenderAuto` and `RenderOff` for the two values. `validate`
 refuses any other value and names both.
+
+`trusted_sites` lists the websites `web_fetch` reads without asking, in every
+session. "Always allow" at the prompt adds a host, through `merud`. Each entry
+must pass `CheckTrustedSite`: a bare host name in lower case, with at least one
+dot, no scheme, path, port or wildcard, and no IP address, `localhost`, or name
+under `.localhost` or `.local`. Those last ones are this machine or the local
+network, which `web_fetch` refuses anyway, and `net/netip.ParseAddr` spots an
+address. A wildcard would trust hosts the user never saw, so the check refuses
+`*`. Adding the slice made `Web` a type Go can't compare with `==`, so the tests
+compare it with `reflect.DeepEqual`.
 
 `Chat` is the `[chat]` section, which only `meru chat` reads; `merud` loads it
 with the rest and ignores it:
@@ -133,7 +153,7 @@ keeps the client thin.
 
 ```go
 type Builtin struct {
-    Tools   []string `toml:"tools"`   // default: all eleven, from BuiltinTools()
+    Tools   []string `toml:"tools"`   // default: all seventeen, from BuiltinTools()
     Confirm []string `toml:"confirm"` // default ["write_file"]
 }
 ```
@@ -222,6 +242,14 @@ reports the unknown profile. `ProfileModels(name)` hands out one profile's
 models, and `false` for a name it doesn't know; `meru setup` calls it to
 download a profile's models before any `config.toml` exists.
 
+`speechModels` maps each profile to its speech-to-text model, the file the
+`whisper` connector downloads: `ggml-base.en.bin` for `lite` and
+`ggml-large-v3-turbo-q5_0.bin` for `full`. `cfg.SpeechModel()` reads it, and
+`merud` passes it to the connector as its `model` field's default. It sits
+beside `profiles` rather than in `Models` because the model is the
+connector's setting, `[connectors.whisper] model`, not an Ollama tier, so
+`[models]` gains no key.
+
 `validate` collects every problem before it returns, so the user fixes them all
 in one pass:
 
@@ -238,6 +266,12 @@ return errors.Join(errs...)
 read and change the outer function's variables (`errs` here). `errors.Join`
 glues the errors together and returns `nil` when the list is empty.
 
+`[index] images`, a plain bool that defaults to true, lets the indexer read
+PNG, JPEG, GIF and WebP files. It takes effect only with an embedding model
+whose `EmbedModel.Images` is set: `merud` passes the indexer
+`cfg.Index.Images && config.FindEmbedModel(cfg.Models.Embed).Images`, so
+`nomic-embed-text` keeps images out whatever the key says.
+
 `checkIndex` also checks `[index] retrieval`: `"auto"`, the default, or
 `"agentic"`, the two constants `RetrievalAuto` and `RetrievalAgentic`. Agentic
 retrieval runs no search before the answer, so `validate` refuses it when
@@ -246,7 +280,7 @@ meaning altogether and keep only `grep` (see
 [Retrieval](../../ARCHITECTURE.md#retrieval)).
 
 `checkBuiltin` adds two rules for `[builtin]`. A name in `tools` must be one of
-the eleven in `builtinTools`, and the message lists them. A name in `confirm` must
+the seventeen in `builtinTools`, and the message lists them. A name in `confirm` must
 also be in `tools`; otherwise the confirm line would do nothing, which is
 almost always a typo. `builtinTools` lives here, not in `internal/builtin`,
 because `builtin` imports `config` and Go refuses an import cycle. A test in
@@ -407,6 +441,37 @@ The table sits here, next to `profiles`, so a change of default models changes
 one file and the installer follows. The memory lines come from the benchmark's
 peak memory. `TestRecommend` checks each size of Mac.
 
+### embed.go
+
+`EmbedModels` lists the embedding models Meru knows something about beyond
+their name: each one's task prefixes, from its model card, and the context to
+load it with. Today that is `embeddinggemma-2:440m`. `FindEmbedModel(name)`
+returns the entry, or the zero `EmbedModel` for a model not listed, which then
+gets plain text and Ollama's own context. `merud`'s `newEngine` copies the
+entry into the engine's `EmbedPrompts` and `EmbedContext`. The prefixes live
+here, beside the model's name, because a wrong or missing prefix makes search
+worse with no error, and a model that wants none must get none. `PrefixFingerprint`
+computes a SHA-256 digest over both prefix strings and their lengths. A change to
+either prefix changes the digest that `merud` passes to the store.
+
+### ollama.go
+
+`MinOllama` is the oldest Ollama Meru runs on, 0.40.5: the first release
+tested to serve `embeddinggemma-2` and to embed images. `merud`, `meru setup`
+and the Mac installer all check it, and none of them may import `engine`, so the
+check lives here, where all three may reach it:
+
+```go
+ok, err := config.OllamaAtLeast("0.34.0") // false, nil
+msg := config.OllamaTooOld("0.34.0")
+// "Ollama 0.34.0 is too old for Meru's search model. Update it from ollama.com/download."
+```
+
+`VersionAtLeast` compares number by number, so `0.40.5` beats `0.9.99`, which
+a plain string comparison gets wrong. `parseVersion` drops a leading `v` and
+anything after `-` or `+`, so `0.40.5-rc1` counts as 0.40.5, and returns a
+`[3]int`, an array whose length is part of its type.
+
 ### loopback.go
 
 `checkLoopbackURL` refuses any Ollama or OTLP address that could reach another
@@ -427,6 +492,32 @@ if !addr.Unmap().IsLoopback() { ... }
   `127.0.0.1`, so both spellings get the same answer.
 - `0.0.0.0` and `::` are refused. They mean "every interface" when listening,
   never "this machine" when connecting.
+
+### jobs.go: [[jobs]]
+
+`Job` is one `[[jobs]]` entry: `name`, `schedule`, `every_weeks`, `from`, the
+action (`prompt` with an optional `skill`, or `command` with its `args`),
+`allow`, `output` and `enabled`. `checkJobs` runs from `validate` and reports
+each problem with the job's name and key:
+
+- a name that isn't lower-case letters, digits, `-` and `_`, or one used twice;
+- a schedule `jobs.Parse` refuses;
+- neither a prompt nor a command, or both; a prompt over 4,000 characters;
+- a skill with a command, or one `[skills] disabled` turns off;
+- a command that isn't a `[[commands]]` entry, or `args` without a command;
+- `configure` or `schedule_job` in `allow`, which change Meru itself;
+- an `output` that is absolute, starts with `~`, leaves the folder with `..`, or
+  holds a placeholder other than `{date}`, `{time}` and `{job}`
+  (`checkOutput`), or `output` with `write_file` off in `[builtin] tools`;
+- more than `MaxJobs` (50) jobs, which keeps the metric's `job` attribute a
+  small set.
+
+`Enabled` is a `*bool`, a pointer, so a missing key reads as `nil` and `On()` can
+tell "not set" (on) from `false` (paused). `CheckJobs` runs the same checks on a
+`Config` and joins the problems into one error with `errors.Join`; `merud` calls
+it on a job a form hasn't saved yet. `JobsFolder` names the chat folder the
+runs go in. config imports `internal/jobs` for `Parse`, which imports only the
+standard library.
 
 ## Go ideas used here
 

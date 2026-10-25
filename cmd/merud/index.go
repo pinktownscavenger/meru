@@ -300,6 +300,12 @@ func (s searchAdapter) SearchFiles(ctx context.Context, query string, limit int)
 	return retrieve.Search(ctx, s.st, s.eng, query, retrieve.Options{TopN: limit})
 }
 
+// SearchImages finds the n indexed images nearest to q, for search_images
+// and for a turn with an attached image.
+func (s searchAdapter) SearchImages(ctx context.Context, q retrieve.ImageQuery, n int) ([]retrieve.Result, error) {
+	return retrieve.SearchImages(ctx, s.st, s.eng, q, n)
+}
+
 // SearchSessions recalls the n past sessions that best match query,
 // leaving out the session excludeSession.
 func (s searchAdapter) SearchSessions(ctx context.Context, query, excludeSession string, n int) ([]retrieve.SessionResult, error) {
@@ -311,7 +317,7 @@ func (s searchAdapter) SearchSessions(ctx context.Context, query, excludeSession
 // size in config, means a new embedding model can't leave a stale number
 // behind.
 func embedDims(ctx context.Context, eng engine.Engine) (int, error) {
-	vecs, err := eng.Embed(ctx, []string{"How many numbers are in this vector?"})
+	vecs, err := eng.Embed(ctx, engine.Texts("How many numbers are in this vector?"))
 	if err != nil {
 		return 0, fmt.Errorf("embed a probe text: %w", err)
 	}

@@ -69,6 +69,48 @@ func (s *Store) SearchKeyword(ctx context.Context, query string, k int) ([]Hit, 
 	return hits, nil
 }
 
+// SearchVectorKind is SearchVector limited to documents of one kind, such
+// as "image" for "find images like this". It is one query: the join to
+// documents filters by kind, so no lookup runs per hit.
+func (s *Store) SearchVectorKind(ctx context.Context, v engine.Vector, kind string, k int) ([]Hit, error) {
+	if len(v) != s.dims {
+		return nil, fmt.Errorf("vector search: query has %d dimensions, want %d", len(v), s.dims)
+	}
+	if k <= 0 {
+		return nil, nil
+	}
+	hits, err := s.hits(ctx,
+		`SELECT v.chunk_id, vec1_l2_distance(v.vector, ?1) / 2 AS distance
+		 FROM chunk_vec v
+		 JOIN chunks c ON c.id = v.chunk_id
+		 JOIN documents d ON d.id = c.doc_id
+		 WHERE d.kind = ?2
+		 ORDER BY distance, v.chunk_id LIMIT ?3`, encodeVector(v), kind, k)
+	if err != nil {
+		return nil, fmt.Errorf("vector search: %w", err)
+	}
+	return hits, nil
+}
+
+// SearchKeywordKind is SearchKeyword limited to documents of one kind, in
+// one query, the same way.
+func (s *Store) SearchKeywordKind(ctx context.Context, query, kind string, k int) ([]Hit, error) {
+	match := ftsQuery(query)
+	if match == "" || k <= 0 {
+		return nil, nil
+	}
+	hits, err := s.hits(ctx,
+		`SELECT chunk_fts.rowid, chunk_fts.rank FROM chunk_fts
+		 JOIN chunks c ON c.id = chunk_fts.rowid
+		 JOIN documents d ON d.id = c.doc_id
+		 WHERE chunk_fts MATCH ? AND d.kind = ?
+		 ORDER BY chunk_fts.rank, chunk_fts.rowid LIMIT ?`, match, kind, k)
+	if err != nil {
+		return nil, fmt.Errorf("keyword search: %w", err)
+	}
+	return hits, nil
+}
+
 // hits runs a query that returns (chunk ID, score) rows, best first, and
 // numbers them from rank 0.
 func (s *Store) hits(ctx context.Context, query string, args ...any) ([]Hit, error) {
@@ -99,11 +141,29 @@ func (s *Store) hits(ctx context.Context, query string, args ...any) ([]Hit, err
 //
 // OR rather than FTS5's default AND: a question such as "what did I note
 // about the Q3 launch" should find a chunk that says "Q3 launch" without
-// the words "what", "did" and "note". BM25 already scores common words low.
+// the words "what", "did" and "note".
+//
+// It leaves out filler words such as "I", "did", "what" and "it" (see
+// filler), unless the text holds nothing else. BM25 scores a common word
+// low, but with OR every word still counts, and in testing "I think I did
+// some work for Fruitstand, what was it?" ranked long notes full of
+// "I", "it" and "was" above the six chunks that name Fruitstand; without
+// the filler they came first.
 func ftsQuery(text string) string {
 	words := strings.FieldsFunc(text, func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && !unicode.IsMark(r)
 	})
+	// Keep the words that carry meaning; a query of filler alone, such as
+	// "what is it", keeps them all rather than search for nothing.
+	var kept []string
+	for _, w := range words {
+		if !filler(strings.ToLower(w)) {
+			kept = append(kept, w)
+		}
+	}
+	if len(kept) > 0 {
+		words = kept
+	}
 	seen := map[string]bool{}
 	var terms []string
 	for _, w := range words {
@@ -121,6 +181,28 @@ func ftsQuery(text string) string {
 		}
 	}
 	return strings.Join(terms, " OR ")
+}
+
+// filler reports whether w, in lower case, is a common English word that
+// says little about what a passage is about: pronouns, articles, the forms
+// of "be", "do" and "have", question words, and short linking words. A
+// switch holds the list, so the package keeps no word list it could change.
+func filler(w string) bool {
+	switch w {
+	case "a", "an", "the", "and", "or", "but", "if", "so", "of", "to", "in", "on",
+		"at", "by", "for", "from", "with", "about", "as", "into", "than", "then",
+		"i", "me", "my", "mine", "we", "us", "our", "you", "your", "he", "him",
+		"his", "she", "her", "it", "its", "they", "them", "their", "this", "that",
+		"these", "those", "there", "here",
+		"is", "am", "are", "was", "were", "be", "been", "being",
+		"do", "does", "did", "done", "have", "has", "had",
+		"can", "could", "will", "would", "shall", "should", "may", "might", "must",
+		"what", "which", "who", "whom", "whose", "when", "where", "why", "how",
+		"some", "any", "all", "again", "also", "just", "very", "too", "not", "no",
+		"please", "tell", "show", "give":
+		return true
+	}
+	return false
 }
 
 // Chunks loads the chunks with the given IDs, in the order of ids, each with

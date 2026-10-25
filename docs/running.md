@@ -1,10 +1,11 @@
 # Running Meru
 
 This guide takes you from nothing to asking Meru a question, then covers settings,
-indexing your files, running it as a service, the dashboard, and fixing common
-problems. It covers questions, streamed answers, your files, memory, web search
-through a SearXNG you run, and tools from MCP servers and A2A agents you allow.
-Scheduled jobs arrive in a later milestone ([ROADMAP.md](../ROADMAP.md)). For a short answer to one question, such as how
+indexing your files, running it as a service, the Usage page, and fixing common
+problems. It describes v0.3: questions, streamed answers, session transcripts,
+routing, answers from your own files with citations, web search through a
+SearXNG you run, and tools from MCP servers and A2A agents you allow. Memory and scheduled jobs arrive in later milestones
+([ROADMAP.md](../ROADMAP.md)). For a short answer to one question, such as how
 to let Meru run a command, start at the [FAQ](faq/index.md).
 
 ## 1. Install the prerequisites
@@ -15,25 +16,25 @@ What you need depends on how you install:
   no Go. Download it from <https://go.dev/dl/>, or on
   macOS run `brew install go`. Check with `go version`. The repo pins Go 1.26.6;
   if yours is older, `go` downloads 1.26.6 by itself the first time you build.
-- **Ollama 0.12.11 or later**, to run the models. Download it from
+- **Ollama 0.40.5 or later**, to run the models. Download it from
   <https://ollama.com/download>. It runs in the background and listens on
   `http://127.0.0.1:11434`. Check with `curl http://127.0.0.1:11434/api/version`.
-  `merud` answers no question with an older Ollama, because the router needs
-  log probabilities, which Ollama added in 0.12.11; it stays up and says so.
+  `merud` answers no question with an older Ollama, because older releases
+  can't serve Meru's search model; it stays up and says so.
 - **Podman or Docker**, only for web search. Meru searches the web through
   SearXNG, which runs in a container (see [Web search](#web-search)). Meru runs
-  without either one. The Ubuntu installer prefers working rootless Podman and
-  falls back to working Docker; it installs neither. Meru's managed SearXNG
-  connector uses Docker. On macOS, Docker Desktop, OrbStack or Colima provides
-  it; check with `docker info`.
+  without either one; the model just doesn't get `web_search`. The Ubuntu
+  installer prefers working rootless Podman and falls back to working Docker; it
+  installs neither. Meru's managed SearXNG connector uses Docker. On macOS,
+  Docker Desktop, OrbStack or colima provides `docker`; check with `docker info`.
 
 ## 2. Download the models
 
-The default `lite` profile uses two small models, about 2 GB in total:
+The default `lite` profile uses two small models, about 2.3 GB in total:
 
 ```sh
 ollama pull hf.co/openbmb/MiniCPM5-2B-GGUF:Q4_K_M   # answers and routes questions
-ollama pull nomic-embed-text                         # embeddings, for searching your files
+ollama pull embeddinggemma-2:440m                    # embeddings, for searching your files
 ```
 
 `meru setup` (step 8) can run these downloads for you once Meru is built.
@@ -42,7 +43,6 @@ For the `full` profile (Apple silicon with 64 GB or more), also pull:
 
 ```sh
 ollama pull qwen3.6:35b-a3b-mxfp8   # 38 GB, writes the answers
-ollama pull qwen3-embedding:0.6b
 ```
 
 ### Which model for which Mac
@@ -54,7 +54,7 @@ your apps:
 
 | Memory | Answer model | Download |
 | --- | --- | --- |
-| 16 GB | MiniCPM5-2B, the `lite` default | about 2 GB with `nomic-embed-text` |
+| 16 GB | MiniCPM5-2B, the `lite` default | about 2.3 GB with `embeddinggemma-2:440m` |
 | 32 GB | `gemma4:26b-a4b-it-qat` | 15 GB more |
 | 48 GB | `qwen3.6:35b`, the same Qwen model at 4 bits | 23 GB more |
 | 64 GB or more | `qwen3.6:35b-a3b-mxfp8`, the `full` profile; `gemma4:26b-mxfp8` for work across several tools | 38 GB, or 28 GB |
@@ -269,7 +269,7 @@ checked by Apple, so the first time macOS refuses to open it: click Done, then
 Open Anyway in System Settings, Privacy & Security. "Read me first.txt" on the
 disk image says the same.
 
-The installer walks through ten steps. Each screen says what the step does, why,
+The installer walks through eleven steps. Each screen says what the step does, why,
 and what it downloads, and waits for Continue. It shows progress as it goes, and a
 step that fails says why and offers Retry and Skip.
 
@@ -281,6 +281,7 @@ step that fails says why and offers Retry and Skip.
 | Folders to search | shows Documents, Desktop and Notes with their file counts; tick the ones Meru may read, or add any folder |
 | Web search | turns web search on; in the last step `merud` downloads SearXNG at its pinned version and runs it in Docker as the container `meru-searxng`, on `127.0.0.1:8888` only. A SearXNG that already answers there stays as it is. Needs Docker Desktop, OrbStack or colima; without one, the screen links Docker's download page and you can skip |
 | Obsidian notes | asks for your vault folder with the folder dialog; in the last step `merud` installs the Obsidian server with its own Node. An `obsidian` entry you set up yourself stays as it is, or moves over to Meru if you pick Adopt |
+| Apple Notes | turns on `search_notes`, `list_notes` and `read_note`, and has two buttons: one opens the Full Disk Access list in System Settings, the other shows `merud` in Finder, to drag into that list. macOS never asks for this access; see [Apple Notes](faq/apple-notes.md) |
 | Skills and commands | turns the built-in skills on and adds the sample commands you tick, all read-only |
 | Gmail, Calendar and Drive | steps 1 to 5 of [google-setup.md](google-setup.md), in three screens: it links each Google Cloud page and takes your address, client ID and secret. In the last step `merud` installs and runs the Google server. A `google` entry you set up yourself stays as it is, or moves over if you pick Adopt |
 | About you | your name, which Meru needs to tell you apart from people in your files; your email, needed after the Google step; how you like answers |
@@ -478,7 +479,7 @@ The index part counts the files Meru searches, the vectors it holds for them, an
 the size of `meru.db` on disk; `· indexing` follows while a scan runs. Then comes
 the number of memories, and `· no profile` while Meru knows nothing about you. On
 the right, a wide terminal shows the last hour's use, such as
-`1h: 4 questions · 18k in · 2.1k out`, then a scope you set with `/scope`, in
+`1h: 4 tasks · 18k in · 2.1k out`, then a scope you set with `/scope`, in
 amber, then the model set in use, then whether `merud` is running. A narrow one drops the last hour first, then the vectors,
 size and memory count. The model set stays.
 
@@ -728,7 +729,7 @@ the list. They run at once, even while an answer runs, and never reach the model
 | `/save` | Save to a note on the newest answer; `/save chat` is Share as file |
 | `/used` | opens the side panel for the newest answer |
 | `/copy N` | copies code block N of this chat; `/copy` alone copies the newest answer's last block, and `/copy answer` the whole answer |
-| `/usage` | opens Settings, Usage |
+| `/usage` | opens the Usage screen |
 | `/me` | opens Settings, About you |
 | `/mcp` | opens Settings, Connections |
 | `/folders` | opens Settings, Folders |
@@ -1077,7 +1078,7 @@ meru usage
 ```text
                   1h   today     week   month     30d     all
 sessions           1       2        5      12      14      30
-questions          4       9       31      88      97     212
+tasks              4       9       31      88      97     212
 tokens in        18k     41k     150k    420k    468k    1.4M
 tokens out      2.1k    5.3k      19k     61k     66k    180k
 active time   2m 14s  5m 01s  20m 10s  1h 01m  1h 07m  3h 05m
@@ -2384,25 +2385,25 @@ PAM creates the user manager. On a headless server, enable lingering only if the
 service should run with no login session; the installer offers the exact command
 and asks first.
 
-## 10. Watch it on a dashboard (optional)
+## 10. See how you use Meru
 
-`merud` can send its metrics and traces to a local Grafana stack, which runs in
-one Docker container. The setup takes one command and one line in
-`~/.meru/config.toml`:
+The Usage button at the foot of the desktop app's rail and `/usage` in `meru chat`
+show how much you use Meru, with charts of tasks, tokens and time to first token
+per day, the slowest tasks of the week and the tools whose calls failed. They read `meru.db`, so
+they need nothing else running.
 
-```sh
-docker compose -f deploy/observability/compose.yaml up -d
-```
+To read the same numbers in a Prometheus you run, take the `# ` off the
+`prometheus` line under `[observability]` in `~/.meru/config.toml`, or add the
+line if your file is older, and restart `merud`:
 
 ```toml
 [observability]
-otlp_endpoint = "http://127.0.0.1:4318"
+prometheus = "127.0.0.1:9464"
 ```
 
-Restart `merud` and open <http://127.0.0.1:3000> (user `admin`, password
-`admin`). [observability.md](observability.md) walks through each step, says which
-dashboard to open for what, explains empty panels, shows how to query the metrics
-from the command line, and how to find one question's trace.
+`merud` then serves its metrics at <http://127.0.0.1:9464/metrics>, on this
+machine only. [observability.md](observability.md) shows the Prometheus scrape
+job, queries to try, and how to send traces to a collector you run.
 
 ## 11. Update to a newer version
 
@@ -2493,6 +2494,17 @@ session:
 {"id": "work", "category": "session", "session": "topics", "question": "What work did I do on the bakery site?", "want": {"sources_none": ["lisbon"]}}
 ```
 
+A question can send a picture with it, as `meru -image` does: put the
+picture's path in `"image"`, with `~/` for your home folder. A picture `merud`
+won't take, or one that isn't there, fails that question and the rest still run.
+A follow-up in the same session can ask about the pictures the first answer
+found:
+
+```json
+{"id": "like-this", "category": "images", "session": "receipts", "image": "~/Pictures/receipt.jpg", "question": "Find receipts like this one in my folders", "want": {"sources_any": [".jpg", ".png"]}}
+{"id": "itemize", "category": "images", "session": "receipts", "question": "Itemize each of those receipts and total them", "want": {"tools": ["view_image"]}}
+```
+
 Every field in `want` is optional. A question passes when each field it sets
 passes. Text matches ignore case.
 
@@ -2541,7 +2553,7 @@ later.
 | --- | --- |
 | `connect to merud at …: … (is merud running?)` | `merud` isn't running, or it uses a different socket. Start `merud`, or pass `-socket` to `meru`. |
 | `Ollama isn't running, so Meru can't answer yet.` | `merud` runs but can't reach Ollama. Start Ollama (open the app, or run `ollama serve`) and check `curl http://127.0.0.1:11434/api/version`. `merud` checks again every 30 seconds, and at once when you ask something, then loads the models. `meru mcp status` and the desktop app's status block show the same sentence. |
-| `Meru can't answer yet: Ollama … is too old` | Update Ollama to 0.12.11 or later. `merud` notices within 30 seconds. |
+| `Meru can't answer yet: Ollama … is too old for Meru's search model` | Update Ollama to 0.40.5 or later from ollama.com/download. `merud` notices within 30 seconds. |
 | `model … not found` in the answer or the log | Pull the model named in the error with `ollama pull`. |
 | `secrets … so other users can read it; run chmod 600 …` | Run the `chmod 600` command in the message. `meru mcp add` also fixes the mode when it saves a key. |
 | `merud` says another merud is running | One `merud` per socket. Stop the other one, or give this one its own `-config` home. |

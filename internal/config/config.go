@@ -42,6 +42,9 @@ type Config struct {
 	// Commands lists the local programs the model may run, one tool each
 	// (v0.3). The commands package checks them when merud starts.
 	Commands []Command `toml:"commands"`
+	// Jobs lists the scheduled jobs merud runs (v0.5); see jobs.go and
+	// ARCHITECTURE.md, "Scheduler".
+	Jobs []Job `toml:"jobs"`
 	// Connectors holds one [connectors.<id>] table per connector: whether
 	// it is on, and the values the user gave for its fields. Nothing
 	// reads it yet; the connector supervisor will (ARCHITECTURE.md,
@@ -165,6 +168,11 @@ type Observability struct {
 	Traces bool `toml:"traces"`
 	// CaptureContent puts prompt and response text into spans. Off by default.
 	CaptureContent bool `toml:"capture_content"`
+	// Prometheus is the loopback address, host:port such as
+	// 127.0.0.1:9464, where merud serves its metrics for Prometheus at
+	// /metrics. Empty, the default, serves nothing. A non-loopback host is
+	// refused.
+	Prometheus string `toml:"prometheus"`
 }
 
 // Log controls merud.log.
@@ -196,6 +204,12 @@ type Index struct {
 	// Watch re-indexes a file as soon as it changes while merud runs. Default
 	// true. merud also rescans every folder at startup.
 	Watch bool `toml:"watch"`
+	// Images indexes the PNG, JPEG, GIF and WebP files in these folders, so
+	// a question can find a picture. Default true. It takes effect only with
+	// an embedding model that takes images (EmbedModel.Images); merud
+	// passes the indexer the two together. Images go to Ollama on this
+	// machine to be embedded, and nowhere else.
+	Images bool `toml:"images"`
 	// Retrieval says how a turn finds text in these folders. "auto", the
 	// default, searches before the model answers on the search routes and
 	// also offers the search_files tool. "agentic" skips that search and
@@ -294,7 +308,7 @@ type Skills struct {
 // whatever Confirm says.
 type Builtin struct {
 	// Tools lists the built-in tools the model may use. A tool left out
-	// isn't registered at all. Default: all eleven, as BuiltinTools returns
+	// isn't registered at all. Default: all seventeen, as BuiltinTools returns
 	// them. A listed tool whose setting is missing, such as the file tools
 	// with no [index] folders, still stays off.
 	Tools []string `toml:"tools"`
@@ -319,6 +333,12 @@ type Web struct {
 	// installs on first need; RenderOff reads the HTML alone. Default
 	// RenderAuto. See ARCHITECTURE.md, "Pages that need JavaScript".
 	Render string `toml:"render"`
+	// TrustedSites lists the hosts web_fetch reads without asking, in
+	// every session, such as "raw.githubusercontent.com": the ones the
+	// user picked "Always this website" for. Each is a bare host name, in
+	// lower case, with no scheme, path, port or wildcard. Downloads still
+	// ask. See ARCHITECTURE.md, "Web search".
+	TrustedSites []string `toml:"trusted_sites"`
 }
 
 // The values [web] render takes.

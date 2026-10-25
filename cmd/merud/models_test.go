@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aarora79/meru/internal/agent"
 	"github.com/aarora79/meru/internal/config"
 	"github.com/aarora79/meru/internal/engine"
 	"github.com/aarora79/meru/internal/rpc"
@@ -87,7 +88,7 @@ var testSets = []config.ModelSet{
 // the sets testSets.
 func testModelService(t *testing.T, pulled, loaded []string, caps map[string][]string) (*modelService, *fixedAnswer, *fakeollama.Server) {
 	t.Helper()
-	srv := fakeollama.Start(t, fakeollama.Config{Version: "0.34.0", Models: pulled, Loaded: loaded, Capabilities: caps})
+	srv := fakeollama.Start(t, fakeollama.Config{Version: "0.40.5", Models: pulled, Loaded: loaded, Capabilities: caps})
 	eng, err := engine.NewOllama(srv.URL, "-1", "nomic-embed-text", nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -118,7 +119,7 @@ var everyModel = []string{miniCPM, qwen, gemma, qwenMoE, gemmaMoE, "nomic-embed-
 func TestModelChoices(t *testing.T) {
 	m, _, _ := testModelService(t, []string{miniCPM, qwen, "nomic-embed-text:latest"}, nil, ollamaCaps)
 	info := m.info(t.Context(), "")
-	if info.Main != qwen || info.RuntimeVersion != "0.34.0" || info.Err != "" {
+	if info.Main != qwen || info.RuntimeVersion != "0.40.5" || info.Err != "" {
 		t.Errorf("info = %+v", info)
 	}
 	tests := []struct {
@@ -511,7 +512,7 @@ func TestModelSet(t *testing.T) {
 // it, and that config.toml kept the rest.
 func TestModelSetOp(t *testing.T) {
 	dir, _ := meruHome(t)
-	eng := &fakeEngine{version: "0.34.0", pulled: []string{miniCPM, qwen, "nomic-embed-text:latest"}}
+	eng := &fakeEngine{version: "0.40.5", pulled: []string{miniCPM, qwen, "nomic-embed-text:latest"}}
 	d := startDaemon(t, dir, settingsHeader, eng)
 
 	m := eventOf(t, mustCall(t, d.sock, rpc.Request{Op: rpc.OpModelSet, ID: qwen}), rpc.EventModels).Models
@@ -543,7 +544,7 @@ func TestModelSetOp(t *testing.T) {
 // model, and the save writes it.
 func TestModelUseOp(t *testing.T) {
 	dir, _ := meruHome(t)
-	eng := &fakeEngine{version: "0.34.0", pulled: []string{miniCPM, qwenMoE, "nomic-embed-text:latest"}}
+	eng := &fakeEngine{version: "0.40.5", pulled: []string{miniCPM, qwenMoE, "nomic-embed-text:latest"}}
 	body := settingsHeader + "\n[[models.sets]]\nname = \"qwen-moe\"\nmain = \"" + qwenMoE + "\"\nthink = false\n"
 	d := startDaemon(t, dir, body, eng)
 
@@ -564,5 +565,38 @@ func TestModelUseOp(t *testing.T) {
 	mustCall(t, d.sock, rpc.Request{Op: rpc.OpModelSave})
 	if cfg := loadConfig(t, dir); cfg.Models.Main != qwenMoE {
 		t.Errorf("config main = %q after a save, want %q", cfg.Models.Main, qwenMoE)
+	}
+}
+
+// TestVisionSets checks the sets a model without vision suggests: those
+// whose answer model can look at pictures and call tools, in config order.
+// gemma-moe's model sees pictures but has no tools, so it can't call
+// view_image, and missing's model isn't pulled.
+func TestVisionSets(t *testing.T) {
+	caps := map[string][]string{
+		qwenMoE:  {"completion", "vision", "tools"},
+		gemmaMoE: {"completion", "vision"},
+	}
+	m, _, srv := testModelService(t, everyModel, nil, caps)
+	got := m.visionSets(t.Context())
+	want := []agent.VisionSet{{Set: "qwen-moe", Model: qwenMoE}, {Set: "small-router", Model: qwenMoE}, {Set: "new-embed", Model: qwenMoE}}
+	if !slices.Equal(got, want) {
+		t.Errorf("visionSets = %+v, want %+v", got, want)
+	}
+	// The engine keeps each pulled model's /api/show answer, so a second
+	// call asks Ollama again only about the model that isn't pulled, whose
+	// failed answer it doesn't keep.
+	asked := func() (n int) {
+		for _, r := range srv.Requests("/api/show") {
+			if strings.Contains(string(r.Body), qwenMoE) || strings.Contains(string(r.Body), gemmaMoE) {
+				n++
+			}
+		}
+		return n
+	}
+	before := asked()
+	m.visionSets(t.Context())
+	if after := asked(); after != before {
+		t.Errorf("a second call asked about pulled models %d more times, want 0", after-before)
 	}
 }

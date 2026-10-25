@@ -1,7 +1,7 @@
 # retrieve
 
 **Code:** `internal/retrieve/` (`doc.go`, `rrf.go`, `search.go`, `format.go`,
-`memories.go`, `sessions.go`)
+`images.go`, `memories.go`, `sessions.go`)
 **Milestone:** v0.2; memory recall and `SearchSessions` in v0.4
 **Architecture:** [Retrieval](../../ARCHITECTURE.md#retrieval) and
 [How hybrid search works](../../ARCHITECTURE.md#how-hybrid-search-works)
@@ -101,7 +101,12 @@ starting values: 50 from each search and 10 after the merge. `search_files`
 sets `TopN` alone, to the number of excerpts the model asked for.
 
 `Result` embeds `store.ChunkWithDoc` and adds the RRF score, so `r.Path`,
-`r.Heading` and `r.Text` work directly.
+`r.Heading` and `r.Text` work directly. `r.IsImage()` says whether the chunk
+is an image's, and `r.CitationKind()` gives the `Kind` its `rpc.Citation`
+carries: `"image"` or empty. `Search` keeps at most `maxImageResults`, two,
+images among its results: an image's chunk text is only its name, and the
+answer model sees the picture only if it opens it with `view_image`, so more
+would crowd out text it can use.
 
 ### format.go: citations
 
@@ -111,16 +116,45 @@ sets `TopN` alone, to the number of excerpts the model asked for.
 [1] notes/launch.md, "Q3 launch", lines 12–40
 ```
 
-A PDF chunk gets `page 3` instead of lines, and a chunk with no heading leaves
-the heading out. `Format` writes a one-line instruction ("Cite the ones you
-use by number") and then each chunk's text under its citation line.
+A PDF chunk gets `page 3` instead of lines, an image gets `(image)` and no
+heading, and a chunk with no heading leaves the heading out. `Format` writes a
+one-line instruction ("Cite the ones you use by number") and then each chunk's
+text under its citation line; under an image it says the text is only the
+file's name and to cite it so the user can open it. It used to say "You can't
+see it", which kept a model with vision from opening the picture with
+`view_image`; the new line is true whether or not the model has that tool.
 `search_files` calls `Cite` too, with numbers that follow the prompt's, so an
 excerpt the tool found reads the same as one the prompt held.
+
+### images.go: image search
+
+`SearchImages(ctx, st, eng, q, n)` returns the `n` indexed images nearest to an
+`ImageQuery`. With `q.Image` set, the picture's bytes go to `Embed` with no prefix,
+and images rank by vector alone, through `store.SearchVectorKind`: pixels have no
+words for keyword search to match. With `q.Text`, the words go in with `Query`
+set, so the model's query prefix applies, and `SearchKeywordKind` adds the images
+whose names or folders hold the words. `rrf` scores each list on its own, and the
+name list's scores count `nameWeight` (0.25) as much as the picture list's
+before `top` ranks them. `Search` weighs its two lists the same; images don't,
+because a file name such as `taxi.png` matches questions about other pictures
+from the same trip. It records its time under the `images` stage of
+`meru.retrieval.duration`.
+
+`images_eval_test.go`, behind the `integration` build tag, measures this on real
+pictures. It reads `bench/image-eval.jsonl`, which git ignores: the owner's
+images, each with three questions that describe it. It reports how often each
+question finds its image first and in the top five, and whether each image,
+saved again as a JPEG, finds its original. It reports against the bar in the
+testing plan and never fails on the score, as the router's eval does. The
+weight came from this eval: on 25 images, a weight of 1 put the right image
+first for 19 of 75 questions, 0.25 for 27, and 0 for 28, but at 0 a well-named
+file such as `hotel_693.32.jpg` lost to another photo of the same bill.
 
 ### memories.go: recall
 
 `SearchMemories(ctx, st, eng, query, exclude, n)` finds the `n` memories that best
-fit a question. It embeds the query once, then asks the store for three lists of up
+fit a question. It embeds the query once, as `engine.Input{Text: query, Query:
+true}` so the engine adds the model's query prefix, then asks the store for three lists of up
 to 50 memories each, leaving out the kinds in `exclude`:
 
 1. by meaning: `SearchMemoryVector`;

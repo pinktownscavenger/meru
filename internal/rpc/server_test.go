@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -241,6 +242,14 @@ func TestRoundTrip(t *testing.T) {
 			{Type: EventSources, Sources: []Citation{{N: 1, Path: "~/a.md", Heading: "A", StartLine: 1, EndLine: 4, Score: 0.03}}},
 			{Type: EventDone},
 		}},
+		// A job's fields come only from merud's scheduler; a client that
+		// sends them would pass an ask off as a job.
+		{"job fields refused", echo, Request{Op: OpAsk, Text: "x", Job: "brief"}, []Event{
+			{Type: EventError, Error: "job and skill are set only by merud's scheduler"},
+		}},
+		{"skill field refused", echo, Request{Op: OpAsk, Text: "x", Skill: "writing"}, []Event{
+			{Type: EventError, Error: "job and skill are set only by merud's scheduler"},
+		}},
 		{"unknown op", echo, Request{Op: "dance"}, []Event{
 			{Type: EventError, Error: `unknown op "dance"`},
 		}},
@@ -256,6 +265,25 @@ func TestRoundTrip(t *testing.T) {
 				t.Errorf("events = %+v\nwant %+v", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestRequestLineLimit checks that a transcribe request with a full
+// minute of audio gets through, and that a request line over
+// MaxRequestLine gets an error event.
+func TestRequestLineLimit(t *testing.T) {
+	path := startServer(t, func(_ context.Context, req Request, emit func(Event) error, _ ApproveFunc) error {
+		return emit(Event{Type: EventTranscript, Text: fmt.Sprint(len(req.Audio.WAV))})
+	})
+	minute := 60 * 16000 * 2 // 60 seconds of 16 kHz mono 16-bit samples
+	evs, err := collect(context.Background(), path, Request{Op: OpTranscribe, Audio: &Audio{WAV: make([]byte, minute)}})
+	if err != nil || len(evs) == 0 || evs[0].Text != fmt.Sprint(minute) {
+		t.Fatalf("a minute of audio: %v, %+v", err, evs)
+	}
+	big := MaxRequestLine * 3 / 4 // base64 makes it a third longer, past the limit
+	evs, err = collect(context.Background(), path, Request{Op: OpTranscribe, Audio: &Audio{WAV: make([]byte, big)}})
+	if err != nil || len(evs) != 1 || evs[0].Type != EventError || !strings.Contains(evs[0].Error, "too long") {
+		t.Errorf("a request over the limit = %v, %+v; want one error event, line too long", err, evs)
 	}
 }
 

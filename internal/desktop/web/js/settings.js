@@ -1,5 +1,6 @@
-// Settings: the settings screen, with a back link and eight sections.
-// Connections, Folders, About you, Skills, Models, Activity and Usage each
+// Settings: the settings screen, with a back link and seven sections, and
+// the Usage screen, which the rail opens beside Settings.
+// Connections, Folders, About you, Skills, Models and Activity each
 // ask the Bridge for their data when they open, and every change goes to
 // merud, which writes config.toml or the memory folder and reloads.
 // Connections opens with the connector cards, which connectors.js draws
@@ -19,9 +20,9 @@ const SECTIONS = [
   { id: "folders", label: "Folders" },
   { id: "you", label: "About you" },
   { id: "skills", label: "Skills" },
+  { id: "jobs", label: "Jobs" },
   { id: "models", label: "Models" },
   { id: "activity", label: "Activity" },
-  { id: "usage", label: "Usage" },
   { id: "about", label: "About" },
 ];
 
@@ -121,8 +122,24 @@ function draw() {
   body.setAttribute("aria-labelledby", "tab-" + current.section);
   root.append(body);
   body.append(el("p", "panel-note", "Loading…"));
-  const drawers = { connections, folders, you, skills, models, activity, usage, about };
+  const drawers = { connections, folders, you, skills, jobs, models, activity, about };
   drawers[current.section](body);
+}
+
+// openUsage draws the Usage screen in root: a back link, the title, and
+// the Charts and Prometheus queries tabs that usage fills.
+export function openUsage(root, pages) {
+  current.pages = pages;
+  root.replaceChildren();
+  const head = el("header", "page-head");
+  const back = button("Back to chat", { className: "text-button back", iconName: "back", onClick: pages.back });
+  const title = el("h1", "", "Usage");
+  title.id = "usage-title";
+  head.append(back, title);
+  const body = el("section", "page-body");
+  body.append(el("p", "panel-note", "Loading…"));
+  root.append(head, body);
+  usage(body);
 }
 
 // fail shows err in body, with a hint when merud isn't running.
@@ -180,7 +197,9 @@ function drawConnections(body, cv) {
       // sentence; the built-in card stays "Connected".
       const web = { ...c, tools: c.tools.filter((t) => WEB_TOOLS.includes(t.name)), connector: c.web, sentence: c.web_sentence };
       const own = { ...c, tools: c.tools.filter((t) => !WEB_TOOLS.includes(t.name)), note: "" };
-      grid.append(connectionCard(body, web, "Web search", "web"), connectionCard(body, own, "Built into Meru", "meru"));
+      const webCard = connectionCard(body, web, "Web search", "web");
+      webCard.append(trustedSites());
+      grid.append(webCard, connectionCard(body, own, "Built into Meru", "meru"));
       continue;
     }
     grid.append(connectionCard(body, c, c.kind === "command" ? "Local commands" : c.name, c.name));
@@ -337,6 +356,39 @@ function toolRow(body, c, t) {
 }
 
 // removeButton asks before it takes an MCP server out of config.toml.
+// trustedSites returns the Web search card's list of the websites
+// web_fetch reads without asking in every session, [web] trusted_sites,
+// each with a Remove button. It fills in when merud answers; a merud from
+// before the list shows nothing.
+function trustedSites() {
+  const box = el("div", "trusted-sites");
+  const draw = (sites) => {
+    box.replaceChildren(el("p", "card-sub", "Websites Meru reads without asking"));
+    if (!sites.length) {
+      box.append(el("p", "card-note", "None. When Meru asks before reading a website, Always allow adds it here."));
+      return;
+    }
+    const list = el("ul", "site-list");
+    for (const host of sites) {
+      const item = el("li");
+      item.append(el("code", "", host), button("Remove", {
+        className: "text-button",
+        onClick: () => bridge.removeTrustedSite(host).then(
+          (left) => {
+            draw(left || []);
+            current.pages.notice("Meru asks again before it reads " + host + " in a new chat.");
+          },
+          (err) => current.pages.notice(errorText(err)),
+        ),
+      }));
+      list.append(item);
+    }
+    box.append(list);
+  };
+  bridge.trustedSites().then((sites) => draw(sites || []), () => box.replaceChildren());
+  return box;
+}
+
 function removeButton(body, name) {
   const box = el("div", "card-actions");
   const ask = button("Remove", {
@@ -850,6 +902,294 @@ function drawSkills(body, sv) {
   }
 }
 
+// ---- Jobs ----
+
+// REPEATS are the choices for how often a job's weeks come round, as
+// every_weeks.
+const REPEATS = [[1, "Every week"], [2, "Every other week"], [3, "Every 3 weeks"], [4, "Every 4 weeks"]];
+
+// ALLOW_WARNING goes under a job's allow list while it names a tool.
+const ALLOW_WARNING = "A run uses these tools without asking you, since nobody watches it. " +
+  "Name only tools you'd let it use unwatched. A tool that asks every time still can't run in a job.";
+
+// jobs draws the scheduled jobs, the Add a job link, and the form it and
+// each Edit open. The list refreshes every few seconds while it shows, so
+// a run's start and end appear without a click; the form sits outside the
+// list, so a refresh leaves what the user types alone.
+function jobs(body) {
+  body.replaceChildren();
+  intro(body, "Jobs Meru runs on a schedule. Each run is a chat in the Jobs folder. " +
+    "Meru saves each job as [[jobs]] in ~/.meru/config.toml.");
+  const formBox = el("div");
+  const listBox = el("div");
+  const draw = (list) => listBox.isConnected && drawJobs(listBox, list || [], edit);
+  const done = (list) => {
+    formBox.replaceChildren();
+    draw(list);
+  };
+  const edit = (j) => jobForm(formBox, j, done);
+  const add = button("Add a job", { className: "text-button link", iconName: "plus", onClick: () => edit(null) });
+  const top = el("div", "custom-server");
+  top.append(add);
+  body.append(top, formBox, listBox);
+  const load = () => bridge.jobs().then(draw, (err) => listBox.isConnected && fail(listBox, err));
+  load();
+  const timer = setInterval(() => (body.isConnected ? load() : clearInterval(timer)), 5000);
+}
+
+// when writes an RFC 3339 time as a person reads it: "today 07:00", or
+// "Mon 27 Oct 07:00".
+function when(stamp) {
+  if (!stamp) return "";
+  const t = new Date(stamp);
+  const now = new Date();
+  const hm = t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+  if (t.toDateString() === now.toDateString()) return "today " + hm;
+  return t.toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" }) + " " + hm;
+}
+
+// specOf picks out of a job from the list the keys config.toml holds, the
+// JobSpec the Bridge saves.
+function specOf(j) {
+  return {
+    name: j.name, schedule: j.schedule, every_weeks: j.every_weeks || 0, from: j.from || "",
+    prompt: j.prompt || "", skill: j.skill || "", command: j.command || "", args: j.args || null,
+    allow: j.allow || null, output: j.output || "", paused: !!j.paused,
+  };
+}
+
+// drawJobs draws the jobs in list into box: each with its schedule in
+// words and its state, Run now or Stop, Pause or Resume, Edit, which calls
+// edit with the job, Remove, and a link to its last run's chat.
+function drawJobs(box, list, edit) {
+  box.replaceChildren();
+  if (list.length === 0) {
+    box.append(el("p", "dim", "No jobs yet. Add one, such as a morning brief at 7:00 on weekdays."));
+    return;
+  }
+  const change = (p, said) => p.then(
+    (next) => {
+      drawJobs(box, next || [], edit);
+      if (said) current.pages.notice(said);
+    },
+    (err) => current.pages.notice(errorText(err)),
+  );
+  const ul = el("ul", "row-list");
+  for (const j of list) {
+    const li = el("li", "row");
+    const text = el("div", "row-main");
+    text.append(el("span", "tool-name", j.name));
+    const does = j.command ? " · runs cmd." + j.command : j.skill ? " · skill " + j.skill : "";
+    text.append(el("span", "tool-desc", j.when + does));
+    let state = j.running ? "Running since " + when(j.started) : j.paused ? "Paused" : "Next " + when(j.next);
+    if (j.last) state += " · last " + when(j.last) + (j.last_outcome ? ", " + j.last_outcome : "");
+    const line = el("span", "dim", state);
+    if (j.last_session) {
+      line.append(document.createTextNode(" · "));
+      line.append(button("Open last run", { className: "link-button",
+        onClick: () => current.pages.openChat(j.last_session, j.name) }));
+    }
+    text.append(line);
+    li.append(text);
+
+    const acts = el("div", "card-actions");
+    const run = j.running
+      ? button("Stop", { className: "button secondary", onClick: () => change(bridge.cancelJob(j.name)) })
+      : button("Run now", { className: "button secondary", onClick: () => change(bridge.runJob(j.name)) });
+    run.setAttribute("aria-label", (j.running ? "Stop " : "Run ") + j.name);
+    const pause = button(j.paused ? "Resume" : "Pause", {
+      className: "text-button",
+      onClick: () => change(bridge.saveJob(j.name, { ...specOf(j), paused: !j.paused }),
+        j.paused ? j.name + " runs on its schedule again." : "Paused " + j.name + "."),
+    });
+    pause.setAttribute("aria-label", (j.paused ? "Resume " : "Pause ") + j.name);
+    const editButton = button("Edit", { className: "text-button", onClick: () => edit(j) });
+    editButton.setAttribute("aria-label", "Edit " + j.name);
+    const remove = button("Remove", {
+      className: "text-button",
+      onClick: () => acts.replaceChildren(el("span", "", "Remove " + j.name + "? Its past runs stay in the Jobs folder."),
+        button("Remove", { className: "button secondary",
+          onClick: () => change(bridge.removeJob(j.name), "Removed " + j.name + ".") }),
+        button("Keep it", { className: "text-button", onClick: () => drawJobs(box, list, edit) })),
+    });
+    remove.setAttribute("aria-label", "Remove " + j.name);
+    acts.append(run, pause, editButton, remove);
+    li.append(acts);
+    ul.append(li);
+  }
+  box.append(ul);
+}
+
+// jobForm opens the form that adds a job, or edits j, in box. As the user
+// types, merud checks the job and says its schedule in words and its next
+// run, or what's wrong. A job that runs a command keeps its command and
+// arguments; the form edits when it runs and where its answer goes. done
+// gets the jobs after a save.
+function jobForm(box, j, done) {
+  box.replaceChildren();
+  const was = j ? j.name : "";
+  const form = el("form", "card custom-form");
+  form.setAttribute("aria-label", j ? "Edit " + j.name : "New job");
+  form.append(el("h3", "", j ? "Edit " + j.name : "New job"));
+
+  const name = field(form, "job-name", "Name", "morning-brief");
+  name.autocomplete = "off";
+  name.spellcheck = false;
+  form.append(el("p", "card-note", "Lower-case letters, digits, - and _. It names the job's chats in the Jobs folder."));
+
+  const schedule = field(form, "job-schedule", "When", "0 7 * * 1-5");
+  schedule.spellcheck = false;
+  form.append(el("p", "card-note", "Five fields: minute, hour, day of the month, month, day of the week. " +
+    "\"0 7 * * 1-5\" is 7:00 on weekdays, and \"0 9 * * 2\" 9:00 on Tuesdays."));
+  const repeatRow = el("div", "field-row");
+  const repeat = el("select", "text-input");
+  repeat.setAttribute("aria-label", "How often");
+  for (const [n, label] of REPEATS) {
+    const o = el("option", "", label);
+    o.value = String(n);
+    repeat.append(o);
+  }
+  const from = el("input", "text-input");
+  from.type = "date";
+  from.setAttribute("aria-label", "First day");
+  const fromLabel = el("span", "dim", "starting");
+  repeatRow.append(repeat, fromLabel, from);
+  form.append(repeatRow);
+  const words = el("p", "card-note");
+  words.setAttribute("aria-live", "polite");
+  form.append(words);
+
+  let prompt = null;
+  let skill = null;
+  if (j && j.command) {
+    form.append(el("p", "card-note", "Runs cmd." + j.command + ", a [[commands]] entry in config.toml, with no model. " +
+      "Edit its arguments in config.toml."));
+  } else {
+    const pl = el("label", "field-label", "What Meru does");
+    pl.htmlFor = "job-prompt";
+    prompt = el("textarea", "text-input");
+    prompt.id = "job-prompt";
+    prompt.placeholder = "Read my calendar for today and my unread mail, and brief me in five lines.";
+    form.append(pl, prompt);
+    const sl = el("label", "field-label", "Skill");
+    sl.htmlFor = "job-skill";
+    skill = el("select", "text-input");
+    skill.id = "job-skill";
+    const none = el("option", "", "Meru picks one, or none");
+    none.value = "";
+    skill.append(none);
+    form.append(sl, skill);
+    bridge.skills().then((sv) => {
+      for (const s of sv.skills) {
+        if (s.disabled && !(j && j.skill === s.name)) continue;
+        const o = el("option", "", s.name);
+        o.value = s.name;
+        skill.append(o);
+      }
+      skill.value = (j && j.skill) || "";
+    }, () => {});
+  }
+
+  const allow = field(form, "job-allow", "Tools it may use without asking", "write_file, google.list_events");
+  allow.spellcheck = false;
+  const warning = el("p", "card-error", ALLOW_WARNING);
+  form.append(warning);
+  const output = field(form, "job-output", "Also save the answer to", "briefs/{date}.md");
+  output.spellcheck = false;
+  form.append(el("p", "card-note", "A file under your output folder, ~/meru-output by default. " +
+    "{date}, {time} and {job} fill in. Leave it empty to keep the answer in the chat only."));
+
+  if (j) {
+    name.value = j.name;
+    schedule.value = j.schedule;
+    repeat.value = String(j.every_weeks > 1 ? j.every_weeks : 1);
+    from.value = j.from || "";
+    if (prompt) prompt.value = j.prompt || "";
+    allow.value = (j.allow || []).join(", ");
+    output.value = j.output || "";
+  }
+
+  // spec reads the form as a JobSpec. An edit keeps the job's command,
+  // arguments and pause.
+  const spec = () => {
+    const weeks = Number(repeat.value);
+    const tools = allow.value.split(",").map((t) => t.trim()).filter(Boolean);
+    return {
+      name: name.value.trim(), schedule: schedule.value.trim(),
+      every_weeks: weeks > 1 ? weeks : 0, from: weeks > 1 ? from.value : "",
+      prompt: prompt ? prompt.value.trim() : "", skill: skill ? skill.value : "",
+      command: j ? j.command || "" : "", args: j ? j.args || null : null,
+      allow: tools.length ? tools : null, output: output.value.trim(), paused: j ? !!j.paused : false,
+    };
+  };
+
+  // check asks merud about the job a moment after the user stops typing,
+  // and says what it found under the schedule. An answer to an older
+  // check is dropped.
+  let timer = 0;
+  let asked = 0;
+  const check = () => {
+    const weeks = Number(repeat.value) > 1;
+    from.hidden = fromLabel.hidden = !weeks;
+    if (weeks && !from.value) {
+      // Today's date on this computer; toISOString would give the date in UTC.
+      const d = new Date();
+      from.value = [d.getFullYear(), String(d.getMonth() + 1).padStart(2, "0"), String(d.getDate()).padStart(2, "0")].join("-");
+    }
+    warning.hidden = !allow.value.trim();
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      const sp = spec();
+      if (!sp.schedule) {
+        words.className = "card-note";
+        words.textContent = "";
+        return;
+      }
+      const n = ++asked;
+      // A name or an action the user hasn't typed yet shouldn't stop the
+      // check from saying the schedule in words.
+      const probe = { ...sp, name: sp.name || "new-job", prompt: sp.prompt || (sp.command ? "" : "-") };
+      bridge.checkJob(was, probe).then((info) => {
+        if (n !== asked) return;
+        words.className = "card-note";
+        words.textContent = info.when + (info.next ? " · next " + when(info.next) : "");
+      }, (err) => {
+        if (n !== asked) return;
+        words.className = "card-error";
+        words.textContent = errorText(err);
+      });
+    }, 300);
+  };
+  for (const input of [name, schedule, repeat, from, allow, output, prompt, skill]) {
+    if (input) input.addEventListener("input", check);
+  }
+  check();
+
+  const save = button(j ? "Save" : "Add job", { className: "button primary" });
+  save.type = "submit";
+  const cancel = button("Cancel", { className: "text-button", onClick: () => box.replaceChildren() });
+  const actions = el("div", "card-actions");
+  actions.append(save, cancel);
+  form.append(actions);
+  form.addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const sp = spec();
+    save.disabled = true;
+    bridge.saveJob(was, sp).then(
+      (list) => {
+        done(list);
+        current.pages.notice((j ? "Saved " : "Added ") + sp.name + ".");
+      },
+      (err) => {
+        save.disabled = false;
+        current.pages.notice(errorText(err));
+      },
+    );
+  });
+  box.append(form);
+  name.focus();
+}
+
 // ---- Models ----
 
 // CAPABILITIES are the capabilities a model card shows, in this order, and
@@ -1128,35 +1468,384 @@ function activity(body) {
 // WINDOWS names the usage windows, as merud sends them.
 const WINDOWS = { "1h": "Last hour", today: "Today", week: "This week", month: "This month", "30d": "Last 30 days", all: "All time" };
 
-// usage draws how much Meru has been used, window by window, as the
-// chat's /usage box does.
+// USAGE_TABS are the Usage section's two sub-tabs. Charts opens first.
+const USAGE_TABS = [
+  { id: "charts", label: "Charts" },
+  { id: "prometheus", label: "Prometheus queries" },
+];
+
+// usage draws the Usage section as two sub-tabs. Charts holds, in the
+// order you look at them most, the usage windows, four charts, the
+// slowest tasks, tool calls by outcome and use by model. Prometheus
+// queries says how to read the same numbers in a Prometheus you run. The
+// windows come first and alone, so an older merud, which can't send the
+// rest, still fills the table.
 function usage(body) {
   bridge.usage().then(
     (windows) => {
       body.replaceChildren();
-      intro(body, "Counted from the session transcripts on this Mac: answered questions only.");
-      const table = el("table", "log");
-      const head = el("tr");
-      for (const h of ["", "Questions", "Chats", "Tokens in", "Tokens out", "Time answering", "Files read", "Tool calls"]) {
-        head.append(el("th", "", h));
-      }
-      const thead = el("thead");
-      thead.append(head);
-      const tbody = el("tbody");
-      for (const w of windows || []) {
-        const tr = el("tr");
-        tr.append(el("th", "", WINDOWS[w.name] || w.name));
-        for (const v of [w.turns, w.sessions, w.tokens_in, w.tokens_out]) tr.append(el("td", "num", Number(v).toLocaleString()));
-        tr.append(el("td", "num", seconds(w.active_ms || 0)), el("td", "num", String(w.docs)), el("td", "num", String(w.tool_calls)));
-        tbody.append(tr);
-      }
-      table.append(thead, tbody);
-      const wrap = el("div", "table-wrap");
-      wrap.append(table);
-      body.append(wrap);
+      const panels = usageTabs(body);
+      const charts = panels.charts;
+      intro(charts, "Counted from the session transcripts on this Mac. A task is one question or request that Meru answered.");
+      charts.append(usageTable(windows || []));
+      const more = el("div", "usage-detail");
+      more.append(el("p", "panel-note", "Loading the charts…"));
+      charts.append(more);
+      prometheusSection(panels.prometheus, "");
+      bridge.usageDetail().then(
+        (d) => {
+          drawDetail(more, d);
+          panels.prometheus.replaceChildren();
+          prometheusSection(panels.prometheus, d.metrics || "");
+        },
+        (err) => more.replaceChildren(el("p", "panel-note", errorText(err))),
+      );
     },
     (err) => fail(body, err),
   );
+}
+
+// usageTabs adds the sub-tabs to body and returns their panels by id. The
+// first tab shows; the arrow keys move between tabs, as in Settings' own
+// tabs.
+function usageTabs(body) {
+  const bar = el("div", "tabs subtabs");
+  bar.setAttribute("role", "tablist");
+  bar.setAttribute("aria-label", "Usage views");
+  body.append(bar);
+  const panels = {};
+  const tabs = [];
+  const show = (id) => {
+    for (const t of tabs) {
+      const on = t.dataset.id === id;
+      t.setAttribute("aria-selected", String(on));
+      t.tabIndex = on ? 0 : -1;
+      panels[t.dataset.id].hidden = !on;
+    }
+  };
+  USAGE_TABS.forEach((u, i) => {
+    const t = button(u.label, { className: "tab" });
+    t.id = "usage-tab-" + u.id;
+    t.dataset.id = u.id;
+    t.setAttribute("role", "tab");
+    t.setAttribute("aria-controls", "usage-panel-" + u.id);
+    t.addEventListener("click", () => show(u.id));
+    t.addEventListener("keydown", (e) => {
+      const step = e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : 0;
+      if (!step) return;
+      e.preventDefault();
+      const next = USAGE_TABS[(i + step + USAGE_TABS.length) % USAGE_TABS.length].id;
+      show(next);
+      document.getElementById("usage-tab-" + next).focus();
+    });
+    tabs.push(t);
+    bar.append(t);
+    const panel = el("div", "usage-panel");
+    panel.id = "usage-panel-" + u.id;
+    panel.setAttribute("role", "tabpanel");
+    panel.setAttribute("aria-labelledby", t.id);
+    panels[u.id] = panel;
+    body.append(panel);
+  });
+  show(USAGE_TABS[0].id);
+  return panels;
+}
+
+// usageTable returns the table of usage windows, one row per window.
+function usageTable(windows) {
+  const table = el("table", "log");
+  const head = el("tr");
+  for (const h of ["", "Tasks", "Chats", "Tokens in", "Tokens out", "Time answering", "Files read", "Tool calls"]) {
+    head.append(el("th", "", h));
+  }
+  const thead = el("thead");
+  thead.append(head);
+  const tbody = el("tbody");
+  for (const w of windows) {
+    const tr = el("tr");
+    tr.append(el("th", "", WINDOWS[w.name] || w.name));
+    for (const v of [w.turns, w.sessions, w.tokens_in, w.tokens_out]) tr.append(el("td", "num", Number(v).toLocaleString()));
+    tr.append(el("td", "num", seconds(w.active_ms || 0)), el("td", "num", String(w.docs)), el("td", "num", String(w.tool_calls)));
+    tbody.append(tr);
+  }
+  table.append(thead, tbody);
+  return wrapTable(table);
+}
+
+// wrapTable puts a table in a box that scrolls sideways in a narrow window.
+function wrapTable(table) {
+  const wrap = el("div", "table-wrap");
+  wrap.append(table);
+  return wrap;
+}
+
+// drawDetail fills box with the dashboard d that merud sent: four charts,
+// two to a row where the window is wide enough, then the tables. The
+// Prometheus queries tab draws d.metrics.
+function drawDetail(box, d) {
+  box.replaceChildren();
+  const days = d.days || [];
+
+  const grid = el("div", "chart-grid");
+  box.append(grid);
+  const charts = [
+    {
+      title: "Tasks per day",
+      note: "questions and requests Meru answered",
+      axis: "tasks",
+      series: [{ key: "questions", className: "bar", say: (v) => v + (v === 1 ? " task" : " tasks") }],
+      tick: (v) => String(v),
+    },
+    {
+      title: "Time to first token",
+      note: "p50, the middle task, over p95, the slow end",
+      axis: "seconds",
+      series: [
+        { key: "ttft_p95_ms", className: "bar p95", say: (v) => "p95 " + seconds(v) },
+        { key: "ttft_p50_ms", className: "bar", say: (v) => "p50 " + seconds(v) },
+      ],
+      tick: (v) => String(Math.round(v / 100) / 10),
+    },
+    {
+      title: "Tokens in per day",
+      note: "what the models read: prompts, files and tool results",
+      axis: "tokens",
+      series: [{ key: "tokens_in", className: "bar", say: (v) => Number(v).toLocaleString() + " tokens in" }],
+      tick: shortCount,
+    },
+    {
+      title: "Tokens out per day",
+      note: "what the models wrote",
+      axis: "tokens",
+      series: [{ key: "tokens_out", className: "bar", say: (v) => Number(v).toLocaleString() + " tokens out" }],
+      tick: shortCount,
+    },
+  ];
+  // Every cell goes in the grid before any chart draws, so each cell has
+  // its final width when its chart measures it. A chart drawn at that width
+  // shows its text at its real size; one measured while its cell was
+  // alone in the grid would come out twice as wide, then shrink to half.
+  const cells = charts.map((c) => {
+    const cell = el("section", "chart-cell");
+    cell.append(el("h3", "chart-title", c.title));
+    cell.append(el("p", "chart-note", c.note));
+    grid.append(cell);
+    return cell;
+  });
+  charts.forEach((c, i) => cells[i].append(barChart(c, days, cells[i].clientWidth)));
+
+  box.append(el("h2", "section-head", "Slowest tasks this week"));
+  box.append(slowestTable(d.slowest || []));
+
+  box.append(el("h2", "section-head", "Tool calls, last 30 days"));
+  box.append(toolsTable(d.tools || []));
+
+  box.append(el("h2", "section-head", "By answer model"));
+  box.append(modelsTable(d.models || []));
+}
+
+// CHART_H is a chart's height, and the PAD values the room around its plot
+// for the axis labels, in pixels.
+const CHART_H = 180;
+const PAD = { left: 52, right: 8, top: 10, bottom: 24 };
+
+// svg makes an SVG element with attrs. SVG elements need their own
+// namespace, so el() can't make them.
+function svg(tag, attrs) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs || {})) node.setAttribute(k, String(v));
+  return node;
+}
+
+// shortDate writes "2026-10-09" as "9 Oct", in the page's language.
+function shortDate(date) {
+  const [y, m, d] = date.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+}
+
+// shortCount writes a count in a few characters: 950, 18k, 1.4M.
+function shortCount(v) {
+  if (v >= 1e6) return (v / 1e6).toFixed(v < 1e7 ? 1 : 0).replace(/\.0$/, "") + "M";
+  if (v >= 1e3) return (v / 1e3).toFixed(v < 1e4 ? 1 : 0).replace(/\.0$/, "") + "k";
+  return String(v);
+}
+
+// niceStep returns a round step for about four ticks up to max: 1, 2 or 5
+// times a power of ten.
+function niceStep(max) {
+  const rough = max / 4;
+  const p = Math.pow(10, Math.floor(Math.log10(rough)));
+  const f = rough / p;
+  return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * p;
+}
+
+// barChart returns a bar chart of days, width pixels wide, for the chart
+// c: one group of bars per day, a y axis with round ticks labelled by
+// c.tick and titled c.axis, and a date under every seventh day, counting
+// back from today. Each series names a field of a day, the CSS class that
+// colors its bars, and how to say a value; later series draw over earlier
+// ones, so the taller one goes first. Each bar carries a <title>, which
+// shows on hover and which screen readers read, and the chart says its
+// peak in an aria-label.
+function barChart(c, days, width) {
+  const W = Math.max(280, Math.round(width || 600));
+  const plotW = W - PAD.left - PAD.right;
+  const plotH = CHART_H - PAD.top - PAD.bottom;
+  const peakValue = Math.max(0, ...days.flatMap((day) => c.series.map((s) => day[s.key] || 0)));
+  const step = peakValue > 0 ? niceStep(peakValue) : 1;
+  const top = Math.max(step, Math.ceil(peakValue / step) * step);
+  const y = (v) => PAD.top + plotH - (v / top) * plotH;
+
+  const chart = svg("svg", { viewBox: "0 0 " + W + " " + CHART_H, role: "img" });
+  // The y axis: a grid line and a label at each tick, and the axis title.
+  for (let v = 0; v <= top + step / 2; v += step) {
+    chart.append(svg("line", { class: v === 0 ? "axis" : "grid", x1: PAD.left, y1: y(v), x2: W - PAD.right, y2: y(v) }));
+    chart.append(svg("line", { class: "axis", x1: PAD.left - 4, y1: y(v), x2: PAD.left, y2: y(v) }));
+    const label = svg("text", { class: "tick", x: PAD.left - 7, y: y(v) + 4, "text-anchor": "end" });
+    label.textContent = c.tick(v);
+    chart.append(label);
+  }
+  chart.append(svg("line", { class: "axis", x1: PAD.left, y1: PAD.top, x2: PAD.left, y2: PAD.top + plotH }));
+  const title = svg("text", { class: "axis-title", x: 0, y: 0, "text-anchor": "middle",
+    transform: "translate(11 " + (PAD.top + plotH / 2) + ") rotate(-90)" });
+  title.textContent = c.axis;
+  chart.append(title);
+
+  // The bars, and the x axis's ticks and dates.
+  const slot = plotW / Math.max(1, days.length);
+  const barW = Math.max(1, slot - 2);
+  days.forEach((day, i) => {
+    const x = PAD.left + i * slot;
+    for (const s of c.series) {
+      const v = day[s.key] || 0;
+      if (!v) continue;
+      const h = Math.max(1, (v / top) * plotH);
+      const bar = svg("rect", { class: s.className, x: x + 1, y: PAD.top + plotH - h, width: barW, height: h });
+      const t = svg("title");
+      t.textContent = shortDate(day.date) + ": " + s.say(v);
+      bar.append(t);
+      chart.append(bar);
+    }
+    if ((days.length - 1 - i) % 7 === 0) {
+      const mid = x + slot / 2;
+      chart.append(svg("line", { class: "axis", x1: mid, y1: PAD.top + plotH, x2: mid, y2: PAD.top + plotH + 4 }));
+      const label = svg("text", { class: "tick", x: mid, y: CHART_H - 6, "text-anchor": "middle" });
+      label.textContent = shortDate(day.date);
+      chart.append(label);
+    }
+  });
+
+  const first = c.series[0];
+  const peak = days.reduce((best, day) => ((day[first.key] || 0) > (best[first.key] || 0) ? day : best), days[0] || {});
+  let words = c.title + ", last " + days.length + " days.";
+  if (peak && peak[first.key]) words += " Highest " + first.say(peak[first.key]) + " on " + shortDate(peak.date) + ".";
+  else words += " Nothing yet.";
+  chart.setAttribute("aria-label", words);
+  return chart;
+}
+
+// slowestTable returns the slowest tasks of the week. A row opens its
+// chat; a chat the rail doesn't list goes by its date.
+function slowestTable(rows) {
+  if (!rows.length) return el("p", "panel-note", "No tasks this week.");
+  const table = el("table", "log");
+  const head = el("tr");
+  for (const h of ["Chat", "Took", "First token", "Tokens in", "Route", "Model"]) head.append(el("th", "", h));
+  const thead = el("thead");
+  thead.append(head);
+  const tbody = el("tbody");
+  for (const q of rows) {
+    const when = new Date(q.at);
+    const stamp = when.toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+    const title = current.pages.chatTitle(q.session) || "A chat from " + stamp;
+    const tr = el("tr");
+    const cell = el("td");
+    cell.append(button(title, { className: "link-button", onClick: () => current.pages.openChat(q.session, title) }));
+    tr.append(cell);
+    tr.append(el("td", "num", seconds(q.ms || 0)), el("td", "num", q.ttft_ms ? seconds(q.ttft_ms) : "–"));
+    tr.append(el("td", "num", Number(q.tokens_in || 0).toLocaleString()), el("td", "", q.route || ""), el("td", "mono", q.model || ""));
+    tbody.append(tr);
+  }
+  table.append(thead, tbody);
+  return wrapTable(table);
+}
+
+// toolsTable returns each tool's calls by outcome; the outcomes other than
+// ok show in the danger color, as the Activity section shows them.
+function toolsTable(tools) {
+  if (!tools.length) return el("p", "panel-note", "No tool calls in the last 30 days.");
+  const table = el("table", "log");
+  const head = el("tr");
+  for (const h of ["Tool", "Kind", "Calls", "Outcomes"]) head.append(el("th", "", h));
+  const thead = el("thead");
+  thead.append(head);
+  const tbody = el("tbody");
+  for (const t of tools) {
+    const tr = el("tr");
+    tr.append(el("td", "mono", t.tool), el("td", "", t.kind || ""), el("td", "num", String(t.calls)));
+    const cell = el("td");
+    const names = Object.keys(t.outcomes || {}).sort((a, b) => t.outcomes[b] - t.outcomes[a]);
+    names.forEach((name, i) => {
+      if (i) cell.append(document.createTextNode(" · "));
+      cell.append(el("span", "outcome " + name, name + " " + t.outcomes[name]));
+    });
+    tr.append(cell);
+    tbody.append(tr);
+  }
+  table.append(thead, tbody);
+  return wrapTable(table);
+}
+
+// modelsTable returns use by answer model, as /usage by model shows it in
+// meru chat.
+function modelsTable(models) {
+  if (!models.length) return el("p", "panel-note", "No finished tasks yet.");
+  const table = el("table", "log");
+  const head = el("tr");
+  for (const h of ["Model", "Tasks", "Tokens in", "Tokens out", "First token (p50)", "Tokens a second"]) head.append(el("th", "", h));
+  const thead = el("thead");
+  thead.append(head);
+  const tbody = el("tbody");
+  for (const m of models) {
+    const tr = el("tr");
+    tr.append(el("td", "mono", m.model || "(before model switches were logged)"));
+    for (const v of [m.turns, m.tokens_in, m.tokens_out]) tr.append(el("td", "num", Number(v || 0).toLocaleString()));
+    tr.append(el("td", "num", m.ttft_p50_ms ? seconds(m.ttft_p50_ms) : "–"));
+    tr.append(el("td", "num", m.eval_ms ? (m.tokens_out / (m.eval_ms / 1000)).toFixed(1) : "–"));
+    tbody.append(tr);
+  }
+  table.append(thead, tbody);
+  return wrapTable(table);
+}
+
+// QUERIES are the PromQL queries the Usage section offers, each with what
+// it answers. The names are the ones merud's /metrics page writes.
+const QUERIES = [
+  ["Tasks per day", "sum(increase(meru_turn_duration_seconds_count[1d]))"],
+  ["Time to first token, p95 over the last hour", "histogram_quantile(0.95, sum by (le) (rate(gen_ai_server_time_to_first_token_seconds_bucket[1h])))"],
+  ["Turn time by route, p95", "histogram_quantile(0.95, sum by (le, meru_route) (rate(meru_turn_duration_seconds_bucket[1h])))"],
+  ["Tool calls that failed today", 'sum by (gen_ai_tool_name, meru_outcome) (increase(meru_tool_calls_total{meru_outcome!="ok"}[1d]))'],
+  ["Tokens per model today", "sum by (gen_ai_request_model, gen_ai_token_type) (increase(gen_ai_client_token_usage_sum[1d]))"],
+  ["Model loads today", "sum(increase(meru_engine_load_duration_seconds_count[1d]))"],
+];
+
+// prometheusSection tells the user how to read the same numbers in a
+// Prometheus they run: the address when merud serves /metrics, or the
+// line that turns it on, then the queries, each with a Copy button.
+function prometheusSection(box, metrics) {
+  intro(box, "merud can serve the numbers behind the charts to a Prometheus you run on this Mac, for longer history and your own queries.");
+  if (metrics) {
+    box.append(el("p", "panel-note", "merud serves its metrics at this address, on this Mac only. Point a Prometheus you run at it:"));
+    box.append(copyBlock(metrics));
+  } else {
+    box.append(el("p", "panel-note", "To read these numbers in a Prometheus you run, add this line under [observability] in ~/.meru/config.toml and restart merud:"));
+    box.append(copyBlock('prometheus = "127.0.0.1:9464"'));
+  }
+  box.append(el("p", "panel-note", "Counts start again from zero when merud restarts; increase() and rate() allow for that."));
+  for (const [what, q] of QUERIES) {
+    box.append(el("p", "query-label", what));
+    box.append(copyBlock(q));
+  }
 }
 
 // ---- About ----

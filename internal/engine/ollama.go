@@ -56,14 +56,24 @@ type OllamaEngine struct {
 	log        *slog.Logger // debug lines for each call; never message text
 
 	// ContextLength, when above 0, goes to Ollama as num_ctx on every chat
-	// call, so each model loads with room for Meru's long prompts. Set it
-	// before the first call; merud sets it from [ollama] context_length.
-	// Every call sends the same value, since Ollama reloads a model whose
+	// call to a model with no window of its own (see SetWindow), so each
+	// model loads with room for Meru's long prompts. Set it before the
+	// first call; merud sets it from [ollama] context_length. Every call to
+	// one model sends the same value, since Ollama reloads a model whose
 	// num_ctx changes.
 	ContextLength int
 
-	mu    sync.Mutex              // guards shown
-	shown map[string]ModelDetails // what /api/show said about each model, by model name
+	// EmbedPrompts are the embedding model's task prefixes, and
+	// EmbedContext the num_ctx Embed asks for when above 0. merud sets both
+	// from config.FindEmbedModel before the first call. Every embed call
+	// sends the same num_ctx, so Ollama never reloads the model between
+	// the warm-up, indexing and queries.
+	EmbedPrompts Prompts
+	EmbedContext int
+
+	mu      sync.Mutex              // guards shown and windows
+	shown   map[string]ModelDetails // what /api/show said about each model, by model name
+	windows map[string]int          // num_ctx for the models SetWindow named, by model name
 }
 
 // This line checks at compile time that *OllamaEngine has every Engine
@@ -321,18 +331,38 @@ func (e *OllamaEngine) Stream(ctx context.Context, msgs []Message, tools []ToolS
 	return seq, nil
 }
 
-// Embed turns each text into a vector with the engine's embedding model,
-// through POST /api/embed. It returns one Vector per text, in order. No
-// texts means no request and a nil result. It fails when no embedding model
-// is set, the request fails, or Ollama returns the wrong number of vectors.
-func (e *OllamaEngine) Embed(ctx context.Context, texts []string) ([]Vector, error) {
-	if len(texts) == 0 {
+// Embed turns each input into a vector with the engine's embedding model,
+// through POST /api/embed. It returns one Vector per input, in order. No
+// inputs means no request and a nil result. It fails when no embedding
+// model is set, the request fails, or Ollama returns the wrong number of
+// vectors.
+//
+// Text gets the model's prefix (EmbedPrompts); an image goes as it is.
+// A text-only input goes over the wire as a plain JSON string, the form
+// Ollama has always taken.
+func (e *OllamaEngine) Embed(ctx context.Context, inputs []Input) ([]Vector, error) {
+	if len(inputs) == 0 {
 		return nil, nil
 	}
 	if e.embedModel == "" {
 		return nil, errors.New("ollama embed: no embedding model configured")
 	}
-	body, err := json.Marshal(embedRequest{Model: e.embedModel, Input: texts, KeepAlive: e.keepAlive})
+	items := make([]embedItem, len(inputs))
+	images := 0
+	for i, in := range inputs {
+		items[i] = embedItem{Image: in.Image}
+		if in.Text != "" || in.Title != "" || in.Image == nil {
+			items[i].Text = e.EmbedPrompts.apply(in)
+		}
+		if in.Image != nil {
+			images++
+		}
+	}
+	req := embedRequest{Model: e.embedModel, Input: items, KeepAlive: e.keepAlive}
+	if e.EmbedContext > 0 {
+		req.Options = &embedOptions{NumCtx: e.EmbedContext}
+	}
+	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("ollama /api/embed: encode request: %w", err)
 	}
@@ -340,7 +370,7 @@ func (e *OllamaEngine) Embed(ctx context.Context, texts []string) ([]Vector, err
 	ctx, span := e.startSpan(ctx, http.MethodPost, "/api/embed", body)
 	defer span.End()
 	resp, err := e.do(ctx, span, http.MethodPost, "/api/embed", body,
-		[]any{"model", e.embedModel, "texts", len(texts)})
+		[]any{"model", e.embedModel, "inputs", len(inputs), "images", images})
 	if err != nil {
 		return nil, err
 	}
@@ -351,11 +381,36 @@ func (e *OllamaEngine) Embed(ctx context.Context, texts []string) ([]Vector, err
 		return nil, e.fail(ctx, span, start, "/api/embed",
 			fmt.Errorf("ollama /api/embed: decode reply: %w", ctxErr(ctx, err)))
 	}
-	if len(r.Embeddings) != len(texts) {
+	if len(r.Embeddings) != len(inputs) {
 		return nil, e.fail(ctx, span, start, "/api/embed",
-			fmt.Errorf("ollama /api/embed: sent %d texts, got %d vectors", len(texts), len(r.Embeddings)))
+			fmt.Errorf("ollama /api/embed: sent %d inputs, got %d vectors", len(inputs), len(r.Embeddings)))
 	}
 	return r.Embeddings, nil
+}
+
+// apply returns the text Embed sends for in. A query takes the Query
+// prefix; a document the Document prefix, with "none" for an empty title.
+// With no prefix, a document keeps the form Meru always sent: the title, a
+// blank line, then the text. strings.NewReplacer swaps each placeholder in
+// one pass, so a "{text}" inside the text itself stays as it is.
+func (p Prompts) apply(in Input) string {
+	if in.Query {
+		if p.Query == "" {
+			return in.Text
+		}
+		return strings.NewReplacer("{query}", in.Text).Replace(p.Query)
+	}
+	if p.Document == "" {
+		if in.Title == "" {
+			return in.Text
+		}
+		return in.Title + "\n\n" + in.Text
+	}
+	title := in.Title
+	if title == "" {
+		title = "none"
+	}
+	return strings.NewReplacer("{title}", title, "{text}", in.Text).Replace(p.Document)
 }
 
 // Info reports Ollama's version (GET /api/version) and the models it has in
@@ -520,10 +575,11 @@ func (e *OllamaEngine) chatBody(msgs []Message, tools []ToolSpec, opts Options, 
 		LogProbs:    opts.LogProbs,
 		TopLogProbs: opts.TopLogProbs,
 	}
-	if opts.Temperature != nil || opts.MaxTokens > 0 || e.ContextLength > 0 {
+	numCtx := e.Window(opts.Model)
+	if opts.Temperature != nil || opts.MaxTokens > 0 || numCtx > 0 {
 		// &chatOptions{...} builds the struct and takes its address, which
 		// is what the pointer field wants.
-		req.Options = &chatOptions{Temperature: opts.Temperature, NumPredict: opts.MaxTokens, NumCtx: e.ContextLength}
+		req.Options = &chatOptions{Temperature: opts.Temperature, NumPredict: opts.MaxTokens, NumCtx: numCtx}
 	}
 	// A thinking model asked for log probabilities would spend its tokens
 	// on hidden reasoning, so LogProbs turns thinking off too.

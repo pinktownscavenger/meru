@@ -12,15 +12,21 @@ import (
 // Cite returns the citation line for result r, numbered n:
 //
 //	[1] notes/launch.md, "Q3 launch", lines 12–40
+//	[2] Pictures/plan.png (image)
 //
 // The heading appears when the chunk has one. Text files give a line range
-// (or "line 7" for one line) and PDFs give a page. The path is the one the
-// store holds.
+// (or "line 7" for one line) and PDFs give a page. An image says so, and
+// gives no heading, which would only repeat its name. The path is the one
+// the store holds.
 func Cite(n int, r Result) string {
 	// strings.Builder collects pieces of a string without copying the whole
 	// thing on each addition.
 	var b strings.Builder
 	fmt.Fprintf(&b, "[%d] %s", n, r.Path)
+	if r.IsImage() {
+		b.WriteString(" (image)")
+		return b.String()
+	}
 	if r.Heading != "" {
 		fmt.Fprintf(&b, ", %q", r.Heading)
 	}
@@ -49,6 +55,14 @@ func Format(results []Result) string {
 		b.WriteString("\n")
 		b.WriteString(Cite(i+1, r))
 		b.WriteString("\n")
+		if r.IsImage() {
+			// The text here is only the file's name. A model that can look at
+			// pictures has view_image to open it; either way the user opens
+			// it from the sources. The line doesn't say "you can't see it",
+			// which kept a vision model from trying.
+			b.WriteString("An image the search matched by its look or its name; this text is only its name. Cite it so the user can open it.\n")
+			continue
+		}
 		b.WriteString(strings.TrimSpace(r.Text))
 		b.WriteString("\n")
 	}

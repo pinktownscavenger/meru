@@ -50,8 +50,11 @@ type Status struct {
 	Documents int  `json:"documents"`
 	Scanning  bool `json:"scanning,omitempty"`
 	// Chunks counts the pieces those files were cut into, for the
-	// "On this Mac" panel in Settings.
-	Chunks int `json:"chunks"`
+	// "On this Mac" panel in Settings. Vectors counts the chunks with a
+	// vector; it falls behind Chunks while merud re-embeds every file after
+	// a change of embedding model.
+	Chunks  int `json:"chunks"`
+	Vectors int `json:"vectors"`
 	// Folders counts the [index] folders, and Profile the memories that go
 	// into every prompt. With both at zero Meru knows nothing yet, and the
 	// page opens Setup on its own.
@@ -101,7 +104,7 @@ func (b *Bridge) Status(ctx context.Context) Status {
 	}
 	s.Up = true
 	if st := ev.Status; st != nil {
-		s.Documents, s.Chunks, s.Scanning = st.Documents, st.Chunks, st.Scanning
+		s.Documents, s.Chunks, s.Vectors, s.Scanning = st.Documents, st.Chunks, st.Vectors, st.Scanning
 		s.Folders, s.Profile = len(st.Folders), st.Profile
 	}
 	if ev, err := b.one(ctx, rpc.Request{Op: rpc.OpMCPStatus}, rpc.EventMCPStatus); err == nil {
@@ -116,16 +119,17 @@ func (b *Bridge) Status(ctx context.Context) Status {
 			}
 		}
 	}
-	// The connectors mcp_status doesn't list: web search, which the rail
-	// names when it is on, and Ollama, when it isn't ok. A merud from
+	// The connectors mcp_status doesn't list: web search and speech to
+	// text, which the rail names when they are on, and Ollama, when it
+	// isn't ok. A merud from
 	// before the connectors op answers with an error, and adds nothing.
 	if ev, err := b.one(ctx, rpc.Request{Op: rpc.OpConnectors}, rpc.EventConnectors); err == nil {
 		s.Connectors = connectorDots(ev.Connectors)
 		for _, c := range ev.Connectors {
 			switch {
-			case c.Kind == "container" && c.State == rpc.ConnectorOK:
+			case (c.Kind == "container" || c.Kind == "service") && c.State == rpc.ConnectorOK:
 				s.Connections = append(s.Connections, c.Name)
-			case c.Kind == "container" && c.State != rpc.ConnectorOff,
+			case (c.Kind == "container" || c.Kind == "service") && c.State != rpc.ConnectorOff,
 				c.Kind == "dependency" && c.State != rpc.ConnectorOK:
 				s.Connections = append(s.Connections, c.Name+" ("+rpc.ConnectorWords(c.State)+")")
 			}

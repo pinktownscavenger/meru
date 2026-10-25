@@ -12,13 +12,14 @@
 import { bridge, onUpdate, copyText, errorText } from "./api.js";
 import { icon } from "./icons.js";
 import {
-  el, button, baseName, seconds, createTurn, drawAll, drawStrip, drawApproval, drawNotice,
-  appendToken, approvalCard, thumb,
+  el, button, seconds, createTurn, drawAll, drawStrip, drawApproval, drawNotice,
+  appendToken, approvalCard, thumb, isWebSource, sourceIcon, sourceName, openSource, drawFooter, tickWorking,
 } from "./turns.js";
 import { setupCommands, menuKey, runCommand } from "./commands.js";
-import { openSettings, settingsPanel, policyWords } from "./settings.js";
+import { openSettings, openUsage, settingsPanel, policyWords } from "./settings.js";
 import { openSetup } from "./setup.js";
 import { connectorProgress } from "./connectors.js";
+import { setupVoice } from "./voice.js";
 import { setupOrganize, chatMenu, folderMenu, menuKey as rowMenuKey, deleteDialog, newFolderDialog } from "./organize.js";
 
 // How often the rail asks merud for its status, in milliseconds.
@@ -38,7 +39,7 @@ const SCOPES = [
 ];
 
 const state = {
-  view: "chat", // "chat", "settings" or "setup"
+  view: "chat", // "chat", "settings", "usage" or "setup"
   session: "", // the open conversation's ID; "" for a new one
   // incognito is true while the open chat is an incognito one: merud
   // keeps it in memory only, and the page tells merud to forget it when
@@ -86,6 +87,8 @@ const handlers = {
     bridge.approve(a.view.id, answer).then(
       () => {
         a.answered = choice;
+        // The wait for the user isn't merud being quiet.
+        t.lastNews = Date.now();
         drawApproval(t, handlers);
         drawStrip(t, handlers);
         if (state.asking === t) {
@@ -103,8 +106,16 @@ const handlers = {
       (err) => notice(errorText(err)),
     );
   },
+  // sourceThumb asks the Bridge for an image source's preview.
+  sourceThumb(path) {
+    return bridge.sourceThumb(path);
+  },
   onOpenSource(path) {
     bridge.openSource(path).catch((err) => notice(errorText(err)));
+  },
+  // onOpenURL opens a web source's page in the browser.
+  onOpenURL(url) {
+    bridge.openURL(url).catch((err) => notice(errorText(err)));
   },
   onCopyCode(text, b) {
     copy(text, b);
@@ -118,8 +129,34 @@ const handlers = {
   onRetry(t) {
     send(t.question, t.scope || state.scope, (t.images || []).map((i) => i.path));
   },
+  // canContinue says whether t's footer offers Continue: t stopped short,
+  // and no turn came after it, since merud picks up the chat's last answer.
+  canContinue: (t) => continues(t) && t === newestTurn(),
+  onContinue(t) {
+    continueAnswer(t);
+  },
   whyText: (v) => whyText(v),
 };
+
+// continues reports whether turn t stopped short in a way Continue can
+// pick up: at the length limit or the turn's time limit.
+function continues(t) {
+  return !!t && ["cut_off", "window_full", "timeout"].includes(t.outcome);
+}
+
+// continueAnswer asks merud to pick up the chat's last answer, t, where it
+// stopped. It says why when there's nothing to continue.
+function continueAnswer(t) {
+  if (!continues(t) || t !== newestTurn()) {
+    notice("Only an answer that stopped short, and is the newest in the chat, can continue.");
+    return;
+  }
+  const scope = t.scope || state.scope;
+  bridge.continueAnswer(state.session, scope === "auto" ? "" : scope, state.incognito).then(
+    () => notice(""),
+    (err) => notice(errorText(err)),
+  );
+}
 
 // copy puts text on the clipboard and says so on the button for a moment.
 function copy(text, b) {
@@ -151,9 +188,11 @@ function showView(view) {
   state.view = view;
   $("chat-view").hidden = view !== "chat";
   $("settings-view").hidden = view !== "settings";
+  $("usage-view").hidden = view !== "usage";
   $("setup-view").hidden = view !== "setup";
   $("app").classList.toggle("no-panel", view === "setup");
   $("open-settings").setAttribute("aria-current", String(view === "settings"));
+  $("open-usage").setAttribute("aria-current", String(view === "usage"));
   drawPanel();
   if (view === "chat") $("question").focus();
 }
@@ -168,14 +207,30 @@ const pages = {
   status: () => state.status,
   refreshStatus: () => loadStatus(),
   openSettings: (section, focus) => goSettings(section, focus),
+  openUsage: () => goUsage(),
   openSetup: () => goSetup(),
+  // chatTitle and openChat let the Usage section name and open a chat from
+  // its slowest questions. A chat the rail doesn't list has no title here.
+  chatTitle: (id) => (state.sessions.find((x) => x.id === id) || {}).title || "",
+  openChat: (id, title) => openSession(state.sessions.find((x) => x.id === id) || { id, title }),
 };
 
 // goSettings opens Settings at section, and at the connection focus
-// when given.
+// when given. Usage has its own screen now, so "usage" opens that.
 function goSettings(section, focus) {
+  if (section === "usage") {
+    goUsage();
+    return;
+  }
   showView("settings");
   openSettings($("settings-view"), section || "connections", focus, pages);
+}
+
+// goUsage opens the Usage screen, which asks merud for fresh numbers each
+// time.
+function goUsage() {
+  showView("usage");
+  openUsage($("usage-view"), pages);
 }
 
 // goSetup opens the Setup screen.
@@ -212,6 +267,9 @@ function newTurn(fields) {
     approval: null,
     contacted: [],
     showSteps: false,
+    // lastNews is when merud last sent anything for the turn, so the
+    // strip can say how long the model has gone quiet; see workingText.
+    lastNews: Date.now(),
     ...fields,
   };
 }
@@ -372,8 +430,12 @@ function onStart(u) {
     $("messages").replaceChildren();
     $("chat-title").textContent = state.title;
   }
+  const before = newestTurn();
   const t = newTurn({ n: u.turn, question: u.question, images: u.images || [], scope: state.scope });
   state.turns.push(t);
+  // Only the newest answer can continue, so the one before loses its
+  // Continue button.
+  if (continues(before)) drawFooter(before, handlers);
   state.running = u.turn;
   $("messages").append(createTurn(t, handlers));
   select(t);
@@ -393,6 +455,7 @@ function onEvent(u) {
     drawSessions();
   }
   if (!t) return;
+  t.lastNews = Date.now();
   switch (ev.type) {
     case "route":
       t.route = ev.route || "";
@@ -443,6 +506,7 @@ function onEvent(u) {
       break;
     case "done":
       t.stats = ev;
+      t.outcome = ev.outcome || "";
       break;
     case "error":
       t.error = ev.error || "merud reported an error.";
@@ -458,6 +522,7 @@ function onApproval(u) {
   const t = findTurn(u.turn);
   if (!t) return;
   t.approval = { view: u.approval, answered: null };
+  t.lastNews = Date.now();
   drawApproval(t, handlers);
   drawStrip(t, handlers);
   state.asking = t;
@@ -736,6 +801,10 @@ function loadSessions() {
 // grouped Today, Yesterday and Earlier. The search matches a chat's
 // title, its folder and its tags; while it holds words, a folder with no
 // match hides and every other one opens.
+// JOBS_FOLDER is the chat folder merud files scheduled jobs' runs in; the
+// rail shows it first, with a clock.
+const JOBS_FOLDER = "Jobs";
+
 function drawSessions() {
   const box = $("sessions");
   box.replaceChildren();
@@ -751,6 +820,9 @@ function drawSessions() {
   for (const s of state.sessions) {
     if (s.folder && !folders.includes(s.folder)) folders.push(s.folder);
   }
+  // The Jobs folder, where scheduled jobs' runs go, comes first.
+  const jobsAt = folders.indexOf(JOBS_FOLDER);
+  if (jobsAt > 0) folders.unshift(...folders.splice(jobsAt, 1));
   let drawn = 0;
   folders.forEach((name, i) => {
     const rows = shown.filter((s) => s.folder === name);
@@ -791,7 +863,7 @@ function folderGroup(name, i, rows, searching) {
   head.setAttribute("aria-expanded", String(open));
   const chevron = icon("chevron", 13);
   chevron.classList.add("folder-chevron");
-  head.append(chevron, icon("folder", 14), el("span", "folder-name", name), el("span", "folder-count", String(rows.length)));
+  head.append(chevron, icon(name === JOBS_FOLDER ? "clock" : "folder", 14), el("span", "folder-name", name), el("span", "folder-count", String(rows.length)));
   head.title = name;
   head.addEventListener("click", () => {
     state.folderOpen.set(name, !open);
@@ -945,7 +1017,7 @@ function loadStatus() {
       state.setupShown = true;
       goSetup();
     }
-    if (state.view === "settings") drawPanel();
+    if (state.view === "settings" || state.view === "usage") drawPanel();
   });
 }
 
@@ -996,7 +1068,15 @@ function drawStatus() {
   head.append(el("span", "dot"), document.createTextNode(" Running on " + s.machine));
   box.append(head);
   if (s.model) box.append(row("Answer model", s.model));
-  box.append(row("Files", s.documents.toLocaleString() + (s.scanning ? " · indexing" : "")));
+  // While merud re-embeds every file after a change of search model, the
+  // count of chunks with a vector shows how far it has got.
+  let files = s.documents.toLocaleString();
+  if (s.scanning && s.vectors < s.chunks) {
+    files += " · re-indexing for the new search model, " + s.vectors.toLocaleString() + " of " + s.chunks.toLocaleString();
+  } else if (s.scanning) {
+    files += " · indexing";
+  }
+  box.append(row("Files", files));
   // The connectors get a link each, which opens their card in Settings;
   // the Connections line names the rest, the servers added by hand.
   const dots = s.connectors || [];
@@ -1055,7 +1135,7 @@ function setRail(open) {
 function drawPanel() {
   const body = $("panel-body");
   body.replaceChildren();
-  if (state.view === "settings") {
+  if (state.view === "settings" || state.view === "usage") {
     $("panel-title").textContent = "On this Mac";
     settingsPanel(body, state.status);
     return;
@@ -1073,13 +1153,14 @@ function drawPanel() {
   }
   body.append(el("h3", "", "Sources"));
   if (t.sources.length === 0) {
-    body.append(el("p", "panel-note", "No files from your folders."));
+    body.append(el("p", "panel-note", "No files from your folders and no web pages."));
   } else {
     const ul = el("ul", "panel-list");
     for (const s of t.sources) {
       const li = el("li");
-      const b = button("", { className: "panel-source", onClick: () => handlers.onOpenSource(s.path) });
-      b.append(icon("file", 14), el("span", "", " " + baseName(s.path)));
+      const b = button("", { className: "panel-source", onClick: () => openSource(s, handlers) });
+      const name = isWebSource(s) && s.heading ? s.heading : sourceName(s);
+      b.append(icon(sourceIcon(s), 14), el("span", "", " " + name));
       b.title = "Open " + s.path;
       li.append(b, el("span", "dim path", s.path));
       ul.append(li);
@@ -1243,9 +1324,13 @@ function wire() {
   $("mini-new").append(icon("plus", 18));
   $("mini-chats").append(icon("chats", 18));
   $("mini-settings").append(icon("sliders", 18));
+  $("mini-usage").append(icon("chart", 18));
+  $("open-usage").prepend(icon("chart", 16), document.createTextNode(" "));
   $("open-settings").prepend(icon("sliders", 16), document.createTextNode(" "));
   $("share").prepend(icon("share", 15), document.createTextNode(" "));
   $("attach").append(icon("clip", 17));
+  $("mic").append(icon("mic", 17));
+  $("site").append(icon("globe", 17));
 
   $("new-chat").addEventListener("click", newChat);
   $("new-incognito").prepend(icon("lock", 14), document.createTextNode(" "));
@@ -1267,6 +1352,8 @@ function wire() {
     $("search").focus();
   });
   $("mini-settings").addEventListener("click", () => goSettings("connections"));
+  $("mini-usage").addEventListener("click", goUsage);
+  $("open-usage").addEventListener("click", goUsage);
   $("open-settings").addEventListener("click", () => goSettings("connections"));
   // The logo and the name at the top of the rail open About in Settings.
   $("open-about").addEventListener("click", () => goSettings("about"));
@@ -1276,9 +1363,17 @@ function wire() {
     const v = $("brand-version");
     v.textContent = a.short_version || "";
     if (a.version) v.title = "Version " + a.version;
+    // The globe at the top right opens Meru's website, the link the
+    // about package names "site". It stays hidden if the Bridge has none.
+    const site = (a.links || []).find((l) => l.id === "site");
+    if (site) {
+      $("site").hidden = false;
+      $("site").addEventListener("click", () => bridge.openURL(site.url).catch((err) => notice(errorText(err))));
+    }
   }).catch(() => {});
   $("share").addEventListener("click", () => save(() => bridge.saveChat(state.session), "chat"));
   $("attach").addEventListener("click", attach);
+  setupVoice($("mic"), $("question"), notice);
   $("search").addEventListener("input", (e) => {
     state.filter = e.target.value;
     drawSessions();
@@ -1314,6 +1409,7 @@ function wire() {
       drawSessions();
       $("search").focus();
     },
+    continueAnswer: () => continueAnswer(newestTurn()),
     retry: () => {
       const t = newestTurn();
       if (!t) {
@@ -1416,6 +1512,12 @@ function wire() {
   loadStatus();
   loadSessions();
   setInterval(loadStatus, STATUS_EVERY);
+  // Once a second, the running turn's Working chip says how long merud has
+  // been quiet; a model writing a long tool call sends nothing until it ends.
+  setInterval(() => {
+    const t = state.running ? findTurn(state.running) : null;
+    if (t) tickWorking(t);
+  }, 1000);
   box.focus();
 }
 

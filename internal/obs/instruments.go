@@ -37,6 +37,9 @@ const (
 	metricTurnDocs          = "meru.turn.docs"
 	metricMalformedCalls    = "meru.model.malformed_calls"
 	metricRenderDuration    = "meru.web.render.duration"
+	metricSpeechDuration    = "meru.speech.duration"
+	metricJobRuns           = "meru.scheduler.job_runs"
+	metricJobLateness       = "meru.scheduler.lateness"
 )
 
 // Attribute keys. The gen_ai.* keys are the GenAI convention's own; the
@@ -51,6 +54,9 @@ const (
 	keyOutcome   = "meru.outcome"
 	keySection   = "meru.section"
 	keyStage     = "meru.stage"
+	// keyJob names a scheduled job. Config caps [[jobs]] at 50, so its
+	// values are a small set the user chose.
+	keyJob = "meru.job"
 	// The tool keys match the attributes on the meru.dispatch span, so a
 	// dashboard can join a metric to its traces.
 	keyToolKind   = "meru.tool.kind"
@@ -70,10 +76,10 @@ var (
 	tiers         = []string{"fast", "main", "embed"}
 	routes        = []string{"direct", "search", "tools", "search+tools"}
 	sources       = []string{"cli", "tui", "job", "desktop"}
-	turnOutcomes  = []string{"ok", "error", "cancelled", "timeout", "cut_off", "gave_up", "bad_output"}
+	turnOutcomes  = []string{"ok", "error", "cancelled", "timeout", "cut_off", "window_full", "gave_up", "bad_output"}
 	routeOutcomes = []string{"ok", "low_confidence", "degraded"}
 	sections      = []string{"system", "skills", "memories", "sessions", "chunks", "web", "history", "tools"}
-	stages        = []string{"vector", "fts", "fusion", "memories", "sessions"}
+	stages        = []string{"vector", "fts", "fusion", "memories", "sessions", "images"}
 	toolKinds     = []string{"mcp", "a2a", "builtin", "command"}
 	toolOutcomes  = []string{"ok", "error", "denied", "declined", "cancelled", "timeout"}
 )
@@ -149,6 +155,9 @@ type instruments struct {
 	turnDocs          metric.Int64Histogram
 	malformedCalls    metric.Int64Counter
 	renderDuration    metric.Float64Histogram
+	speechDuration    metric.Float64Histogram
+	jobRuns           metric.Int64Counter
+	jobLateness       metric.Float64Histogram
 }
 
 // newInstruments creates every instrument on meter. Units follow the
@@ -225,6 +234,24 @@ func newInstruments(meter metric.Meter) (*instruments, error) {
 		metric.WithUnit("s"),
 		metric.WithDescription("Duration of one page web_fetch rendered in a headless Chrome, Chrome's start included."),
 		metric.WithExplicitBucketBoundaries(durationBuckets...))
+	keep(err)
+	// Speech to text takes under a second warm, a few with the server's
+	// start: the same spread.
+	in.speechDuration, err = meter.Float64Histogram(metricSpeechDuration,
+		metric.WithUnit("s"),
+		metric.WithDescription("Duration of one recording turned into text, the speech server's start included."),
+		metric.WithExplicitBucketBoundaries(durationBuckets...))
+	keep(err)
+	in.jobRuns, err = meter.Int64Counter(metricJobRuns,
+		metric.WithUnit("{run}"),
+		metric.WithDescription("Scheduled job runs, by job and outcome."))
+	keep(err)
+	// A run starts on time, within a tick, or late after the computer
+	// slept: seconds up to the 12-hour catch-up limit.
+	in.jobLateness, err = meter.Float64Histogram(metricJobLateness,
+		metric.WithUnit("s"),
+		metric.WithDescription("How long after its scheduled time a job's run started."),
+		metric.WithExplicitBucketBoundaries(1, 30, 60, 300, 900, 3600, 3*3600, 12*3600))
 	keep(err)
 	in.retrievalDuration, err = meter.Float64Histogram(metricRetrievalDuration,
 		metric.WithUnit("s"),

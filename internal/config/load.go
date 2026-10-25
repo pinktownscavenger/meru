@@ -11,6 +11,8 @@ import (
 	"log/slog"
 	"maps"
 	"math"
+	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -34,10 +36,12 @@ const MaxWebResults = 20
 // each name here is a tool it serves.
 var builtinTools = []string{
 	"configure", "datetime", "about_meru", "remember", "write_file",
-	"read_file", "list_folder", "grep", "search_files", "web_search", "web_fetch",
+	"read_file", "list_folder", "grep", "search_files", "search_images", "view_image",
+	"web_search", "web_fetch",
+	"search_notes", "list_notes", "read_note", "schedule_job",
 }
 
-// BuiltinTools returns the names of all eleven built-in tools, the default
+// BuiltinTools returns the names of all seventeen built-in tools, the default
 // for [builtin] tools. It returns a copy, so a caller can't change the
 // list the defaults use.
 func BuiltinTools() []string { return slices.Clone(builtinTools) }
@@ -57,14 +61,28 @@ var profiles = map[string]Models{
 	"lite": {
 		Fast:  "hf.co/openbmb/MiniCPM5-2B-GGUF:Q4_K_M",
 		Main:  "hf.co/openbmb/MiniCPM5-2B-GGUF:Q4_K_M",
-		Embed: "nomic-embed-text",
+		Embed: "embeddinggemma-2:440m",
 	},
 	"full": {
 		Fast:  "hf.co/openbmb/MiniCPM5-2B-GGUF:Q4_K_M",
 		Main:  "qwen3.6:35b-a3b-mxfp8",
-		Embed: "qwen3-embedding:0.6b",
+		Embed: "embeddinggemma-2:440m",
 	},
 }
+
+// speechModels maps each profile to its speech-to-text model, the file the
+// whisper connector downloads unless [connectors.whisper] model names the
+// other. It sits beside profiles, not in Models, because the model is the
+// connector's setting, not an Ollama tier. See ARCHITECTURE.md, "Speech to
+// text".
+var speechModels = map[string]string{
+	"lite": "ggml-base.en.bin",
+	"full": "ggml-large-v3-turbo-q5_0.bin",
+}
+
+// SpeechModel returns the speech-to-text model the config's profile picks,
+// which merud hands the whisper connector as its model's default.
+func (c Config) SpeechModel() string { return speechModels[c.Profile] }
 
 // DefaultDir returns the Meru home directory, ~/.meru. It fails only when the
 // operating system can't say where the user's home directory is.
@@ -127,6 +145,7 @@ func defaults() Config {
 			ChunkTokens:   500,
 			OverlapTokens: 50,
 			Watch:         true,
+			Images:        true,
 			Retrieval:     RetrievalAuto,
 		},
 		// Every built-in tool is on. web_fetch, which fetches public pages
@@ -139,7 +158,7 @@ func defaults() Config {
 		Builtin: Builtin{Tools: BuiltinTools(), Confirm: []string{"write_file"}},
 		Skills:  Skills{OutputDir: "~/meru-output", Disabled: []string{}},
 		// web_search runs through a SearXNG the user starts on this port.
-		Web:  Web{SearXNGURL: "http://127.0.0.1:8888", MaxResults: 8, Render: RenderAuto},
+		Web:  Web{SearXNGURL: "http://127.0.0.1:8888", MaxResults: 8, Render: RenderAuto, TrustedSites: []string{}},
 		Chat: Chat{MouseCopy: true},
 	}
 }
@@ -284,6 +303,11 @@ func validate(cfg Config) error {
 			add("observability.otlp_endpoint: %w", err)
 		}
 	}
+	if o.Prometheus != "" {
+		if err := checkPrometheus(o.Prometheus); err != nil {
+			add("observability.prometheus %q: %w", o.Prometheus, err)
+		}
+	}
 	if d, err := time.ParseDuration(o.MetricsInterval); err != nil || d <= 0 {
 		add("observability.metrics_interval %q must be a positive duration such as \"10s\"", o.MetricsInterval)
 	}
@@ -301,6 +325,11 @@ func validate(cfg Config) error {
 	if n := cfg.Web.MaxResults; n < 1 || n > MaxWebResults {
 		add("web.max_results is %d; it must be between 1 and %d", n, MaxWebResults)
 	}
+	for _, h := range cfg.Web.TrustedSites {
+		if err := CheckTrustedSite(h); err != nil {
+			add("web.trusted_sites: %w", err)
+		}
+	}
 	if r := cfg.Web.Render; r != RenderAuto && r != RenderOff {
 		add("web.render is %q; it must be %q (render pages that need JavaScript) or %q", r, RenderAuto, RenderOff)
 	}
@@ -314,6 +343,7 @@ func validate(cfg Config) error {
 	for _, err := range checkBuiltin(cfg.Builtin) {
 		add("%w", err)
 	}
+	errs = append(errs, checkJobs(cfg)...)
 	for _, err := range checkConnectors(cfg.Connectors) {
 		add("%w", err)
 	}
@@ -525,4 +555,48 @@ func ProfileModels(name string) (Models, bool) {
 func renamedNetwork(k toml.Key) bool {
 	return len(k) == 3 && k[2] == "network" &&
 		((k[0] == "mcp" && k[1] == "servers") || (k[0] == "a2a" && k[1] == "agents"))
+}
+
+// checkPrometheus fails unless addr is host:port with a loopback host and a
+// port from 1 to 65535, such as 127.0.0.1:9464. merud listens there, so the
+// rule is the same one loopback.CheckURL holds for every address merud uses.
+func checkPrometheus(addr string) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("write it as host:port, such as 127.0.0.1:9464")
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("the port must be a number from 1 to 65535")
+	}
+	if host == "" {
+		return fmt.Errorf("name the host, such as 127.0.0.1; an empty host listens on every network")
+	}
+	if err := loopback.CheckURL("http://" + addr); err != nil {
+		return fmt.Errorf("%w; merud serves metrics on this machine only", err)
+	}
+	return nil
+}
+
+// trustedSite is what a [web] trusted_sites entry may hold: a host name of
+// lower-case letters, digits, hyphens and dots, with at least one dot, such
+// as "raw.githubusercontent.com". No scheme, path, port or wildcard fits it.
+var trustedSite = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
+
+// CheckTrustedSite fails when host can't be a [web] trusted_sites entry:
+// anything but a bare host name, or a name for this machine, which
+// web_fetch never reads anyway. merud calls it before it saves a host the
+// user trusted.
+func CheckTrustedSite(host string) error {
+	if !trustedSite.MatchString(host) {
+		return fmt.Errorf("%q isn't a bare host name such as \"raw.githubusercontent.com\": no scheme, path, port or wildcard", host)
+	}
+	// netip.ParseAddr succeeds only for an IP address, which names a
+	// machine rather than a site.
+	if _, err := netip.ParseAddr(host); err == nil {
+		return fmt.Errorf("%q is an address; trust a site by its host name", host)
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") || strings.HasSuffix(host, ".local") {
+		return fmt.Errorf("%q is on this machine or this network, which web_fetch never reads", host)
+	}
+	return nil
 }

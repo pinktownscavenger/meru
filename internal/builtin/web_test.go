@@ -24,6 +24,7 @@ import (
 	"github.com/aarora79/meru/internal/config"
 	"github.com/aarora79/meru/internal/dispatch"
 	"github.com/aarora79/meru/internal/engine"
+	"github.com/aarora79/meru/internal/rpc"
 )
 
 // webTools returns built-in tools with only the web tools configured.
@@ -91,7 +92,7 @@ func TestWebSearch(t *testing.T) {
 		{
 			name: "results", status: 200, body: json, args: `{"query":"go release"}`,
 			want: []string{
-				`Web results for "go release", 3 of 3. Cite each result you use by its URL.`,
+				`Web results for "go release", 3 of 3. Cite each result you use by its number, such as [1].`,
 				"[1] Release History - The Go Programming Language — https://go.dev/doc/devel/release",
 				"Published 2026-02-10.",
 				"[2] Go 1.26 is released — https://go.dev/blog/go1.26",
@@ -303,7 +304,7 @@ func TestWebFetch(t *testing.T) {
 		{name: "redirect followed", args: `{"url":"` + srv.URL + `/moved"}`, want: []string{srv.URL + "/notes.txt\n", "plain notes"}},
 		{name: "no cookies kept", args: `{"url":"` + srv.URL + `/set-cookie"}`, want: []string{"no cookie"}},
 		{name: "content type refused", args: `{"url":"` + srv.URL + `/image.png"}`, want: []string{`"image/png"`, "HTML, PDF and plain text"}, isErr: true},
-		{name: "too large", args: `{"url":"` + srv.URL + `/huge.txt"}`, want: []string{"larger than 5.0 MB"}, isErr: true},
+		{name: "too large", args: `{"url":"` + srv.URL + `/huge.txt"}`, want: []string{"larger than 16.0 MB"}, isErr: true},
 		{name: "not found", args: `{"url":"` + srv.URL + `/missing"}`, want: []string{"404"}, isErr: true},
 		{name: "redirect loop", args: `{"url":"` + srv.URL + `/loop"}`, want: []string{"stopped after 5 redirects"}, isErr: true},
 		{
@@ -488,5 +489,35 @@ func TestWebSearchFollowsCheck(t *testing.T) {
 	ok = true
 	if spec, listed := offered(); !spec || !listed {
 		t.Errorf("web_search offered %v, listed %v once the check passes", spec, listed)
+	}
+}
+
+// TestWebSearchSources checks that web_search numbers its results after
+// the turn's other sources, from the counter dispatch carries, and returns
+// one web source per result with its URL and title (#174).
+func TestWebSearchSources(t *testing.T) {
+	srv := fakeSearXNG(t, 200, strings.Replace(searxngJSON, "LONG", "x", 1), nil)
+	tools := webTools(t, config.Web{SearXNGURL: srv.URL + "/", MaxResults: 8})
+	// Four file excerpts came first, so the web results start at [5].
+	next := 5
+	ctx := dispatch.WithCiteNumbers(context.Background(), func(n int) int { first := next; next += n; return first })
+	res, err := tools.Call(ctx, WebSearch, []byte(`{"query":"go release"}`))
+	if err != nil || res.IsError {
+		t.Fatalf("Call = %+v, %v", res, err)
+	}
+	if !strings.Contains(res.Text, "[5] Release History - The Go Programming Language — https://go.dev/doc/devel/release") ||
+		!strings.Contains(res.Text, "[7] (no title) — ") || strings.Contains(res.Text, "[1] ") {
+		t.Errorf("text doesn't number from 5:\n%s", res.Text)
+	}
+	if len(res.Sources) != 3 {
+		t.Fatalf("sources = %+v, want 3", res.Sources)
+	}
+	s := res.Sources[0]
+	if s.N != 5 || s.Kind != rpc.SourceWeb || s.URL != "https://go.dev/doc/devel/release" || s.Path != s.URL ||
+		s.Heading != "Release History - The Go Programming Language" {
+		t.Errorf("first source = %+v", s)
+	}
+	if next != 8 {
+		t.Errorf("the counter moved to %d, want 8", next)
 	}
 }

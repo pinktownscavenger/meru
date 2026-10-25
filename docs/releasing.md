@@ -40,7 +40,9 @@ out. CI also checks the commit first, and the script runs `make check` again.
   needs, the pull requests and the closed issues. Merge its pull request
   before you run `make release`, which uses that file as the GitHub release's
   text. Without the file, the release gets GitHub's list of merged pull
-  requests alone.
+  requests alone. The same pull request moves the version lines: the README's
+  status, AGENTS.md's Status, and the landing page's release pill, whose
+  version, link and time `docs/index.html` holds.
 
 ## What `make release` does
 
@@ -148,7 +150,7 @@ curl -fsSL https://github.com/aarora79/meru/releases/latest/download/install.sh 
 `make release` attaches `scripts/install.sh` to every release, so that URL always
 serves the latest copy. A plain `curl -LO` of any file's URL works too. People
 who'd rather not use Terminal download `Meru-v0.4.1-macos-arm64.dmg`, open it and
-run "Install Meru.app", which walks through ten steps in a window
+run "Install Meru.app", which walks through eleven steps in a window
 ([running.md](running.md#the-mac-installer)).
 
 To try the disk image before a release, `make dmg` builds

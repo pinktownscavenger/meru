@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -82,6 +83,35 @@ func TestRetry(t *testing.T) {
 	}
 	if len(m.turns) != 2 || m.input.Value() != "" {
 		t.Errorf("turns = %d, input %q", len(m.turns), m.input.Value())
+	}
+}
+
+func TestContinue(t *testing.T) {
+	merud := &fakeMerud{events: []rpc.Event{{Type: rpc.EventDone}}}
+	m := testModel(merud.ask, newFakeSender())
+	m.width, m.height = 80, 30
+	m.session = "2026-10-19T234933-aea8"
+	// A whole answer has nothing to continue.
+	m.turns = []exchange{{question: "compare the release notes", state: stateDone, answer: "Both add…", stats: rpc.Event{Type: rpc.EventDone}}}
+	m, _ = update(t, m, typeText("/continue"), press(tea.KeyEnter))
+	if !strings.Contains(m.notice, "nothing to continue") || len(merud.reqs) != 0 {
+		t.Fatalf("notice %q, %d requests", m.notice, len(merud.reqs))
+	}
+	// One that stopped short shows the hint and continues.
+	m.turns[0].stats.Outcome = "window_full"
+	m.turns[0].scope = rpc.ScopeWeb
+	if view := m.renderTurn(&m.turns[0]); !strings.Contains(view, "/continue picks up") {
+		t.Errorf("turn lacks the hint:\n%s", view)
+	}
+	m, cmd := update(t, m, typeText("/continue"), press(tea.KeyEnter))
+	finishTurn(cmd)
+	r := lastReq(t, merud)
+	if !r.Continue || r.Session != m.session || r.Text != continueWords || r.Scope != rpc.ScopeWeb {
+		t.Errorf("request = %+v, want a continue of the session", r)
+	}
+	// The hint goes once a newer turn follows.
+	if view := m.renderTurn(&m.turns[0]); strings.Contains(view, "/continue picks up") {
+		t.Error("an older turn still shows the hint")
 	}
 }
 
@@ -303,6 +333,155 @@ func TestFoldersKeys(t *testing.T) {
 	_, cmd = update(t, m, press(tea.KeyEsc), typeText("/folders add ~/Garden"), press(tea.KeyEnter))
 	cmd()
 	if r := lastReq(t, merud); r.Op != rpc.OpFolderAdd || r.Path != filepath.Join("/Users/dana", "Garden") {
+		t.Errorf("request = %+v", r)
+	}
+}
+
+func TestJobsKeys(t *testing.T) {
+	brief := rpc.JobInfo{JobSpec: rpc.JobSpec{Name: "morning-brief", Schedule: "0 7 * * 1-5", Prompt: "Brief me."}, When: "7:00 on weekdays",
+		Next: "2026-10-27T07:00:00-04:00", Last: "2026-10-24T07:00:00-04:00", LastOutcome: "ok", LastSession: "2026-10-24T110000-ab12"}
+	running := brief
+	running.Running, running.Started = true, "2026-10-26T12:00:00-04:00"
+	merud := &fakeMerud{events: []rpc.Event{{Type: rpc.EventJobs, Jobs: []rpc.JobInfo{brief}}, {Type: rpc.EventDone}}}
+	m := testModel(merud.ask, newFakeSender())
+	m.width, m.height = 100, 30
+	m, cmd := update(t, m, typeText("/jobs"), press(tea.KeyEnter))
+	m, _ = update(t, m, cmd())
+	if r := lastReq(t, merud); r.Op != rpc.OpJobs {
+		t.Fatalf("request = %+v, want jobs", r)
+	}
+	if view := m.View(); !strings.Contains(view, "morning-brief  7:00 on weekdays") || !strings.Contains(view, ", ok") {
+		t.Errorf("view lacks the job:\n%s", view)
+	}
+
+	// c on a job that isn't running says so and sends nothing.
+	before := len(merud.reqs)
+	m, cmd = update(t, m, typeText("c"))
+	if cmd != nil || len(merud.reqs) != before || !strings.Contains(m.notice, "isn't running") {
+		t.Errorf("c with no run: cmd %v, notice %q", cmd != nil, m.notice)
+	}
+
+	// Enter runs it now; the reply shows it running.
+	merud.events = []rpc.Event{{Type: rpc.EventJobs, Jobs: []rpc.JobInfo{running}}, {Type: rpc.EventDone}}
+	m, cmd = update(t, m, press(tea.KeyEnter))
+	m, _ = update(t, m, cmd())
+	if r := lastReq(t, merud); r.Op != rpc.OpJobRun || r.ID != "morning-brief" {
+		t.Errorf("request = %+v, want job_run", r)
+	}
+	if view := m.View(); !strings.Contains(view, "running since") {
+		t.Errorf("view doesn't show the run:\n%s", view)
+	}
+
+	// c stops it.
+	merud.events = []rpc.Event{{Type: rpc.EventJobs, Jobs: []rpc.JobInfo{brief}}, {Type: rpc.EventDone}}
+	m, cmd = update(t, m, typeText("c"))
+	m, _ = update(t, m, cmd())
+	if r := lastReq(t, merud); r.Op != rpc.OpJobCancel || r.ID != "morning-brief" {
+		t.Errorf("request = %+v, want job_cancel", r)
+	}
+
+	// o opens the last run's chat.
+	merud.events = []rpc.Event{{Type: rpc.EventTurns, Turns: []rpc.TurnInfo{{Question: "Brief me.", Answer: "Here is your brief."}}}, {Type: rpc.EventDone}}
+	m, cmd = update(t, m, typeText("o"))
+	m, _ = update(t, m, cmd())
+	if r := lastReq(t, merud); r.Op != rpc.OpSessionTurns || r.Session != brief.LastSession {
+		t.Errorf("request = %+v, want the last run's turns", r)
+	}
+	if m.jobsBox != nil || m.session != brief.LastSession || len(m.turns) != 1 {
+		t.Errorf("after o: box open %v, session %q, turns %d", m.jobsBox != nil, m.session, len(m.turns))
+	}
+}
+
+func TestJobsChangeKeys(t *testing.T) {
+	brief := rpc.JobInfo{JobSpec: rpc.JobSpec{Name: "morning-brief", Schedule: "0 7 * * 1-5", Prompt: "Brief me."}, When: "7:00 on weekdays"}
+	list := []rpc.Event{{Type: rpc.EventJobs, Jobs: []rpc.JobInfo{brief}}, {Type: rpc.EventDone}}
+	merud := &fakeMerud{events: list}
+	m := testModel(merud.ask, newFakeSender())
+	m.width, m.height = 100, 30
+	m, cmd := update(t, m, typeText("/jobs"), press(tea.KeyEnter))
+	m, _ = update(t, m, cmd())
+
+	// p pauses: a job_set of the same job with Paused on.
+	m, cmd = update(t, m, typeText("p"))
+	m, _ = update(t, m, cmd())
+	if r := lastReq(t, merud); r.Op != rpc.OpJobSet || r.ID != "morning-brief" || r.JobSpec == nil ||
+		!r.JobSpec.Paused || r.JobSpec.Prompt != "Brief me." {
+		t.Errorf("p sent %+v", r)
+	}
+
+	// d once only warns; d again removes.
+	before := len(merud.reqs)
+	m, cmd = update(t, m, typeText("d"))
+	if cmd != nil || len(merud.reqs) != before || !strings.Contains(m.notice, "d again") {
+		t.Errorf("a first d: cmd %v, notice %q", cmd != nil, m.notice)
+	}
+	m, cmd = update(t, m, typeText("d"))
+	m, _ = update(t, m, cmd())
+	if r := lastReq(t, merud); r.Op != rpc.OpJobRemove || r.ID != "morning-brief" {
+		t.Errorf("d d sent %+v", r)
+	}
+
+	// a walks through a new job: name, schedule, prompt, then an empty
+	// skill saves it.
+	m, _ = update(t, m, typeText("a"))
+	if m.jobsBox.walk == nil || !strings.Contains(m.View(), "New job · Name") {
+		t.Fatalf("a opened no form:\n%s", m.View())
+	}
+	m, _ = update(t, m, typeText("go-news"), press(tea.KeyEnter), typeText("0 9 * * 2"), press(tea.KeyEnter),
+		typeText("What's new in Go?"), press(tea.KeyEnter))
+	m, cmd = update(t, m, press(tea.KeyEnter))
+	m, _ = update(t, m, cmd())
+	if r := lastReq(t, merud); r.Op != rpc.OpJobSet || r.ID != "" || r.JobSpec == nil ||
+		!reflect.DeepEqual(*r.JobSpec, rpc.JobSpec{Name: "go-news", Schedule: "0 9 * * 2", Prompt: "What's new in Go?"}) {
+		t.Errorf("a sent %+v", r)
+	}
+
+	// e keeps what an empty Enter passes over, and Esc leaves the form,
+	// not the box.
+	m, _ = update(t, m, typeText("e"), press(tea.KeyEnter), typeText("30 7 * * 1-5"), press(tea.KeyEnter), press(tea.KeyEnter))
+	m, cmd = update(t, m, press(tea.KeyEnter))
+	m, _ = update(t, m, cmd())
+	if r := lastReq(t, merud); r.Op != rpc.OpJobSet || r.ID != "morning-brief" || r.JobSpec.Name != "morning-brief" ||
+		r.JobSpec.Schedule != "30 7 * * 1-5" || r.JobSpec.Prompt != "Brief me." {
+		t.Errorf("e sent %+v", r)
+	}
+	m, _ = update(t, m, typeText("e"), press(tea.KeyEsc))
+	if m.jobsBox == nil || m.jobsBox.walk != nil {
+		t.Errorf("Esc: box %v, form %v", m.jobsBox != nil, m.jobsBox != nil && m.jobsBox.walk != nil)
+	}
+}
+
+func TestSitesKeys(t *testing.T) {
+	list := rpc.Event{Type: rpc.EventTrustedSites, Sites: []string{"en.wikipedia.org", "go.dev"}}
+	merud := &fakeMerud{events: []rpc.Event{list, {Type: rpc.EventDone}}}
+	m := testModel(merud.ask, newFakeSender())
+	m, cmd := update(t, m, typeText("/sites"), press(tea.KeyEnter))
+	m, _ = update(t, m, cmd())
+	if r := lastReq(t, merud); r.Op != rpc.OpTrustedSites {
+		t.Fatalf("request = %+v, want trusted_sites", r)
+	}
+	if view := m.View(); !strings.Contains(view, "go.dev") {
+		t.Errorf("view lacks the sites:\n%s", view)
+	}
+	// d twice on the second row removes it.
+	m, _ = update(t, m, press(tea.KeyDown))
+	m, cmd = update(t, m, typeText("d"))
+	if cmd != nil || m.sitesBox.confirm != "go.dev" {
+		t.Fatalf("first d: cmd %v, confirm %q", cmd != nil, m.sitesBox.confirm)
+	}
+	merud.events = []rpc.Event{{Type: rpc.EventTrustedSites, Sites: []string{"en.wikipedia.org"}}, {Type: rpc.EventDone}}
+	m, cmd = update(t, m, typeText("d"))
+	m, _ = update(t, m, cmd())
+	if r := lastReq(t, merud); r.Op != rpc.OpTrustedSiteRemove || r.ID != "go.dev" {
+		t.Errorf("request = %+v, want trusted_site_remove go.dev", r)
+	}
+	if !slices.Equal(m.sitesBox.sites, []string{"en.wikipedia.org"}) {
+		t.Errorf("sites = %v after the removal", m.sitesBox.sites)
+	}
+	// /sites remove takes a host by name.
+	_, cmd = update(t, m, press(tea.KeyEsc), typeText("/sites remove en.wikipedia.org"), press(tea.KeyEnter))
+	cmd()
+	if r := lastReq(t, merud); r.Op != rpc.OpTrustedSiteRemove || r.ID != "en.wikipedia.org" {
 		t.Errorf("request = %+v", r)
 	}
 }

@@ -53,7 +53,12 @@ main model's token counts (`tokens_in`, `tokens_out`), the time the model spent
 writing (`eval_ms`), and the time per output token (`tpot_ms`, `eval_ms` over
 `tokens_out`). `tpot_ms` is a `float64`, so it keeps the fraction. Every field has `omitempty`, so a `ping`'s `done` stays
 `{"type":"done"}`, and a client built before these fields existed skips
-them.
+them. `outcome` joined them later: it says how a turn ended without a whole
+answer, `cut_off`, `window_full`, `timeout`, `gave_up`, `bad_output` or `no_vision`, and both
+clients offer Continue after the first two. A request asks for that with
+`continue: true` on an `ask`, with the chat's `session` and no `text` needed;
+`merud` then picks up the session's last answer (see [agent](agent.md),
+"Continue").
 
 v0.2 added, without changing anything older clients read:
 
@@ -256,6 +261,24 @@ The request names paths, never bytes, so an image doesn't cross the socket;
 `TurnInfo.Images` hands the same full paths back when a session reopens, so the
 app can show the images again.
 
+A `transcribe` request does send bytes: the recording, in `Request.Audio`, a
+pointer to an `Audio` struct whose `WAV` holds the whole file. The app has the
+sound in memory and nothing on disk to name, and Meru keeps no audio file, so
+the bytes ride in the request as base64. The reply is one `transcript` event
+whose `Text` is the words (see [speech](speech.md)).
+
+Two choices joined `once`, `session` and `deny` for `web_fetch`'s prompt:
+`ChoiceSite` (`"site"`), this website for this chat, and `ChoiceSiteAlways`
+(`"site_always"`), always this website. `Approval.Site` names the host both
+choices cover, so each client can put it on the button. An older client offers
+only the choices it knows from the list; `merud` treats any other answer as deny.
+The websites "always" saves have two ops of their own:
+
+| Op | Reply | What it carries |
+| --- | --- | --- |
+| `trusted_sites` (`OpTrustedSites`) | one `trusted_sites` event | `Sites`, the hosts in `[web] trusted_sites`. A missing list reads as none. |
+| `trusted_site_remove` (`OpTrustedSiteRemove`) | one `trusted_sites` event | Takes the host in `Request.ID` off the list and returns the hosts left. It fails for a host the list doesn't hold. |
+
 `ToolName(kind, server, tool)` joins a transcript line's three fields back into
 the name the model saw, such as `google.search_gmail_messages` or `cmd.backup`.
 
@@ -321,8 +344,13 @@ Two helpers both clients use, so `meru` and `meru chat` show sources the same
 way:
 
 - **`Citation.String`** writes one line: `[1] ~/notes/garden.md, "Planting",
-  lines 3–5`. A method named `String` also makes `fmt.Println(c)` print it
-  this way.
+  lines 3–5`, or `[2] ~/Documents/img/shot.png (image)` for a citation whose
+  `Kind` is `"image"`. A method named `String` also makes `fmt.Println(c)` print
+  it this way. `Kind` is empty for text, so an older client shows an image as
+  any other source. A web page, `Kind` `SourceWeb`, prints as `[5] Release
+  History — https://go.dev/doc/devel/release`, from its `Heading` and `URL`.
+- **`Citation.Link(home)`** is the address a source line links to: a web page's
+  `URL`, or the file's `FileURL`.
 - **`Cited(answer, sources)`** finds the `[1]` and `[1, 3]` marks in the
   answer with a regular expression and returns the sources they name. No
   marks means no sources: the model decides when a source matters.
@@ -384,19 +412,34 @@ chat`'s `/usage by model` shows them, with `ShortMillis` for the time to first
 token (`820ms`, `1.2s`) and tokens per second worked out as `TokensOut` over
 `EvalMillis`. `ModelUsageNote` goes under it and says what the columns count.
 
+`UsageDetail` is the third `Kind`, the one the Usage screen and the `/usage` box
+send. `merud` answers it with one `usage_detail` event, whose `UsageDetail`
+field holds a `UsageDetailReply`: `Days` (one `UsageDay` per local day,
+oldest first, with tasks, tokens and the p50 and p95 time to first token),
+`Slowest` (`SlowQuestion` rows), `Tools` (`ToolOutcomes`, a count per
+outcome in a map), `Models` (the by-model windows) and `Metrics`, the
+`/metrics` address or `""`. `UsageDays`, `SlowestDays`, `SlowestCount` and
+`ToolsCount` fix the sizes in one place both sides read. An older `merud`
+doesn't know the kind and answers with plain windows, so a client that wants
+the detail checks the event's type, not only that a reply came.
+
 ### client.go
 
 `Do` dials the socket, sends the request and returns the events as an
 iterator, which callers read with `for ev, err := range rpc.Do(...)`. Cancelling
 the caller's context closes the connection.
 
+Two limits guard against a peer that sends endless data. `maxLine`, 1 MiB,
+caps an event and an approval reply. `MaxRequestLine`, 4 MiB, caps a request:
+a minute of audio takes 2.6 MB in base64, and only a request carries it.
+
 ### server.go
 
 `serveConn` answers `ping` itself and hands `ask`, `index`, `index_status`,
 `tools`, `log`, `usage`, the memory ops (`memory_list`, `memory_add`,
 `memory_forget`), the skill ops (`skills`, `skill_show`, `skill_reset`) and the
-MCP ops (`mcp_probe`, `mcp_reload`, `mcp_status`), `connectors`, and the
-history and settings ops to the handler. Any other op gets an
+MCP ops (`mcp_probe`, `mcp_reload`, `mcp_status`), `connectors`, the
+history and settings ops, and `transcribe` to the handler. Any other op gets an
 `unknown op` error.
 
 **Listen** claims the socket. A socket file can outlive a `merud` that crashed,
@@ -498,6 +541,28 @@ the error, or `rpc cancelled` with the reason. To tell a hang-up from a
 shutdown it keeps the server's own context as `serverCtx`: if that one is
 cancelled too, `merud` is stopping; if not, the client hung up. A cancel also
 adds a `cancelled` event to the span.
+
+### Scheduled jobs
+
+`jobs` (`OpJobs`) replies with one `jobs` event whose `Jobs` holds a `JobInfo`
+per job: the schedule and `When` in words, the prompt and skill, `Paused`,
+`Next`, `Last`, `LastOutcome` and `LastSession`, and `Running` with `Started`.
+`job_run` and `job_cancel` take the job's name in `ID`, run it now or stop its
+run, and reply with the same event.
+
+`JobInfo` embeds a `JobSpec`, the job as `config.toml` holds it: name,
+schedule, `EveryWeeks` and `From`, prompt, skill, command and `Args`, `Allow`,
+`Output` and `Paused`. Embedding means a struct named inside another without a
+field name: its fields read as the outer struct's own (`j.Name`), and
+`encoding/json` writes its keys at the top level, so the JSON a client reads
+stays as it was. `job_set` (`OpJobSet`) carries a `JobSpec` in
+`Request.JobSpec`, with the old name in `ID` for an edit, and replies with the
+list. With `DryRun` it saves nothing and the `jobs` event holds only that job,
+with `When` and `Next`, for the desktop form's live line. `job_remove`
+(`OpJobRemove`) takes the name in `ID`. `Request.Job` and `Request.Skill` belong to
+the asks `merud`'s scheduler makes for itself; the server refuses either from a
+client, before the handler sees the request, so no client can make an ask that
+passes as a job.
 
 ## Go ideas used here
 

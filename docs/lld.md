@@ -38,7 +38,7 @@ allows only code inside this repo to import.
 | `cmd/meru-desktop` | the desktop app's window (Wails v3, build tag `desktop`): opens it, serves the page, binds the Bridge | `main.go`: `run` |
 | `internal/desktop` | everything in the desktop app that needs no window: the Bridge the page calls, the views it sends, and the page (`web/`) | `bridge.go`: `Send`, `run`, then `views.go`, `history.go`, `status.go`, `settings.go`, `files.go`, `commands.go`, `assets.go` |
 | `cmd/meru-installer` | the Mac installer's window (Wails v3, build tag `desktop`): opens it, serves the page with Meru.app's styles behind it, binds the Bridge | `main.go`: `run` |
-| `internal/installer` | the Mac installer's ten steps, its Bridge, and the one allowlist of programs it runs (see [Installer](../ARCHITECTURE.md#installer)) | `bridge.go`: `Run`, `run`, then `steps.go`, `run.go` and one file per step |
+| `internal/installer` | the Mac installer's eleven steps, its Bridge, and the one allowlist of programs it runs (see [Installer](../ARCHITECTURE.md#installer)) | `bridge.go`: `Run`, `run`, then `steps.go`, `run.go` and one file per step |
 | `internal/opener` | hands an `http`, `https` or `file` URL to the system's opener, with no shell | `opener.go`: `Check`, `Open` |
 | `internal/config` | reads and checks `~/.meru/config.toml` | `load.go`: `Load` |
 | `internal/connectors` | the connector manifests, compiled in, with pinned versions, and the checks on them; the pinned Node and uv, and each connector's install under `~/.meru/runtime`; the supervisor, one per stdio connector, which `merud` builds at startup: it checks the connector's settings, installs and health-checks it, starts it on the first call, stops it when idle and restarts it after a crash; and the SearXNG container's supervisor, which checks it every minute and runs Meru's container when config asks (see [Connectors and the supervisor](../ARCHITECTURE.md#connectors-and-the-supervisor)) | `manifest.go`: `Load`, `Parse`, `Validate`; `runtimes.go`: `Runtimes`, `EnsureRuntime`; `install.go`: `Install`, `Installed`; `launch.go`: `LaunchCommand`; `run.go`: `Runner`, `ExecRunner`, `stdioTransport`; `supervisor.go`: `New`, `Configure`, `Spawn`, `Status`, `Close`; `container.go`: `ContainerMode`, `NewContainer`, `Configure`, `OK`, `Status`, `Close`; `status.go`: `checkSettings`; `health.go`: `runHealthCheck` |
@@ -50,10 +50,13 @@ allows only code inside this repo to import.
 | `internal/agent` | runs one turn, from question to answer, with its tool rounds | `agent.go`: `Handle`, then `tools.go`: `converse`, `runTools` |
 | `internal/dispatch` | the one path for every tool call: allowlist, approval, call, transcript lines, `tool_calls` row, metrics, span | `dispatch.go`: `Backend`, then `dispatcher.go`: `Dispatch` |
 | `internal/a2a` | the A2A client: reads agent cards, turns allowed skills into tools, sends messages | `client.go`: `New`, then `call.go`: `Call` |
-| `internal/builtin` | tools that live inside `merud`: `configure`, `datetime` and `about_meru`, and from v0.4 `remember`, `write_file`, the read-only `read_file`, `list_folder`, `grep` and `search_files`, and the web tools `web_search` and `web_fetch` | `builtin.go`: `Confirm`, `Call`; then `files.go`, `web.go`, `webguard.go`: `ConfirmCall` and `webdownload.go` |
+| `internal/builtin` | tools that live inside `merud`: `configure`, `datetime` and `about_meru`, and from v0.4 `remember`, `write_file`, the read-only `read_file`, `list_folder`, `grep`, `search_files`, `search_images` and `view_image`, the web tools `web_search` and `web_fetch`, the Apple Notes tools `search_notes`, `list_notes` and `read_note`, and from v0.5 `schedule_job` | `builtin.go`: `Confirm`, `Call`; then `files.go`, `web.go`, `webguard.go`: `ConfirmCall`, `webdownload.go`, `notes.go` and `schedulejob.go`: `AuditArgs` |
+| `internal/speech` | speech to text for the `transcribe` op: reads a WAV header for the length, posts the file to the whisper connector's server, cleans Whisper's markers (see [Speech to text](../ARCHITECTURE.md#speech-to-text)) | `speech.go`: `CheckWAV`, `Transcribe`, `Clean` |
+| `internal/jobs` | the time rules for scheduled jobs (v0.5): parses a five-field cron schedule with `every_weeks` and `from`, finds the next run, says it in words, and decides whether a job runs now or was missed too long ago (see [Scheduler](../ARCHITECTURE.md#scheduler)) | `schedule.go`: `Parse`, `Next`, `Describe`; `due.go`: `Due`, `CatchUp`; `scheduler.go`: `New`, `Set`, `Loop`, `RunNow`, `Cancel`, `Status` |
+| `internal/applenotes` | reads the Notes app's `NoteStore.sqlite`, live and read-only: finds the schema at run time and decodes each note's text from its gzipped protobuf (see [the built-in tools](../ARCHITECTURE.md#approving-a-tool-call)) | `store.go`: `Open`, `Search`, `Note`, `Folders`; `body.go`: `noteText` |
 | `internal/render` | `web_fetch`'s page reader: for a page whose text comes from JavaScript, it installs the pinned `chrome-headless-shell` on first need, starts a proxy on loopback and a fresh Chrome for that page, drives Chrome over two pipes, waits for the text and the traffic to settle, and returns the HTML (see [Pages that need JavaScript](../ARCHITECTURE.md#pages-that-need-javascript)) | `render.go`: `New`, `Render`, `Ready`, `Close`; `browser.go`: `startBrowser`; `cdp.go`: `call`; `proxy.go`: `startProxy`, `arm` |
 | `internal/commands` | the `[[commands]]` entries: startup checks, rendering the model's arguments into an argv, running the program with no shell, and the `dispatch` backend for `cmd.<name>` tools | `commands.go`: `New`, then `render.go`: `Render`, `run.go`: `Run` and `set.go` |
-| `internal/catalog` | the starter MCP servers, the config block for each, the safe append to `config.toml`, and the edits of one list in it | `catalog.go`: `Entries`, then `block.go`, `append.go` and `edit.go` |
+| `internal/catalog` | the starter MCP servers, the config block for each, the safe append to `config.toml`, the edits of one list in it, and adding, replacing and removing one `[[jobs]]` entry | `catalog.go`: `Entries`, then `block.go`, `append.go`, `edit.go` and `jobs.go`: `SetJob`, `RemoveJob` |
 | `internal/secrets` | `~/.meru/secrets.toml`: load with a mode check, resolve `secret:<name>`, redact, save | `secrets.go`: `Load`, `Resolve`, `Redact`, `Set` |
 | `internal/transcript` | reads and writes session files (JSONL), and lists them | `transcript.go`: `New`, `Append`, `History`, then `list.go`: `List` |
 | `internal/rpc` | the socket protocol between `meru` and `merud` | `protocol.go`, then `client.go` and `server.go` |
@@ -91,7 +94,7 @@ flowchart TD
     tui --> rpc & opener & about
     agent --> dispatch & transcript & engine & rpc & obs & config & retrieve
     agent --> store & memory & skills & builtin
-    builtin --> dispatch & catalog & secrets & config & memory & index & render
+    builtin --> dispatch & catalog & secrets & config & memory & index & render & applenotes
     render --> connectors & obs
     commands --> dispatch & engine & rpc & config
     summarize --> store & engine & obs & transcript
@@ -154,7 +157,7 @@ packages; learn these and the rest reads easily.
 type Engine interface {
     Generate(ctx context.Context, msgs []Message, tools []ToolSpec, opts Options) (Completion, error)
     Stream(ctx context.Context, msgs []Message, tools []ToolSpec, opts Options) (iter.Seq2[Delta, error], error)
-    Embed(ctx context.Context, texts []string) ([]Vector, error)
+    Embed(ctx context.Context, inputs []Input) ([]Vector, error)
     Info(ctx context.Context) (ModelInfo, error)
 }
 ```
@@ -215,6 +218,7 @@ type Event struct {
     TokensOut      int   // answer tokens
     TTLTMillis     int64   // question received to the answer's last token
     TPOTMillis     float64 // EvalMillis / TokensOut: time per output token
+    Outcome        string  // how a turn ended short: "cut_off", "timeout", ...; empty for a whole answer
 }
 ```
 
@@ -266,7 +270,8 @@ type Approval struct {
     Name    string          // the tool's full name, such as "obsidian.obsidian_simple_search"
     Kind    string          // "mcp", "a2a" or "builtin"
     Args    json.RawMessage // the call's arguments
-    Choices []Choice        // what the client may offer: "once", "session", "deny"
+    Choices []Choice        // what the client may offer: "once", "session", "site", "site_always", "deny"
+    Site    string          // the host the two website choices name; empty without them
 }
 
 type Reply struct {
@@ -277,13 +282,15 @@ type Reply struct {
 type ApproveFunc func(ctx context.Context, a Approval) (Choice, error)
 ```
 
-`configure` offers only `once` and `deny`. A choice the approval didn't offer
+`configure` offers only `once` and `deny`. A `web_fetch` read of an unknown URL
+offers `once`, `site`, `site_always` and `deny`: `site` trusts the host for the
+session, and `site_always` adds it to `[web] trusted_sites` too. A choice the approval didn't offer
 counts as deny; the server checks that, and `dispatch` checks it again.
 
 `ApproveFunc` is the same function type on both ends. On the client,
 `rpc.Do(ctx, socket, req, approve)` calls it for each `approval` event and writes
 the `Reply`; a nil `approve` answers deny. One-shot `meru` passes a prompter that
-reads `o`, `s` or `d` from the terminal, or denies when standard input isn't a
+reads `o`, `s`, `w`, `a` or `d` from the terminal, or denies when standard input isn't a
 terminal; `meru chat` passes a function that opens the approval box and waits for
 your key; the desktop app passes one that shows a card in the answer and waits
 for a button. On the server, the rpc server builds one per connection and passes it to
@@ -398,6 +405,15 @@ type Refresher interface {
 type CallConfirmer interface {
     ConfirmCall(c Call) (confirm Confirm, ok bool)
 }
+
+// A Backend may also be a SiteTruster: for a call that asks every time,
+// CallSite names the host it reaches, and dispatch then offers the two
+// website choices; TrustSite records the answer. builtin.Tools uses it
+// for web_fetch.
+type SiteTruster interface {
+    CallSite(c Call) string
+    TrustSite(ctx context.Context, c Call, host string, always bool) error
+}
 ```
 
 The agent sees tools only through `ToolRunner`. `merud` passes a
@@ -500,9 +516,9 @@ sequenceDiagram
     M->>E: NewOllama(base URL, keep_alive, embed model, logger)
     M->>R: Listen(socket) — refuses if another merud answers
     M->>R: Serve(listener, gate) — until ready, the gate waits or answers from the Ollama watch
-    M->>E: waitReady: Info() → Ollama 0.12.11 or later? then warm() the fast and embed models; again every 30 s
+    M->>E: waitReady: Info() → Ollama 0.40.5 or later? then warm() the fast and embed models; again every 30 s
     M->>E: embedDims: embed one probe text to learn the vector size
-    M->>M: openStore: store.Open(meru.db, embed model, vector size)
+    M->>M: openStore: store.Open(meru.db, model, vector size, prefix fingerprint)
     M->>M: index.New(cfg.Index, store, engine)
     M->>M: newToolService: secrets.Load, commands.New, MCP pool, A2A client, builtin.New, dispatch.New, ReplayToolCalls
     M->>M: newRouter, then agent.New(cfg, engine, routerAdapter, searchAdapter, dispatcher, store)
@@ -543,8 +559,12 @@ It joins the built-in tools, the commands, the pool and the A2A client in one
 `meru.db` loses no history. A bad `[[commands]]`, `[[mcp.servers]]` or
 `[[a2a.agents]]` entry stops `merud` here, with a message that names the entry
 and the key; a command's program missing from `PATH` only logs a warning. The probe asks the embedding model rather than config for the vector
-size, so a new embedding model can't leave a stale number behind; when the model or
-the size changed, `store.Open` drops the old vectors and the startup scan re-embeds.
+size, so a new embedding model can't leave a stale number behind. `openStore`
+also passes a fingerprint of the configured query and document prefixes. When
+the model, either prefix or the size changes, `store.Open` drops the old vectors
+and the startup scan re-embeds. An older database without a prefix fingerprint
+keeps its vectors when the model and size match; `store.Open` records the current
+fingerprint for later prefix checks.
 
 The three last steps run side by side in an `errgroup` (from `golang.org/x/sync`),
 so `merud` answers questions while the first scan is still running. The group
@@ -790,6 +810,50 @@ the probe and writes the catalog's lists.
    and `Handle` calls `noteModel`, which writes a `model_switch` line before the
    answer. `store.turnsOf` reads that line when it rebuilds `turns`, and
    `Store.UsageByModel` adds the rows up for `/usage by model`.
+
+### "Find images like this", function by function
+
+1. **`cmd/meru/image.go` → `attachImage`** (or the desktop's attach button, or
+   `/attach` in `meru chat`) sends `attach_file`; `merud` copies the picture into
+   the uploads folder. The question's request names the copy in `Images`.
+2. **`internal/agent/agent.go` → `respond`** sees an image and calls
+   `findSimilar` (similar.go) before `checkVision`.
+3. **`cmd/merud/index.go` → `searchAdapter.SearchImages`** calls
+   **`internal/retrieve/images.go` → `SearchImages`**, which embeds the picture
+   with `engine.Input{Image: data}` and runs `store.SearchVectorKind(..., "image")`.
+4. **No vision:** `checkVision` sends the route, `emitSimilar` the sources, and
+   `endTurn` answers with `similarAnswer`, the list. **Vision:** `respondScoped`
+   sends the sources and puts the list in the prompt for the model.
+5. **The desktop page** draws each image source's chip and asks
+   **`Bridge.SourceThumb`** for its preview, which reads only an image `merud`
+   cited.
+
+### The Usage screen, function by function
+
+1. **`internal/desktop/web/js/settings.js` → `usage`** asks the Bridge for the
+   windows, draws the table, then calls `bridge.usageDetail()`. In `meru chat`,
+   `usageCommand` sends both requests at once with `tea.Batch`.
+2. **`internal/desktop/settings.go` → `Bridge.UsageDetail`** sends `usage` with
+   `Kind` `detail`, and turns an older `merud`'s plain reply into `errOldMerud`.
+3. **`cmd/merud/main.go` → `handleUsage`** calls `store.UsageDetail(ctx,
+   time.Now())`, sets `Metrics` to the `/metrics` address, and emits one
+   `usage_detail` event.
+4. **`internal/store/usagedetail.go` → `UsageDetail`** runs three queries over
+   `turns` and `tool_calls`, groups turns into local days in Go, and works out
+   each day's p50 and p95 by nearest rank.
+5. **The page** draws four SVG charts and three tables; the Prometheus queries
+   tab shows `Metrics` or the line that turns it on.
+
+### `/metrics`, function by function
+
+1. **`cmd/merud/main.go` → `serve`** calls `listenMetrics` after the socket
+   when `[observability] prometheus` is set, and `serveMetrics` adds the server
+   and its `Shutdown` to the errgroup.
+2. **`internal/obs/setup.go` → `setup`** adds a `ManualReader` to the meter
+   provider beside the OTLP reader, if any.
+3. **`internal/obs/prometheus.go` → `MetricsHandler`** checks the path, the
+   `Host` and the method, calls `manual.Collect`, and `writeText` writes each
+   metric in Prometheus's text format.
 
 ### `meru mcp` and `/mcp`, function by function
 

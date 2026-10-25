@@ -87,6 +87,14 @@ type Bridge struct {
 	// so ServiceShutdown can wait for them.
 	wg sync.WaitGroup
 
+	// citedMu guards cited, the full paths of the images merud has cited
+	// in a live answer or a past chat the page opened. SourceThumb makes a
+	// preview only for one of these, so the page can't ask the Bridge to
+	// read a file of its choosing. It has its own mutex because the event
+	// loop adds to it while it holds mu.
+	citedMu sync.Mutex
+	cited   map[string]bool
+
 	mu sync.Mutex // guards the fields below
 	// model is the answer model the status block names: config's at
 	// start, then the one UseModel picked last.
@@ -118,6 +126,9 @@ type Bridge struct {
 type outgoing struct {
 	text   string
 	images []Attachment
+	// cont marks a Continue, which merud answers by picking up the chat's
+	// last answer; text is then the word the chat shows.
+	cont bool
 }
 
 // turn is one question on its way through merud.
@@ -167,7 +178,21 @@ func New(o Options) *Bridge {
 //
 // It fails when question is blank, scope is unknown, or the queue is full.
 func (b *Bridge) Send(session, question, scope string, incognito bool) error {
-	return b.send(session, question, scope, incognito, nil)
+	return b.send(session, question, scope, incognito, nil, false)
+}
+
+// Continue asks merud to pick up session's last answer where it stopped
+// short, at the length limit or the turn's time limit. merud hands the
+// model the last question and the tool calls it already made, so nothing
+// is fetched twice. It queues like a question while a turn runs, and
+// leaves the attached files for the next question. It fails for an empty
+// session or an unknown scope; merud refuses a chat whose last answer is
+// whole, and the turn then ends with that error.
+func (b *Bridge) Continue(session, scope string, incognito bool) error {
+	if session == "" {
+		return errors.New("there is no chat to continue")
+	}
+	return b.send(session, continueText, scope, incognito, nil, true)
 }
 
 // Retry is Send for Try again: it asks question once more, with the
@@ -188,12 +213,17 @@ func (b *Bridge) Retry(session, question, scope string, images []string, incogni
 			Thumb: b.thumbnail(full), full: full,
 		})
 	}
-	return b.send(session, question, scope, incognito, extra)
+	return b.send(session, question, scope, incognito, extra, false)
 }
 
-// send does the work of Send and Retry. extra holds images to send beside
-// the ones attached in the composer.
-func (b *Bridge) send(session, question, scope string, incognito bool, extra []Attachment) error {
+// continueText is what the chat shows for a Continue, as `meru chat` and
+// merud's transcript record it.
+const continueText = "Continue"
+
+// send does the work of Send, Retry and Continue. extra holds images to
+// send beside the ones attached in the composer. cont marks a Continue,
+// which takes no attachments.
+func (b *Bridge) send(session, question, scope string, incognito bool, extra []Attachment, cont bool) error {
 	q := strings.TrimSpace(question)
 	if q == "" {
 		return errors.New("type a question first")
@@ -207,8 +237,11 @@ func (b *Bridge) send(session, question, scope string, incognito bool, extra []A
 	if b.turn != nil && len(b.queue) >= maxQueue {
 		return fmt.Errorf("%d questions already wait; send this one when the next starts", maxQueue)
 	}
-	next := outgoing{text: b.withAttachments(q), images: append(extra, imagesOf(b.attached)...)}
-	if len(b.attached) > 0 {
+	next := outgoing{text: q, cont: true}
+	if !cont {
+		next = outgoing{text: b.withAttachments(q), images: append(extra, imagesOf(b.attached)...)}
+	}
+	if len(b.attached) > 0 && !cont {
 		b.attached = nil
 		b.emitAttachments("")
 	}
@@ -253,13 +286,13 @@ func (b *Bridge) Unqueue(i int) error {
 }
 
 // Approve answers the approval card id, from a turn or a save, with
-// choice: "once", "session" or "deny". It fails when the card isn't open
-// any more, because its turn or save ended or it was answered, or when
-// choice isn't one of the three. merud checks the choice again against the
+// choice: "once", "session", "site", "site_always" or "deny". It fails
+// when the card isn't open any more, because its turn or save ended or it
+// was answered, or when choice isn't one of those. merud checks the choice again against the
 // ones it offered, and treats any other as a deny.
 func (b *Bridge) Approve(id, choice string) error {
 	c := rpc.Choice(choice)
-	if c != rpc.ChoiceOnce && c != rpc.ChoiceSession && c != rpc.ChoiceDeny {
+	if !slices.Contains([]rpc.Choice{rpc.ChoiceOnce, rpc.ChoiceSession, rpc.ChoiceSite, rpc.ChoiceSiteAlways, rpc.ChoiceDeny}, c) {
 		return fmt.Errorf("%q isn't an answer to an approval", choice)
 	}
 	b.mu.Lock()
@@ -314,7 +347,7 @@ func (b *Bridge) start(q outgoing) {
 	t := &turn{n: b.last, cancel: cancel}
 	b.turn = t
 	req := rpc.Request{Op: rpc.OpAsk, Session: b.session, Text: q.text, Source: rpc.SourceDesktop, Scope: b.scope,
-		Incognito: b.session == "" && b.newIncognito}
+		Incognito: b.session == "" && b.newIncognito, Continue: q.cont}
 	if len(q.images) > 0 {
 		req.Images = &rpc.Images{}
 		for _, a := range q.images {
@@ -369,6 +402,7 @@ func (b *Bridge) event(t *turn, ev rpc.Event) {
 	case rpc.EventSources:
 		// Each "sources" event replaces the one before it.
 		t.sources = ev.Sources
+		b.allowThumbs(ev.Sources)
 	case rpc.EventToolCall:
 		if ev.Tool != nil {
 			s := stepOf(ev.Tool.ID, ev.Tool.Kind, ev.Tool.Name, ev.Tool.Args)

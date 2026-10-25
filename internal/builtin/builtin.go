@@ -2,7 +2,9 @@
 // and the configure tool. The remember tool lives in remember.go,
 // write_file in writefile.go, read_file, list_folder and grep in files.go,
 // the past chats those three read in chats.go, AttachmentText in attachments.go, search_files in search.go, and
-// web_search and web_fetch in web.go, webguard.go and webdownload.go.
+// web_search and web_fetch in web.go, webguard.go and webdownload.go,
+// search_notes, list_notes and read_note in notes.go, and schedule_job in
+// schedulejob.go.
 
 package builtin
 
@@ -42,29 +44,43 @@ const actionAddServer = "add_mcp_server"
 type Tools struct {
 	configPath string
 
+	// saveSite adds a host to [web] trusted_sites, for "Always this
+	// website"; UseSiteSaver sets it. nil saves nothing.
+	saveSite func(ctx context.Context, host string) error
+
 	// lists guards on and confirm, which SetLists replaces while merud
 	// runs, when the desktop app changes a built-in tool's policy.
 	lists   sync.RWMutex
 	on      []string // [builtin] tools: the built-ins the model may use
 	confirm []string // [builtin] confirm from config.toml
 
-	memory     *memory.Store  // where remember saves; nil leaves remember out
-	outputDir  string         // where write_file writes, absolute; "" leaves write_file out
-	files      *index.Indexer // what the file tools read through; nil leaves them out
-	search     FileSearcher   // what search_files searches with; nil leaves it out
-	web        *webClients    // web_search and web_fetch, as [web] sets them
-	onChange   func(context.Context) error
-	onRemember func(context.Context)       // runs after remember saves; nil for none
-	now        func() time.Time            // the clock datetime reads; time.Now outside tests
-	about      func(context.Context) About // gathers about_meru's facts; nil leaves about_meru out
+	memory    *memory.Store  // where remember saves; nil leaves remember out
+	outputDir string         // where write_file writes, absolute; "" leaves write_file out
+	files     *index.Indexer // what the file tools read through; nil leaves them out
+	search    FileSearcher   // what search_files searches with; nil leaves it out
+	// imageSearch is what search_images searches with; nil leaves it out.
+	imageSearch ImageSearcher
+	web         *webClients // web_search and web_fetch, as [web] sets them
+	onChange    func(context.Context) error
+	onRemember  func(context.Context)       // runs after remember saves; nil for none
+	now         func() time.Time            // the clock datetime reads; time.Now outside tests
+	about       func(context.Context) About // gathers about_meru's facts; nil leaves about_meru out
 	// webReady says whether web search works now, and in one line why
 	// not; nil means it works whenever [web] searxng_url is set. See
 	// UseWebCheck.
 	webReady func() (bool, string)
 
+	// notesPath is the Apple Notes database the notes tools read, set by
+	// UseNotes on a Mac; "" leaves them out. See notes.go.
+	notesPath string
+
 	// sessionsDir is the folder of past chats the file tools also read,
 	// set by ReadSessions; "" when they don't read it. See chats.go.
 	sessionsDir string
+
+	// addJob saves a job schedule_job proposed, set by UseJobs; nil
+	// leaves schedule_job out. See schedulejob.go.
+	addJob func(ctx context.Context, j config.Job) error
 
 	// mu makes one configure call finish its write before the next starts
 	// reading config.toml, so two calls can't both pass the duplicate check.
@@ -169,8 +185,8 @@ func (t *Tools) Off() []Off {
 }
 
 // missing returns why the tool name can't run, or "" when it can. Only
-// remember, write_file, the file tools, web_search and about_meru need a
-// setting.
+// remember, write_file, the file tools, web_search, about_meru and the
+// Apple Notes tools need a setting.
 func (t *Tools) missing(name string) string {
 	switch name {
 	case Remember:
@@ -181,7 +197,7 @@ func (t *Tools) missing(name string) string {
 		if t.outputDir == "" {
 			return "[skills] output_dir is empty"
 		}
-	case ReadFile, ListFolder, Grep:
+	case ReadFile, ListFolder, Grep, ViewImage:
 		if !t.hasFiles() {
 			return "[index] folders is empty"
 		}
@@ -192,6 +208,13 @@ func (t *Tools) missing(name string) string {
 		if t.search == nil {
 			return "merud has no search index"
 		}
+	case SearchImages:
+		if !t.hasFiles() {
+			return "[index] folders is empty"
+		}
+		if t.imageSearch == nil {
+			return "the index reads no images: [index] images is off, or the embedding model can't read pictures"
+		}
 	case WebSearch:
 		if t.web.searxngURL == "" {
 			return "[web] searxng_url is empty"
@@ -199,6 +222,12 @@ func (t *Tools) missing(name string) string {
 	case AboutMeru:
 		if t.about == nil {
 			return "merud gave it no facts to report"
+		}
+	case SearchNotes, ListNotes, ReadNote:
+		return t.notesOff()
+	case ScheduleJob:
+		if t.addJob == nil {
+			return "merud runs no scheduler"
 		}
 	}
 	return ""
@@ -236,8 +265,18 @@ func (t *Tools) Tools() []engine.ToolSpec {
 		if t.search != nil {
 			specs = append(specs, t.searchSpec())
 		}
+		if t.imageSearch != nil {
+			specs = append(specs, t.searchImagesSpec())
+		}
+		specs = append(specs, viewImageSpec())
 	}
 	specs = append(specs, t.web.toolSpecs(t.saveDir())...)
+	if t.notesOff() == "" {
+		specs = append(specs, notesSpecs()...)
+	}
+	if t.addJob != nil {
+		specs = append(specs, scheduleJobSpec())
+	}
 	search, _ := t.webSearchOn()
 	// DeleteFunc drops, in place, each spec the function returns true for.
 	return slices.DeleteFunc(specs, func(s engine.ToolSpec) bool {
@@ -268,7 +307,8 @@ func (t *Tools) webSearchOn() (bool, string) {
 	return true, ""
 }
 
-// Confirm says configure always asks, with no session approval. Any other
+// Confirm says configure and schedule_job always ask, with no session
+// approval. Any other
 // built-in asks when [builtin] confirm lists it, and runs without asking
 // otherwise. The shipped list holds write_file alone, so remember saves
 // without asking, as ARCHITECTURE.md "Memory" says, write_file asks, and
@@ -277,7 +317,7 @@ func (t *Tools) webSearchOn() (bool, string) {
 // without save; ConfirmCall, in webguard.go, decides the rest per call.
 func (t *Tools) Confirm(name string) dispatch.Confirm {
 	switch {
-	case name == Configure:
+	case AlwaysAsks(name):
 		return dispatch.ConfirmAlways
 	case t.asks(name):
 		return dispatch.ConfirmAsk
@@ -354,6 +394,18 @@ func (t *Tools) Status() []rpc.ServerInfo {
 				Confirm:     t.Confirm(SearchFiles) != dispatch.ConfirmNever,
 			})
 		}
+		if t.imageSearch != nil {
+			tools = append(tools, rpc.ToolInfo{
+				Name:        SearchImages,
+				Description: "Finds pictures in the indexed folders, by words or like another picture.",
+				Confirm:     t.Confirm(SearchImages) != dispatch.ConfirmNever,
+			})
+		}
+		tools = append(tools, rpc.ToolInfo{
+			Name:        ViewImage,
+			Description: Summary(ViewImage),
+			Confirm:     t.Confirm(ViewImage) != dispatch.ConfirmNever,
+		})
 	}
 	if on, _ := t.webSearchOn(); on {
 		tools = append(tools, rpc.ToolInfo{
@@ -368,6 +420,23 @@ func (t *Tools) Status() []rpc.ServerInfo {
 			"Asks first for a URL no search or question of yours gave, and before any download.",
 		Confirm: t.Confirm(WebFetch) != dispatch.ConfirmNever,
 	})
+	if t.notesOff() == "" {
+		for _, name := range []string{SearchNotes, ListNotes, ReadNote} {
+			tools = append(tools, rpc.ToolInfo{
+				Name:        name,
+				Description: Summary(name),
+				Confirm:     t.Confirm(name) != dispatch.ConfirmNever,
+			})
+		}
+	}
+	if t.addJob != nil {
+		tools = append(tools, rpc.ToolInfo{
+			Name:        ScheduleJob,
+			Description: Summary(ScheduleJob),
+			Confirm:     true,
+			AlwaysAsks:  true,
+		})
+	}
 	tools = slices.DeleteFunc(tools, func(ti rpc.ToolInfo) bool { return !t.enabled(ti.Name) })
 	return []rpc.ServerInfo{{
 		Name:      server,
@@ -387,8 +456,17 @@ func (t *Tools) Call(ctx context.Context, name string, args json.RawMessage) (di
 	if !t.enabled(name) {
 		return dispatch.Result{}, fmt.Errorf("%q is not a built-in tool that [builtin] tools turns on", name)
 	}
+	// view_image returns pictures beside its text, so it builds its own
+	// Result.
+	if name == ViewImage && t.hasFiles() {
+		res, err := t.viewImage(ctx, args)
+		if err != nil {
+			return dispatch.Result{Text: err.Error(), IsError: true}, nil
+		}
+		return res, nil
+	}
 	var text string
-	var sources []rpc.Citation // only search_files sets these
+	var sources []rpc.Citation // the search tools and the web tools set these
 	var err error
 	switch {
 	case name == Configure:
@@ -409,6 +487,8 @@ func (t *Tools) Call(ctx context.Context, name string, args json.RawMessage) (di
 		text, err = t.grep(ctx, args)
 	case name == SearchFiles && t.hasFiles() && t.search != nil:
 		text, sources, err = t.searchFiles(ctx, args)
+	case name == SearchImages && t.hasFiles() && t.imageSearch != nil:
+		text, sources, err = t.searchImages(ctx, args)
 	case name == WebSearch:
 		// The check can change between the turn's tool list and this
 		// call, so a call that comes while web search is down says why.
@@ -416,9 +496,13 @@ func (t *Tools) Call(ctx context.Context, name string, args json.RawMessage) (di
 		if !on {
 			return dispatch.Result{Text: "web_search is off now: " + why, IsError: true}, nil
 		}
-		text, err = t.webSearch(ctx, args)
+		text, sources, err = t.webSearch(ctx, args)
 	case name == WebFetch:
-		text, err = t.webFetch(ctx, args)
+		text, sources, err = t.webFetch(ctx, args)
+	case IsNotesTool(name) && t.notesOff() == "":
+		text, err = t.callNotes(ctx, name, args)
+	case name == ScheduleJob && t.addJob != nil:
+		text, err = t.scheduleJob(ctx, args)
 	default:
 		return dispatch.Result{}, fmt.Errorf("%q is not a built-in tool", name)
 	}
@@ -673,10 +757,22 @@ func Summary(name string) string {
 		return "Finds matching lines in the indexed folders or the output folder."
 	case SearchFiles:
 		return "Searches the indexed folders by meaning and by words."
+	case SearchImages:
+		return "Finds pictures in the indexed folders, by words or like another picture."
+	case ViewImage:
+		return "Shows the answer model a picture in the indexed folders, when the model can see pictures."
 	case WebSearch:
 		return "Searches the web through the SearXNG instance [web] searxng_url names."
 	case WebFetch:
 		return "Reads a public web page. It asks first for a URL no search or question of yours gave."
+	case SearchNotes:
+		return "Searches your Apple Notes by words. Needs Full Disk Access for merud."
+	case ListNotes:
+		return "Lists your Apple Notes folders and newest notes."
+	case ReadNote:
+		return "Reads one of your Apple Notes in full."
+	case ScheduleJob:
+		return "Schedules a job when you ask for one in chat. It asks every time."
 	}
 	return ""
 }

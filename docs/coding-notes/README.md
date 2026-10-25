@@ -44,11 +44,14 @@ Read them in this order; each builds on the ones before it.
 23. [opener](opener.md): opening a clicked link with the system's opener, `http`, `https` and `file` only
 24. [desktop](desktop.md): the desktop app, its Bridge to `merud`, and the page in its window
 25. [about](about.md): the tagline, the version and the links both clients show
-26. [installer](installer.md): the Mac installer's ten steps, its allowlist of programs, and its window
-27. [connectors](connectors.md): the connector manifests, their pinned versions and checks, the installs of Node, uv and each connector into ~/.meru/runtime, the supervisor that runs each stdio connector, and the one that runs the SearXNG container
+26. [installer](installer.md): the Mac installer's eleven steps, its allowlist of programs, and its window
+27. [connectors](connectors.md): the connector manifests, their pinned versions and checks, the installs of Node, uv and each connector into ~/.meru/runtime, the supervisor that runs each stdio connector, the one that runs the SearXNG container, and the one that runs a service such as whisper-server
 28. [testing](testing.md): how Meru tests itself, from unit tests to fakes
 29. [end-to-end tests](e2e.md): the real binaries, run against a fake Ollama
 30. [render](render.md): `web_fetch`'s page reader, a headless Chrome per page that needs JavaScript, behind a proxy
+31. [applenotes](applenotes.md): reading the Notes app's database, live and read-only, for the Apple Notes tools
+32. [speech](speech.md): speech to text, a WAV recording to whisper-server and back, for the `transcribe` op
+33. [jobs](jobs.md): the time rules for scheduled jobs: cron schedules as bitmasks, the next run, and catch-up after sleep
 
 ### Go basics
 
@@ -56,8 +59,11 @@ Read them in this order; each builds on the ones before it.
 - [Struct tags](go-basics/struct-tags.md)
 - [Errors](go-basics/errors.md)
 - [defer](go-basics/defer.md)
+- [Bitmasks](go-basics/bitmasks.md)
 - [Interfaces](go-basics/interfaces.md)
 - [HTTP clients](go-basics/http-clients.md)
+- [HTTP servers](go-basics/http-servers.md)
+- [JSON marshalers](go-basics/json-marshaler.md)
 - [Iterators](go-basics/iterators.md)
 - [context](go-basics/context.md)
 - [Goroutines](go-basics/goroutines.md)
@@ -75,6 +81,7 @@ Read them in this order; each builds on the ones before it.
 - [encoding/json](go-basics/json.md)
 - [embed](go-basics/embed.md)
 - [os.Root](go-basics/os-root.md)
+- [Byte slices](go-basics/byte-slices.md)
 
 ## Rules for writing a note
 
