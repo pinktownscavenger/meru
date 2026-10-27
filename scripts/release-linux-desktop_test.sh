@@ -84,7 +84,7 @@ make_package() {
   package_stage="$case_dir/package-stage"
   control="$package_stage/control"
   data="$package_stage/data"
-  mkdir -p "$package_dir" "$control" "$data/usr/bin" \
+  mkdir -p "$package_dir" "$control" "$data/etc/apparmor.d" "$data/usr/bin" \
     "$data/usr/share/applications" \
     "$data/usr/share/icons/hicolor/512x512/apps" \
     "$data/usr/share/doc/meru-desktop"
@@ -95,6 +95,11 @@ make_package() {
     'Depends: libgtk-4-1, libwebkitgtk-6.0-4, xdg-utils' \
     "X-Meru-Commit: $commit" \
     'Description: Meru desktop app' > "$control/control"
+  printf '/etc/apparmor.d/meru-desktop\n' > "$control/conffiles"
+  cp "$repo_root/deploy/linux/postinst" "$control/postinst"
+  chmod 0755 "$control/postinst"
+  cp "$repo_root/deploy/linux/meru-desktop.apparmor" "$data/etc/apparmor.d/meru-desktop"
+  chmod 0644 "$data/etc/apparmor.d/meru-desktop"
   printf '#!/bin/sh\necho %s\n' "$version" > "$data/usr/bin/meru-desktop"
   chmod 0755 "$data/usr/bin/meru-desktop"
   cp "$repo_root/deploy/linux/com.meru.desktop.desktop" \

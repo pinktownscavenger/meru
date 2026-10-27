@@ -319,7 +319,8 @@ internal/
 test/e2e/            end-to-end tests: real binaries against the fake Ollama and fake MCP
 deploy/              launchd/ and systemd/ service files (systemd/ also holds
                      meru-searxng.container, the Podman Quadlet for SearXNG on Ubuntu);
-                     linux/ holds the desktop entry the .deb installs
+                     linux/ holds the desktop entry, the AppArmor profile and the one
+                     fixed postinst that the .deb installs
 scripts/             release.sh, which `make release` runs; release-archive.sh, which packs
                      one platform's archive; release-linux-desktop.sh, which has the Ubuntu
                      workflow build the .deb from the release commit and checks what it gets

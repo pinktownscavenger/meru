@@ -33,7 +33,7 @@ how. CI builds one program that isn't Meru's: whisper.cpp's `whisper-server`
 | Cross-compile | ci / build | Code that builds on your OS but not on another; accidental cgo | `make build` |
 | Desktop app and installer | ci / desktop (macOS) | The desktop app or the Mac installer failing to build with cgo and the WebView, or failing vet, staticcheck or govulncheck with their build tags | `make desktop installer desktop-check` (needs cgo) |
 | Ubuntu desktop app | ci / desktop app (Ubuntu 24.04) | A cgo, GTK, WebKitGTK, desktop-entry or shared-library failure on the supported Linux host | `make desktop-linux` on Ubuntu 24.04 with the listed development packages |
-| Debian package structure | ci / desktop app (Ubuntu 24.04) and `make check` | A wrong version, commit, architecture, dependency, installed path, mode, link or maintainer script | `make desktop-package-test`; `make desktop-deb VERSION=v0.0.0` needs Ubuntu's desktop libraries |
+| Debian package structure | ci / desktop app (Ubuntu 24.04) and `make check` | A wrong version, commit, architecture, dependency, installed path, mode or link; a maintainer script other than the fixed `postinst`; a changed AppArmor profile, or one `apparmor_parser` can't parse | `make desktop-package-test`; `make desktop-deb VERSION=v0.0.0` needs Ubuntu's desktop libraries |
 | Ubuntu installer | ci / installer | A broken shell flow, systemd user unit or rootless Podman Quadlet; a web fetch that can reach a private address | `make install-script-test`; the service checks need systemd and Podman from Ubuntu 24.04 |
 | End-to-end | ci / e2e | A real `merud` and `meru` failing together against the fake Ollama | `make e2e` |
 | actionlint | ci / actionlint | Mistakes in the workflow files themselves | `make actionlint` |

@@ -20,7 +20,9 @@ curl -fsSL https://github.com/aarora79/meru/releases/latest/download/install.sh 
 
 The same installer offers `Meru-vX.Y.Z-linux-amd64.deb` after it sets up the
 command-line programs. That package holds only `meru-desktop`, its menu entry,
-icon and licence. Apt supplies GTK 4, WebKitGTK and `xdg-utils`. Removing it with
+icon, licence and `/etc/apparmor.d/meru-desktop`, the AppArmor profile that lets
+WebKit's sandbox start on Ubuntu 24.04. Its one script loads that profile. Apt
+supplies GTK 4, WebKitGTK and `xdg-utils`. Removing it with
 `sudo apt-get remove --yes meru-desktop` leaves `meru`, `merud`, the user service,
 config and data in place.
 

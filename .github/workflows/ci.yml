@@ -139,9 +139,12 @@ jobs:
         run: |
           make desktop-deb VERSION=v0.0.0 COMMIT="$COMMIT"
           bash scripts/check-deb.sh v0.0.0 "$COMMIT" dist/Meru-v0.0.0-linux-amd64.deb
-      - name: check desktop entry and shared libraries
+      - name: check desktop entry, AppArmor profile and shared libraries
         run: |
           desktop-file-validate deploy/linux/com.meru.desktop.desktop
+          # -Q parses the profile without loading it; -K skips the cache.
+          apparmor_parser -Q -K deploy/linux/meru-desktop.apparmor
+          sh -n deploy/linux/postinst
           ldd bin/linux-amd64/meru-desktop > "$RUNNER_TEMP/meru-desktop-ldd.txt"
           ! grep -F 'not found' "$RUNNER_TEMP/meru-desktop-ldd.txt"
 

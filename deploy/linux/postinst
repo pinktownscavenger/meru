@@ -1,0 +1,15 @@
+#!/bin/sh
+# postinst loads the meru-desktop AppArmor profile after dpkg installs or
+# upgrades the package. Without it, Ubuntu blocks WebKit's sandbox until the
+# next reboot. This is the step Ubuntu's own dh_apparmor snippet runs, and the
+# package's only maintainer script; scripts/check-deb.sh rejects any change.
+set -e
+
+if [ "$1" = configure ] && aa-enabled --quiet 2>/dev/null; then
+  # -r replaces a loaded copy; -T skips the profile cache and -W rewrites it.
+  # A failed load doesn't fail the install: AppArmor loads every profile in
+  # /etc/apparmor.d at the next boot.
+  apparmor_parser -r -T -W /etc/apparmor.d/meru-desktop || true
+fi
+
+exit 0

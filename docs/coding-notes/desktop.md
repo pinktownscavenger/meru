@@ -728,15 +728,36 @@ that path without a display. The Mac release host cannot run a Linux program, so
 checker reads the same stamped text from the binary with `strings`.
 
 `scripts/package-deb.sh` makes one fixed Debian tree. It installs the binary,
-desktop entry, 512-pixel icon and licence copy, then gives that tree to `dpkg-deb`
-with `-Zxz`. Without that flag, `dpkg-deb` on Ubuntu 24.04 compresses with zstd.
-The control file holds the release version, `amd64`, the three runtime packages and
-the source commit. It has no maintainer script. `scripts/check-deb.sh` opens the ar
-archive with tools that macOS and Ubuntu share, extracts its xz control and data
-archives with `tar -J`, and refuses any extra path, link, mode, dependency, identity
-or other compression. It names the compression because GNU tar can't detect it
-when it reads from a pipe. This lets
-the Mac publisher inspect the Linux artifact without installing it.
+desktop entry, 512-pixel icon, licence copy and an AppArmor profile, then gives that
+tree to `dpkg-deb` with `-Zxz`. Without that flag, `dpkg-deb` on Ubuntu 24.04
+compresses with zstd. The control file holds the release version, `amd64`, the
+three runtime packages and the source commit.
+
+The profile, `deploy/linux/meru-desktop.apparmor`, goes to
+`/etc/apparmor.d/meru-desktop`. WebKitGTK runs each page in a bubblewrap sandbox,
+and bubblewrap needs an unprivileged user namespace. Ubuntu 24.04 turns those off
+for any program whose AppArmor profile doesn't allow `userns`. Without the profile,
+`bwrap` fails with "setting up uid map: Permission denied" and the app stops with
+`SIGTRAP` before it draws a window. The profile copies the one Ubuntu ships for
+Epiphany, its own WebKit browser: unconfined, with `userns` added. `DEBIAN/conffiles`
+lists the profile, so dpkg keeps an administrator's edit through an upgrade.
+
+The kernel ignores a profile file until something loads it, so the package has
+one maintainer script. `deploy/linux/postinst` runs `apparmor_parser -r` on the
+profile after install or upgrade, when AppArmor is on, as Ubuntu's `dh_apparmor`
+snippet does. It touches nothing else, and a failed load doesn't fail the install,
+because AppArmor loads the profile at the next boot anyway.
+
+`scripts/check-deb.sh` opens the ar archive with tools that macOS and Ubuntu share,
+extracts its xz control and data archives with `tar -J`, and refuses any extra
+path, link, mode, dependency, identity or other compression. It names the
+compression because GNU tar can't detect it when it reads from a pipe. The control
+archive must hold `control`, `conffiles` and `postinst` and nothing else, and
+`cmp` must find the `postinst` and the profile byte for byte equal to the copies in
+`deploy/linux/`. A release can then ship no script or profile that review never
+saw. This lets the Mac publisher inspect the Linux artifact without installing it.
+CI also parses the profile with `apparmor_parser -Q -K`, which checks it without
+loading it.
 
 ### jobs.go and Settings, Jobs
 

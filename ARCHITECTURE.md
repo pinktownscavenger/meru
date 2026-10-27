@@ -128,8 +128,8 @@ installs the command-line clients and daemon, uses the `lite` profile by default
 and makes no GPU-based model recommendation. Fresh-host acceptance must pass before
 the project calls this path supported. On a desktop, the same checked setup path
 offers an app-only Debian package after the command-line install. The package owns
-the desktop binary, menu entry, icon and licence copy. It owns no daemon, service,
-config or user data.
+the desktop binary, menu entry, icon, licence copy and the AppArmor profile that lets
+WebKit's sandbox start. It owns no daemon, service, config or user data.
 
 **On a cloud server**, Meru still sends no prompt to a model provider,
 but your notes, email and transcripts live on that server. Meru's promise is "a
@@ -3286,10 +3286,23 @@ offers the app as an optional final step. A decline leaves command-line Meru rea
 With no terminal, the installer prints the checked local-package command and runs no
 privileged step.
 
-The package installs `/usr/bin/meru-desktop`, one desktop entry, one 512-pixel icon
-and the Apache License 2.0 text. It declares GTK4, WebKitGTK 6.0 and `xdg-open` as
-runtime dependencies. It has no maintainer scripts, so install, upgrade and removal
-cannot start `merud` or change files under `~/.meru`.
+The package installs `/usr/bin/meru-desktop`, one desktop entry, one 512-pixel icon,
+the Apache License 2.0 text and `/etc/apparmor.d/meru-desktop`. It declares GTK4,
+WebKitGTK 6.0 and `xdg-open` as runtime dependencies.
+
+WebKitGTK runs each page in a bubblewrap sandbox, which needs an unprivileged user
+namespace. Ubuntu 24.04 grants one only to a program whose AppArmor profile allows
+`userns`; without it the app aborts at start. The profile matches the one Ubuntu
+ships for its own WebKit browser, Epiphany: unconfined, with `userns` added. The
+package marks it as a conffile, so an edit the administrator makes survives an
+upgrade.
+
+A profile does nothing until the kernel loads it, so the package has one maintainer
+script, a fixed `postinst` that runs `apparmor_parser -r` on that one file when
+AppArmor is on. It does what Ubuntu's own `dh_apparmor` snippet does and nothing
+else: install, upgrade and removal cannot start `merud` or change files under
+`~/.meru`. `scripts/check-deb.sh` rejects any other script, and any change to this
+one or to the profile.
 
 Linux cgo builds run on an Ubuntu 24.04 GitHub Actions runner. The release owner
 starts that workflow with the version and exact commit that `scripts/release.sh`

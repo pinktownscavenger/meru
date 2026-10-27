@@ -25,13 +25,15 @@ root_dir="$(cd "$script_dir/.." && pwd)"
 desktop_file="$root_dir/deploy/linux/com.meru.desktop.desktop"
 icon="$root_dir/docs/img/meru-logo.png"
 licence="$root_dir/LICENSE"
-for source in "$desktop_file" "$icon" "$licence"; do
+apparmor_profile="$root_dir/deploy/linux/meru-desktop.apparmor"
+postinst="$root_dir/deploy/linux/postinst"
+for source in "$desktop_file" "$icon" "$licence" "$apparmor_profile" "$postinst"; do
   [ -f "$source" ] || fail "required package file is missing: $source"
 done
 
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
-mkdir -p "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/share/applications" \
+mkdir -p "$stage/DEBIAN" "$stage/etc/apparmor.d" "$stage/usr/bin" "$stage/usr/share/applications" \
   "$stage/usr/share/icons/hicolor/512x512/apps" "$stage/usr/share/doc/meru-desktop" "$output_dir"
 
 cat >"$stage/DEBIAN/control" <<EOF
@@ -51,8 +53,14 @@ install -m 0755 "$binary" "$stage/usr/bin/meru-desktop"
 install -m 0644 "$desktop_file" "$stage/usr/share/applications/com.meru.desktop.desktop"
 install -m 0644 "$icon" "$stage/usr/share/icons/hicolor/512x512/apps/com.meru.desktop.png"
 install -m 0644 "$licence" "$stage/usr/share/doc/meru-desktop/copyright"
+# Ubuntu 24.04 lets WebKit's sandbox start only under this AppArmor profile.
+# conffiles tells dpkg the file under /etc is the administrator's to edit, and
+# the fixed postinst loads the profile so the app starts without a reboot.
+install -m 0644 "$apparmor_profile" "$stage/etc/apparmor.d/meru-desktop"
+printf '/etc/apparmor.d/meru-desktop\n' >"$stage/DEBIAN/conffiles"
+install -m 0755 "$postinst" "$stage/DEBIAN/postinst"
 chmod 0755 "$stage/DEBIAN"
-chmod 0644 "$stage/DEBIAN/control"
+chmod 0644 "$stage/DEBIAN/control" "$stage/DEBIAN/conffiles"
 
 output="$output_dir/Meru-$version-linux-amd64.deb"
 # -Zxz fixes the compression. dpkg-deb on Ubuntu 24.04 picks zstd by default,

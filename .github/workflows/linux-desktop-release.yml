@@ -57,6 +57,7 @@ jobs:
         run: |
           test "$(bin/linux-amd64/meru-desktop --version)" = "$VERSION"
           desktop-file-validate deploy/linux/com.meru.desktop.desktop
+          apparmor_parser -Q -K deploy/linux/meru-desktop.apparmor
           ldd bin/linux-amd64/meru-desktop > "$RUNNER_TEMP/meru-desktop-ldd.txt"
           ! grep -F 'not found' "$RUNNER_TEMP/meru-desktop-ldd.txt"
       - uses: actions/upload-artifact@v7

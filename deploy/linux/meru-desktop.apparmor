@@ -1,0 +1,16 @@
+# AppArmor profile for the Meru desktop app, installed as
+# /etc/apparmor.d/meru-desktop by the meru-desktop package.
+#
+# WebKitGTK runs each page in a bubblewrap sandbox, which needs an unprivileged
+# user namespace. Ubuntu 24.04 grants one only to a program whose profile allows
+# userns. This profile matches /etc/apparmor.d/epiphany, the one Ubuntu ships for
+# its own WebKit browser: unconfined, with userns added.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile meru-desktop /usr/bin/meru-desktop flags=(unconfined) {
+  userns,
+
+  # Site-specific additions and overrides. See local/README for details.
+  include if exists <local/meru-desktop>
+}

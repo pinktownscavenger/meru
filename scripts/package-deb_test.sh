@@ -73,7 +73,7 @@ make_deb() {
   local architecture=${4:-amd64} deps=${5:-$dependencies} mutation=${6:-valid}
   local dir control data
   dir=$(mktemp -d); control="$dir/control"; data="$dir/data"
-  mkdir -p "$control" "$data/usr/bin" "$data/usr/share/applications" \
+  mkdir -p "$control" "$data/etc/apparmor.d" "$data/usr/bin" "$data/usr/share/applications" \
     "$data/usr/share/icons/hicolor/512x512/apps" "$data/usr/share/doc/meru-desktop"
   printf '%s\n' \
     'Package: meru-desktop' \
@@ -82,6 +82,11 @@ make_deb() {
     "Depends: $deps" \
     "X-Meru-Commit: $package_commit" \
     'Description: Meru desktop app' >"$control/control"
+  printf '/etc/apparmor.d/meru-desktop\n' >"$control/conffiles"
+  cp "$root_dir/deploy/linux/postinst" "$control/postinst"
+  chmod 0755 "$control/postinst"
+  cp "$root_dir/deploy/linux/meru-desktop.apparmor" "$data/etc/apparmor.d/meru-desktop"
+  chmod 0644 "$data/etc/apparmor.d/meru-desktop"
   make_binary "$data/usr/bin/meru-desktop" "$version"
   cp "$root_dir/deploy/linux/com.meru.desktop.desktop" "$data/usr/share/applications/"
   printf 'png\n' >"$data/usr/share/icons/hicolor/512x512/apps/com.meru.desktop.png"
@@ -93,7 +98,13 @@ make_deb() {
   case "$mutation" in
     extra) printf 'extra\n' >"$data/usr/share/doc/meru-desktop/extra" ;;
     symlink) rm "$data/usr/share/icons/hicolor/512x512/apps/com.meru.desktop.png"; ln -s /tmp/icon "$data/usr/share/icons/hicolor/512x512/apps/com.meru.desktop.png" ;;
-    script) printf '#!/bin/sh\n' >"$control/postinst"; chmod 0755 "$control/postinst" ;;
+    script) printf '#!/bin/sh\n' >"$control/prerm"; chmod 0755 "$control/prerm" ;;
+    no-postinst) rm "$control/postinst" ;;
+    changed-postinst) printf 'rm -rf "$HOME/.meru"\n' >>"$control/postinst" ;;
+    postinst-mode) chmod 0644 "$control/postinst" ;;
+    changed-conffiles) printf '/etc/meru\n' >>"$control/conffiles" ;;
+    no-profile) rm "$data/etc/apparmor.d/meru-desktop" ;;
+    changed-profile) printf 'profile extra /usr/bin/* flags=(unconfined) { userns, }\n' >>"$data/etc/apparmor.d/meru-desktop" ;;
     wrong-mode) chmod 0777 "$data/usr/share/applications/com.meru.desktop.desktop" ;;
     wrong-binary) make_binary "$data/usr/bin/meru-desktop" v9.9.9 ;;
   esac
@@ -121,10 +132,14 @@ test_builder_writes_app_only_tree() {
   assert_contains "$(cat "$snapshot/DEBIAN/control")" "Depends: $dependencies"
   assert_contains "$(cat "$snapshot/DEBIAN/control")" "X-Meru-Commit: $commit"
   files=$(cd "$snapshot" && find . -type f | LC_ALL=C sort)
-  assert_equal $'./DEBIAN/control\n./usr/bin/meru-desktop\n./usr/share/applications/com.meru.desktop.desktop\n./usr/share/doc/meru-desktop/copyright\n./usr/share/icons/hicolor/512x512/apps/com.meru.desktop.png' "$files"
+  assert_equal $'./DEBIAN/conffiles\n./DEBIAN/control\n./DEBIAN/postinst\n./etc/apparmor.d/meru-desktop\n./usr/bin/meru-desktop\n./usr/share/applications/com.meru.desktop.desktop\n./usr/share/doc/meru-desktop/copyright\n./usr/share/icons/hicolor/512x512/apps/com.meru.desktop.png' "$files"
   assert_equal 755 "$(mode_of "$snapshot/usr/bin/meru-desktop")"
   assert_equal 644 "$(mode_of "$snapshot/usr/share/applications/com.meru.desktop.desktop")"
-  [ -z "$(find "$snapshot/DEBIAN" -type f ! -name control -print)" ] || test_fail "builder wrote a maintainer script"
+  assert_equal 755 "$(mode_of "$snapshot/DEBIAN/postinst")"
+  assert_equal 644 "$(mode_of "$snapshot/etc/apparmor.d/meru-desktop")"
+  assert_equal /etc/apparmor.d/meru-desktop "$(cat "$snapshot/DEBIAN/conffiles")"
+  cmp -s "$snapshot/DEBIAN/postinst" "$root_dir/deploy/linux/postinst" || test_fail "builder changed the postinst"
+  cmp -s "$snapshot/etc/apparmor.d/meru-desktop" "$root_dir/deploy/linux/meru-desktop.apparmor" || test_fail "builder changed the AppArmor profile"
   rm -rf "$dir"
 }
 
@@ -229,11 +244,13 @@ test_checker_rejects_identity_drift() {
   rm -rf "$dir"
 }
 
-# test_checker_rejects_package_scope_drift checks files, links, scripts and modes.
+# test_checker_rejects_package_scope_drift checks files, links, scripts, the
+# AppArmor profile and modes.
 test_checker_rejects_package_scope_drift() {
   local dir package mutation
   dir=$(mktemp -d); package="$dir/Meru-v1.2.3-linux-amd64.deb"
-  for mutation in extra symlink script wrong-mode wrong-binary gzip; do
+  for mutation in extra symlink script no-postinst changed-postinst postinst-mode \
+    changed-conffiles no-profile changed-profile wrong-mode wrong-binary gzip; do
     make_deb "$package" v1.2.3 "$commit" amd64 "$dependencies" "$mutation"
     if "$checker" v1.2.3 "$commit" "$package" >/dev/null 2>&1; then
       test_fail "checker accepted $mutation package"
