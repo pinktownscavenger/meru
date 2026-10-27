@@ -1384,6 +1384,12 @@ question. One already on prints its state. With `merud` down the step names
 `meru mcp fix obsidian` and `meru mcp fix google` and asks nothing. `offer`
 and `doIt` stay for `meru mcp add`, which adds a server by hand.
 
+Step 7 asks a test question when `merud` answers. With `merud` down it says an
+installer that started setup starts `merud` next, and only otherwise names
+`merud &`. Both installers run setup before they start `merud` as a service, so
+an unqualified "start merud" had people start a second one beside it. The
+Ubuntu installer then runs the Tools step and the test question itself.
+
 `setup_test.go` scripts whole sessions: the answers go in as a string, and the
 test reads back the files and the output. `TestSetupWebSearchHandsOff` and
 `TestSetupConnectors` run the two steps against a fake `merud` and check the

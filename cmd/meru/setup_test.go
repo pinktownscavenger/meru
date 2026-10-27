@@ -241,7 +241,10 @@ func TestSetupFirstRun(t *testing.T) {
 	if !strings.Contains(string(written), "[[mcp.servers]]") || !strings.Contains(string(written), "\nfolders = [\"~/notes\", \"/srv/papers\"]\n") {
 		t.Errorf("setup didn't write the filled-in template:\n%s", written)
 	}
-	for _, want := range []string{"Ollama isn't answering", "must be an absolute path", "meru setup user", "merud isn't running"} {
+	// The merud lines name the installer, which starts merud as a service
+	// right after setup; a bare "start merud" would make a second one.
+	for _, want := range []string{"Ollama isn't answering", "must be an absolute path", "meru setup user",
+		"merud isn't running yet", "Once it runs, set one up with", "it starts merud next"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("output lacks %q:\n%s", want, out)
 		}

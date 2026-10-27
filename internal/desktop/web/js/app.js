@@ -1011,7 +1011,12 @@ function openSession(s) {
 function loadStatus() {
   bridge.status().then((s) => {
     state.status = s;
-    if (s.machine) state.machine = s.machine;
+    // The empty state drew before merud said where it runs, with the
+    // default "this Mac". On Linux the name changes, so draw it again.
+    if (s.machine && s.machine !== state.machine) {
+      state.machine = s.machine;
+      if (state.turns.length === 0) drawConversation();
+    }
     drawStatus();
     if (s.up && s.folders === 0 && s.profile === 0 && !state.setupShown && state.turns.length === 0) {
       state.setupShown = true;

@@ -418,8 +418,8 @@ func setupCmd(ctx context.Context, socket string, c *console, main string) error
 
 	fmt.Fprintln(c.out, "\n5. Tools")
 	if ping(ctx, socket, io.Discard) != nil {
-		fmt.Fprintln(c.out, "merud isn't running, and it installs and runs the tools' servers. Start merud, then run\n"+
-			"meru mcp fix obsidian or meru mcp fix google to set one up. To add a server you run yourself: meru mcp add.")
+		fmt.Fprintln(c.out, "merud isn't running yet, and it installs and runs the tools' servers. Once it runs, set one up with\n"+
+			"meru mcp fix obsidian or meru mcp fix google. To add a server you run yourself: meru mcp add.")
 	} else {
 		fmt.Fprintln(c.out, "merud can install and run these servers for you, each at the version pinned in this release.")
 		for _, id := range []string{"obsidian", "google"} {
@@ -437,7 +437,10 @@ func setupCmd(ctx context.Context, socket string, c *console, main string) error
 
 	fmt.Fprintln(c.out, "\n7. A test question")
 	if !merudUp {
-		fmt.Fprintln(c.out, "merud isn't running. Start it with `merud &`, then ask it something: meru \"hello\"")
+		// An installer runs setup before it starts merud as a service, so
+		// "start merud" alone would have the user start a second one.
+		fmt.Fprintln(c.out, "merud isn't running yet. If an installer started this setup, it starts merud next.\n"+
+			"Otherwise start it with `merud &`. Then ask it something: meru \"hello\"")
 		return nil
 	}
 	fmt.Fprintf(c.out, "merud is running. Asking: %s\n", testQuestion)

@@ -39,13 +39,31 @@ generator applies the file's `[Install]` section during `daemon-reload`, so the
 script starts the generated transient service but does not try to enable it as a
 regular unit.
 
+`meru setup` runs before `merud` does, so it skips the steps that need
+`merud`. When setup has just written `config.toml` and the machine has no GPU
+for Ollama, `use_cpu_turn_timeout` raises `[agent] turn_timeout` from `"5m"` to
+`"15m"` before `merud` reads the file. `gpu_present` looks for the NVIDIA
+driver's `/dev/nvidiactl` and AMD's `/dev/kfd`, which CUDA and ROCm need; with
+neither, Ollama runs on the CPU. On a 2-CPU server a web-search answer took
+8 minutes, and 5 minutes stopped it. A config the user already had, or one with
+another value, stays as it is. The script writes the new text through `cat >`
+so the file keeps the mode setup gave it.
+
 The last step copies the checked `merud.service` from the extracted archive,
-waits for `meru ping`, and then offers the user profile. A headless server can
-keep the user services alive after logout with lingering. The script shows the
-exact `sudo loginctl` command and runs it only after consent.
+waits for `meru ping`, and then runs what setup skipped. It offers the user
+profile, then the Obsidian and Google connectors through `meru mcp fix`, which
+asks its own questions on the terminal. A headless server can keep the user
+services alive after logout with lingering. The script shows the exact `sudo
+loginctl` command and runs it only after consent. Last, it offers setup's test
+question. `meru` gets `</dev/null` as its input, because under `curl | bash`
+the script's input is the rest of the script.
 
 The last optional step runs `sudo apt-get update`, then installs the checked
 `.deb` through the exact command `sudo apt-get install --yes -- <path>`. The
+path points at a copy in a new folder with mode 0755, and the script removes
+that folder afterwards. apt reads a local package as its own user, `_apt`,
+which can't open the script's private download folder; apt then prints a
+permission note and reads the file as root. The
 update comes first because a fresh or idle machine's package lists can name
 library versions the mirror has dropped, and apt then fails with 404. Apt
 installs the app's GTK and WebKit libraries. Declining that step leaves the

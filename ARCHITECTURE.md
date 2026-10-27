@@ -3265,8 +3265,12 @@ installer, "Install Meru.app", remains the Mac path.
 The same one-line `scripts/install.sh` entry point that installs release archives on
 macOS also installs Ubuntu. The checked Linux archive holds `meru`, `merud`, the
 systemd user unit and the Podman Quadlet. The installer verifies the archive before
-it uses any of them, then runs `meru setup` with the existing `lite` default. This
-stage does not inspect a GPU or suggest a larger model.
+it uses any of them, then runs `meru setup` with the existing `lite` default. It
+suggests no larger model. Its one GPU check looks for the device files CUDA and
+ROCm need, `/dev/nvidiactl` and `/dev/kfd`. With neither, Ollama runs on the CPU,
+where a 2-CPU server took 8 minutes over one web-search answer, so the installer
+sets `[agent] turn_timeout = "15m"` in the `config.toml` setup just wrote. A
+config the user already had stays as it is.
 
 The installer keeps a SearXNG that already answers on `127.0.0.1:8888`. Otherwise
 it uses working rootless Podman when present, then working Docker. It installs
@@ -3274,9 +3278,13 @@ neither container runtime. Both paths bind SearXNG to loopback only and keep its
 settings and secret when the installer runs again.
 
 `merud` runs through the user's systemd instance from `%h/.local/bin/merud`. The
-installer enables and starts that user service. On a headless server it offers to
-enable lingering, explains that this runs the user service without a login session,
-and calls `sudo loginctl enable-linger` only after the user accepts that step.
+installer enables and starts that user service after setup, so setup skips the
+steps that need `merud` and says the installer starts it next. Once `meru ping`
+works, the installer runs those steps itself: the profile, the Obsidian and Google
+connectors through `meru mcp fix`, and the test question. On a headless server it
+offers to enable lingering, explains that this runs the user service without a
+login session, and calls `sudo loginctl enable-linger` only after the user accepts
+that step.
 
 ### Ubuntu desktop package
 

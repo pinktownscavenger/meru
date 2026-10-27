@@ -368,19 +368,32 @@ test_desktop_package_decline_keeps_core_install() {
   rm -rf "$dir"
 }
 
-# test_desktop_package_accepts_exact_apt_argv keeps the checked path one argument.
+# test_desktop_package_accepts_exact_apt_argv keeps the checked path one
+# argument, in a folder apt's own user can read, and removes that folder.
 test_desktop_package_accepts_exact_apt_argv() {
-  local dir log output arg
+  local dir log output arg staged
   dir=$(mktemp -d); log="$dir/log"
   printf 'package\n' >"$dir/Meru package.deb"
   load_installer
   all=0
   has_tty() { return 0; }
   ask() { return 0; }
-  sudo() { for arg in "$@"; do printf '<%s>' "$arg" >>"$log"; done; printf '\n' >>"$log"; }
+  sudo() {
+    for arg in "$@"; do printf '<%s>' "$arg" >>"$log"; done; printf '\n' >>"$log"
+    if [ "$2" = install ]; then
+      printf '%s\n' "$5" >"$dir/staged"
+      printf '%s %s\n' "$(mode_of "$(dirname "$5")")" "$(mode_of "$5")" >"$dir/modes"
+      cmp -s "$5" "$dir/Meru package.deb" || printf 'different\n' >"$dir/modes"
+    fi
+  }
   install_desktop_deb "$dir/Meru package.deb"
   output=$(cat "$log")
-  assert_equal "<apt-get><update>"$'\n'"<apt-get><install><--yes><--><$dir/Meru package.deb>" "$output"
+  staged=$(cat "$dir/staged")
+  assert_equal "<apt-get><update>"$'\n'"<apt-get><install><--yes><--><$staged>" "$output"
+  assert_equal "Meru package.deb" "$(basename "$staged")"
+  [ "$staged" != "$dir/Meru package.deb" ] || test_fail "apt read the private download folder"
+  assert_equal "755 644" "$(cat "$dir/modes")"
+  [ ! -e "$(dirname "$staged")" ] || test_fail "the apt folder was left behind"
   rm -rf "$dir"
 }
 
@@ -959,13 +972,15 @@ test_profile_runs_only_after_ping() {
   type install_user_service >/dev/null 2>&1 || { rm -rf "$dir"; test_fail "install_user_service is missing"; return; }
   install_merud_service() { printf 'service\n' >>"$log"; return 1; }
   offer_user_profile() { printf 'profile\n' >>"$log"; }
+  offer_tools() { printf 'tools\n' >>"$log"; }
   offer_lingering() { printf 'linger\n' >>"$log"; }
+  ask_test_question() { printf 'question\n' >>"$log"; }
   install_user_service >/dev/null 2>&1 || true
-  if grep -q '^profile$' "$log"; then test_fail "profile ran after failed ping"; fi
+  assert_equal service "$(cat "$log")"
   : >"$log"
   install_merud_service() { printf 'service\n' >>"$log"; return 0; }
   install_user_service
-  assert_equal $'service\nprofile\nlinger' "$(cat "$log")"
+  assert_equal $'service\nprofile\ntools\nlinger\nquestion' "$(cat "$log")"
   rm -rf "$dir"
 }
 
@@ -985,6 +1000,96 @@ test_service_waits_for_config() {
   : >"$HOME/.meru/config.toml"
   finish_linux_setup
   assert_equal service "$(cat "$log")"
+  HOME=$old_home
+  rm -rf "$dir"
+}
+
+# test_tools_need_a_terminal_and_consent runs meru mcp fix for each
+# connector only after a yes on a terminal.
+test_tools_need_a_terminal_and_consent() {
+  local dir log output
+  dir=$(mktemp -d); log="$dir/log"
+  load_installer
+  bin_dir="$dir/bin"
+  run_with_tty() { printf '%s\n' "$*" >>"$log"; }
+  has_tty() { return 1; }
+  ask() { return 0; }
+  output=$(offer_tools)
+  [ ! -s "$log" ] || test_fail "tools ran without a terminal"
+  assert_contains "$output" 'meru mcp fix obsidian'
+  has_tty() { return 0; }
+  ask() { return 1; }
+  offer_tools >/dev/null
+  [ ! -s "$log" ] || test_fail "tools ran after a no"
+  ask() { return 0; }
+  offer_tools
+  assert_equal "$dir/bin/meru mcp fix obsidian"$'\n'"$dir/bin/meru mcp fix google" "$(cat "$log")"
+  rm -rf "$dir"
+}
+
+# test_test_question_reads_no_stdin keeps meru off the curl pipe and asks
+# only after a yes.
+test_test_question_reads_no_stdin() {
+  local dir output
+  dir=$(mktemp -d)
+  load_installer
+  bin_dir="$dir/bin"
+  mkdir -p "$bin_dir"
+  printf '#!/bin/sh\nprintf "%%s|" "$*" >"%s/args"\ncat >"%s/stdin"\n' "$dir" "$dir" >"$bin_dir/meru"
+  chmod +x "$bin_dir/meru"
+  ask() { return 1; }
+  output=$(ask_test_question)
+  [ ! -e "$dir/args" ] || test_fail "the question ran after a no"
+  assert_contains "$output" 'meru "In one sentence'
+  ask() { return 0; }
+  printf 'rest of the install script\n' | ask_test_question >/dev/null
+  assert_equal "In one sentence, what can you help me with?|" "$(cat "$dir/args")"
+  assert_equal "" "$(cat "$dir/stdin")"
+  rm -rf "$dir"
+}
+
+# test_cpu_turn_timeout_edits_only_the_default raises 5m to 15m without a
+# GPU, keeps the file's mode, and leaves a GPU host or a changed value alone.
+test_cpu_turn_timeout_edits_only_the_default() {
+  local dir config output
+  dir=$(mktemp -d); config="$dir/config.toml"
+  load_installer
+  printf '[agent]\nmax_rounds    = 8\nturn_timeout  = "5m"\n' >"$config"
+  chmod 0600 "$config"
+  gpu_present() { return 0; }
+  use_cpu_turn_timeout "$config" >/dev/null
+  assert_contains "$(cat "$config")" 'turn_timeout  = "5m"'
+  gpu_present() { return 1; }
+  output=$(use_cpu_turn_timeout "$config")
+  assert_equal $'[agent]\nmax_rounds    = 8\nturn_timeout  = "15m"' "$(cat "$config")"
+  assert_equal 600 "$(mode_of "$config")"
+  assert_contains "$output" 'turn_timeout = "15m"'
+  [ ! -e "$config.new" ] || test_fail "left the temporary file"
+  printf '[agent]\nturn_timeout = "30m"\n' >"$config"
+  output=$(use_cpu_turn_timeout "$config")
+  assert_equal $'[agent]\nturn_timeout = "30m"' "$(cat "$config")"
+  assert_equal "" "$output"
+  rm -rf "$dir"
+}
+
+# test_cpu_turn_timeout_only_for_a_new_config leaves a config the user
+# already had alone.
+test_cpu_turn_timeout_only_for_a_new_config() {
+  local dir log old_home
+  dir=$(mktemp -d); log="$dir/log"; old_home=$HOME
+  HOME="$dir/home"
+  load_installer
+  setup_searxng() { :; }
+  ollama_ready() { return 0; }
+  finish_linux_setup() { :; }
+  print_linux_checks() { :; }
+  use_cpu_turn_timeout() { printf 'timeout %s\n' "$1" >>"$log"; }
+  run_meru_setup() { mkdir -p "$HOME/.meru"; : >"$HOME/.meru/config.toml"; }
+  configure_linux
+  assert_equal "timeout $HOME/.meru/config.toml" "$(cat "$log")"
+  : >"$log"
+  configure_linux
+  [ ! -s "$log" ] || test_fail "edited a config the user already had"
   HOME=$old_home
   rm -rf "$dir"
 }
@@ -1047,6 +1152,10 @@ run_test() {
 }
 
 for test_name in \
+  test_tools_need_a_terminal_and_consent \
+  test_test_question_reads_no_stdin \
+  test_cpu_turn_timeout_edits_only_the_default \
+  test_cpu_turn_timeout_only_for_a_new_config \
   test_linux_release_archives_include_units \
   test_platform_for_ubuntu_2404_amd64 \
   test_platform_for_macos \

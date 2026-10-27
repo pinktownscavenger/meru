@@ -215,11 +215,14 @@ The script names every download and privileged step before it starts. It then:
 5. offers SearXNG through working rootless Podman, or working Docker when
    Podman is unavailable;
 6. runs `meru setup` for the `lite` models, folders and tools, including its
-   check of the SearXNG service;
+   check of the SearXNG service; on a computer with no NVIDIA or AMD GPU it
+   then sets `turn_timeout = "15m"` in the new `config.toml`, since answers
+   on the CPU can take several minutes;
 7. installs and starts `merud` as a systemd user service;
-8. after `meru ping` works, offers `meru setup user`; and
+8. after `meru ping` works, offers `meru setup user` and the Obsidian and
+   Google tools (`meru mcp fix`);
 9. offers `sudo loginctl enable-linger "$USER"` for a server that should keep
-   running after logout;
+   running after logout, then a test question;
 10. offers the checked desktop package: it runs `sudo apt-get update`, then
     `sudo apt-get install`, and apt may download GTK 4, WebKitGTK and
     `xdg-utils` for the app. If apt fails, the script keeps the package and
@@ -1169,7 +1172,9 @@ own error.
 If part of the answer had already appeared, it stays, followed by a note that
 Meru stopped it. The `turn` line in `merud.log` then shows `outcome=timeout`,
 `outcome=cut_off` or `outcome=gave_up`. On the `full` profile a long answer
-can need more time; raise `turn_timeout` if answers stop short.
+can need more time, and so does any computer where Ollama runs on the CPU; raise
+`turn_timeout` if answers stop short. The Ubuntu installer sets `"15m"` itself
+on a computer with no GPU.
 
 Restart `merud` after editing the file. It checks every value at startup and
 refuses to start on a typo, an unknown key or a bad value, naming the key. It also

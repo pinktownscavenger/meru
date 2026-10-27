@@ -194,6 +194,12 @@ shows "Waiting for Ollama". A `merud` that runs adds the connectors
 with its state, as in "Web search (needs config)", and Ollama only when it
 isn't ok. `TestStatusWaitingAndWeb` covers both.
 
+`Status` also names the machine: "this Mac" on macOS and "this computer"
+elsewhere (`machineName`). The page draws a new chat's empty state before that
+answer comes, with "this Mac" as its default, so `loadStatus` draws the empty
+state again when the name differs. Before, Ubuntu showed "Answers come from the
+model on this Mac" under a status line that said "Running on this computer".
+
 `OpenURL` checks the link with `opener.Check`; `OpenSource` turns a source's
 `~/Notes/lisbon.md` into a `file://` URL with `rpc.FileURL` first.
 

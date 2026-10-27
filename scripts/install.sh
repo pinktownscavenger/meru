@@ -238,11 +238,18 @@ install_desktop_deb() {
     fi
   fi
   say "Installing the Meru desktop app"
+  # apt downloads as its own user, _apt, which can't open the private
+  # download folder; it then prints a permission note and reads the file as
+  # root. A folder _apt can read keeps that note out of a clean install.
+  local apt_dir status=0
+  apt_dir=$(mktemp -d) || { keep_desktop_deb "$package"; return 0; }
+  chmod 0755 "$apt_dir"
+  install -m 0644 "$package" "$apt_dir/$(basename "$package")"
   # Package lists on a fresh or idle machine can name versions the mirror has
   # dropped, and apt then fails with 404, so refresh them first.
-  if sudo apt-get update && sudo apt-get install --yes -- "$package"; then
-    return 0
-  fi
+  sudo apt-get update && sudo apt-get install --yes -- "$apt_dir/$(basename "$package")" || status=1
+  rm -rf "$apt_dir"
+  [ "$status" = 0 ] && return 0
   echo "The desktop app was not installed. Command-line Meru is ready."
   keep_desktop_deb "$package"
 }
@@ -538,11 +545,61 @@ offer_lingering() {
   echo "Lingering is enabled for $username."
 }
 
-# install_user_service starts merud before profile and lingering questions.
+# offer_tools sets up the connectors that meru setup skips while merud is
+# down: setup runs before this installer starts the service. meru mcp fix
+# asks its own questions, so it needs a terminal.
+offer_tools() {
+  local id
+  if ! has_tty || ! ask "Set up Obsidian notes or Google (Gmail, Calendar and Drive) now?"; then
+    echo "Set them up later with: meru mcp fix obsidian, or meru mcp fix google"
+    return 0
+  fi
+  for id in obsidian google; do
+    run_with_tty "$bin_dir/meru" mcp fix "$id" || echo "Try again later with: meru mcp fix $id"
+  done
+}
+
+# ask_test_question asks merud the question meru setup asks when merud
+# already runs, so the install ends with an answer from the model. The
+# question needs no tools, so </dev/null keeps meru off the curl pipe.
+ask_test_question() {
+  local question="In one sentence, what can you help me with?"
+  if ! ask "Ask Meru a test question now? On a computer with no GPU the first answer can take a few minutes."; then
+    echo "Ask it something later: meru \"$question\""
+    return 0
+  fi
+  "$bin_dir/meru" "$question" </dev/null || echo "Meru didn't answer. Check: journalctl --user -u merud -n 50 --no-pager"
+}
+
+# install_user_service starts merud, then runs the steps that need it.
 install_user_service() {
   install_merud_service || return 1
   offer_user_profile
+  offer_tools
   offer_lingering
+  ask_test_question
+}
+
+# gpu_present reports whether Ollama can use an NVIDIA or AMD GPU. CUDA needs
+# the NVIDIA driver's /dev/nvidiactl, and ROCm needs AMD's /dev/kfd; with
+# neither, Ollama runs the models on the CPU.
+gpu_present() {
+  [ -e /dev/nvidiactl ] || [ -e /dev/kfd ]
+}
+
+# use_cpu_turn_timeout raises [agent] turn_timeout from 5 to 15 minutes in a
+# config.toml that meru setup just wrote, when Ollama has no GPU. A 2-CPU
+# server took 8 minutes to answer from web search, and the 5-minute limit
+# stopped it. A config the user already had stays as it is.
+use_cpu_turn_timeout() {
+  local config=$1
+  gpu_present && return 0
+  grep -q '^turn_timeout *= *"5m"' "$config" || return 0
+  # cat > keeps the file's mode; setup writes it readable only by the user.
+  sed 's/^turn_timeout *= *"5m"/turn_timeout  = "15m"/' "$config" >"$config.new" &&
+    cat "$config.new" >"$config" && rm -f "$config.new" || return 1
+  echo "Ollama finds no GPU here, so the models run on the CPU and one answer can take minutes."
+  echo "$config gives each question up to 15 minutes: turn_timeout = \"15m\" under [agent]."
 }
 
 # finish_linux_setup starts the daemon only after meru setup has written config.
@@ -568,6 +625,8 @@ print_linux_checks() {
 
 # configure_linux starts web search before setup checks it, then starts merud when configured.
 configure_linux() {
+  local config="$HOME/.meru/config.toml" had_config=0
+  [ -f "$config" ] && had_config=1
   setup_searxng
   if ollama_ready; then
     run_meru_setup
@@ -575,6 +634,9 @@ configure_linux() {
     run_meru_setup
   else
     echo "Run 'meru setup' after Ollama starts."
+  fi
+  if [ "$had_config" = 0 ] && [ -f "$config" ]; then
+    use_cpu_turn_timeout "$config"
   fi
   finish_linux_setup
   print_linux_checks
